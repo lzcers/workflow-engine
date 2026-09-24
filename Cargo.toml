@@ -1,0 +1,44 @@
+[package]
+name = "workflow-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Typed workflow graphs and schedulers with an optional PostgreSQL backend"
+readme = "README.md"
+license = "MIT"
+
+[features]
+default = []
+# 启用 PostgreSQL 通用实现（[`crate::pg`]）：引入 sqlx/chrono。默认关闭，
+# 引擎核心（node/graph/task/scheduler）保持零数据库依赖。
+pg = ["dep:sqlx", "dep:chrono"]
+
+[dependencies]
+futures = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+chrono = { version = "0.4.42", default-features = false, features = [
+    "clock",
+    "serde",
+], optional = true }
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "derive",
+    "chrono",
+], optional = true }
+
+[dev-dependencies]
+chrono = { version = "0.4.42", default-features = false, features = [
+    "clock",
+    "serde",
+] }
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "derive",
+    "chrono",
+] }
+uuid = { version = "1.18.1", features = ["v4"] }

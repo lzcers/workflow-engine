@@ -1,0 +1,85 @@
+# workflow-engine
+
+独立的**通用工作流引擎**：强类型节点、图引擎、通用调度器和可选 PostgreSQL 后端。
+引擎不包含业务字段，适合由应用自行定义节点与任务上下文。
+
+## 定位
+
+- 引擎核心（`node` / `graph` / `edge` / `task` / `scheduler` / `pool`）**零数据库依赖**；
+- PostgreSQL 通用实现由 `pg` feature 门控（`workflow-engine = { features = ["pg"] }`）；
+- 调度器只依赖四个抽象：任务快照 `Task`、任务存储 `TaskStore`、图引擎 `Graph`、
+  节点上下文 `NodeContext`。不解读任务语义，只驱动 `claim → settle` 循环并把图规划结果
+  交给存储落库。
+
+## 核心模块
+
+| 模块 | 职责 |
+| --- | --- |
+| [`node`](src/node) | 强类型 [`Node`](src/node/mod.rs) trait、节点上下文 [`NodeContext`](src/node/mod.rs)、类型擦除 `AnyNode`、`JoinNode`（多源 AND 汇合） |
+| [`edge`](src/edge) | 边模型：成功/失败边、触发时机（`when` / `when_error`）、守卫、扇出；类型检查版构造函数 `map_checked` / `when_checked` / `on_error_checked` / `passthrough_checked` |
+| [`graph`](src/graph) | [`Graph`](src/graph/mod.rs) 图引擎：节点注册、边规划（`plan_success` / `plan_failure`）、执行（`execute`）、静态校验 |
+| [`dsl`](src/dsl.rs) | 声明式图 DSL：`workflow!` 宏把 `nodes { … }` + `edges { … }` 展开为 Graph 构建链，并做**编译期**类型接线校验 |
+| [`task`](src/task.rs) | `Task` / `TaskStore` 抽象，把调度与具体持久化解耦 |
+| [`scheduler`](src/scheduler.rs) | 通用单会话调度器 [`Scheduler`](src/scheduler.rs)：批量认领无依赖任务 → 多协程并发结算 |
+| [`pool`](src/pool.rs) | 进程级 worker 池 [`SchedulerPool`](src/pool.rs)：按键管理 worker 生命周期与唤醒 |
+| [`pgsql_backend`](src/pgsql_backend)（`pg`） | PostgreSQL 通用实现：`PgTaskRepo` / `PgTaskStore` / 任务就绪 LISTEN/NOTIFY 监听 |
+
+## 关键机制
+
+- **节点不携带名字**：节点名作为 `Graph` 的 `HashMap` key 在注册实例时外部绑定，同一节点
+  实现可复用、可在不同名字下注册。
+- **编译期类型接线**：DSL 边经类型检查版构造函数装配，由 trait solver 强制「转换函数入参 ==
+  上游节点 `Out`、出参 == 下游节点 `In`」，类型错线在编译期即报错，而非运行时 serde 错误。
+- **at-least-once 结算**：成功/失败结算与后继入队在同一事务原子提交；事务失败整体回滚并
+  释放租约，任务下一轮被重认领（重执行一次的代价即引擎既有的 at-least-once 语义），杜绝
+  「已成功但后继从未入队」的静默停摆。
+- **并发闸门 = 在途任务计数**（`JoinSet` 跟踪，`len <= max_concurrency`）：认领后立即
+  spawn 结算并回到认领循环，快任务的后续立即被捡走，慢的 AI 任务仍在后台并发执行。
+- **JOIN 不是语法糖**：多源 AND 汇合是业务节点，在 `nodes` 块显式注册 `JoinNode`，再经
+  普通边把各源汇入；JOIN 输出类型为 `Value`，接下游的转换函数在内部反序列化为强类型视图。
+
+## 数据库（`pg` feature）
+
+引擎自有 schema（迁移见 [`migrations/0001_workflow_tasks.sql`](migrations/0001_workflow_tasks.sql)，
+幂等 DDL，启动时执行）：
+
+- `tasks`：任务行（`workflow_id` / `run_id` / `task_id` / `status` / `claimed_by` /
+  `lease_until` / `attempt` / `depends_on_ids` / `input_json` / `output_json` …），承载认领、
+  扇出、原子结算、级联、JOIN 闸门所需的全部字段。
+- `task_counters`：工作流级任务 id 自增计数表（引擎自有的 id 分配源，与任务插入同事务）。
+
+引擎表**不持有指向业务表的 FK**；消费方在自己的业务表之外执行 `pgsql_backend::migrate`
+建立引擎表，再以 `ALTER TABLE` 补充业务完整性约束（如 FK 到自己的业务表）。
+
+## 使用
+
+本地作为相邻项目的依赖时，在应用的 `Cargo.toml` 中启用：
+
+```toml
+workflow-engine = { path = "../workflow-engine", features = ["pg"] }
+```
+
+构建一张图有两种方式（见 [`graph`](src/graph/tests.rs) 和 [`dsl`](src/dsl.rs) 中的测试）：
+
+1. 命令式 `Graph::<Ctx>::builder(ctx).node(..).edge(..)…build()`；
+2. 声明式 `dsl::workflow!(context: ctx; nodes { … } edges { … })`。
+
+图直接持有上下文与构造完成的节点。`.node(name, instance)` 对应 DSL 的
+`name => instance`；节点与上下文类型由实例推导，unit struct 可直接写 `name => NodeType`。
+节点实例跨任务复用，单次执行的可变状态保存在局部变量或 `NodeContext::fork` 产生的任务上下文中。
+调度顺序为 `on_start → execute → on_success/on_error`；`Graph::execute` 单独调用时不触发事件钩子。
+
+`Scheduler::new(graph, store, poll, idle_timeout)` 直接接收 `Arc<Graph<Ctx>>`：图是固定的拓扑
+真相源，会话配置等易变依赖由上下文在 `NodeContext::fork`（异步）里按任务刷新——「配置变更对
+下一个认领的任务生效」。刷新失败由业务侧降级为沿用上一份已生效配置，不阻塞认领。
+
+## 开发
+
+```bash
+# 类型检查 / 测试
+cargo check
+cargo test --all-features
+```
+
+PostgreSQL 集成测试需要 `WORKFLOW_ENGINE_TEST_DATABASE_URL`（或 `DATABASE_URL`）；
+未设置时，这些测试会跳过数据库连接。
