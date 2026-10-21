@@ -8,6 +8,8 @@
 //! - [`pool`]：进程级 worker 池（[`SchedulerPool`]），按键管理 worker 生命周期、唤醒与逐出（重建）。
 //! - [`pgsql_backend`]（`pg` feature）：PostgreSQL 通用实现（`PgTaskRepo` / `PgTaskStore` /
 //!   任务就绪监听 + 工作流重启监听）。默认关闭，引擎核心保持零数据库依赖。
+//! - [`sqlite_backend`]（`sqlite` feature）：SQLite 通用实现（`SqliteTaskRepo` /
+//!   `SqliteTaskStore`），支持原子结算、租约恢复与任务就绪轮询。
 //!
 //! 节点**不携带名字**：阶段名作为 [`Graph`] 的 `HashMap` key 在注册实例时外部绑定，
 //! 同一节点实现可复用、可在不同名字下注册。
@@ -20,6 +22,8 @@ pub mod node;
 pub mod pgsql_backend;
 pub mod pool;
 pub mod scheduler;
+#[cfg(any(feature = "sqlite", test))]
+pub mod sqlite_backend;
 pub mod task;
 
 pub use edge::{

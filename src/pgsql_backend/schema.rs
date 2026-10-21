@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use super::repo::PgResult;
 
 /// 引擎 schema DDL（幂等，每次启动执行：全部 `CREATE ... IF NOT EXISTS`）。
-pub const SCHEMA_DDL: &str = include_str!("../../migrations/0001_workflow_tasks.sql");
+pub const SCHEMA_DDL: &str = include_str!("../../migrations/pgsql/0001_workflow_tasks.sql");
 
 /// 执行引擎 schema 迁移（幂等，可每次启动执行）。
 pub async fn migrate(pool: &PgPool) -> PgResult<()> {

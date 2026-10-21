@@ -1,12 +1,13 @@
 # workflow-engine
 
-独立的**通用工作流引擎**：强类型节点、图引擎、通用调度器和可选 PostgreSQL 后端。
+独立的**通用工作流引擎**：强类型节点、图引擎、通用调度器和可选 PostgreSQL / SQLite 后端。
 引擎不包含业务字段，适合由应用自行定义节点与任务上下文。
 
 ## 定位
 
 - 引擎核心（`node` / `graph` / `edge` / `task` / `scheduler` / `pool`）**零数据库依赖**；
 - PostgreSQL 通用实现由 `pg` feature 门控（`workflow-engine = { features = ["pg"] }`）；
+- SQLite 通用实现由 `sqlite` feature 门控；两个后端可独立启用，也可同时启用；
 - 调度器只依赖四个抽象：任务快照 `Task`、任务存储 `TaskStore`、图引擎 `Graph`、
   节点上下文 `NodeContext`。不解读任务语义，只驱动 `claim → settle` 循环并把图规划结果
   交给存储落库。
@@ -23,6 +24,7 @@
 | [`scheduler`](src/scheduler.rs) | 通用单会话调度器 [`Scheduler`](src/scheduler.rs)：批量认领无依赖任务 → 多协程并发结算 |
 | [`pool`](src/pool.rs) | 进程级 worker 池 [`SchedulerPool`](src/pool.rs)：按键管理 worker 生命周期与唤醒 |
 | [`pgsql_backend`](src/pgsql_backend)（`pg`） | PostgreSQL 通用实现：`PgTaskRepo` / `PgTaskStore` / 任务就绪 LISTEN/NOTIFY 监听 |
+| [`sqlite_backend`](src/sqlite_backend)（`sqlite`） | SQLite 通用实现：`SqliteTaskRepo` / `SqliteTaskStore` / 任务就绪轮询与租约恢复 |
 
 ## 关键机制
 
@@ -40,7 +42,7 @@
 
 ## 数据库（`pg` feature）
 
-引擎自有 schema（迁移见 [`migrations/0001_workflow_tasks.sql`](migrations/0001_workflow_tasks.sql)，
+引擎自有 schema（迁移见 [`migrations/pgsql/0001_workflow_tasks.sql`](migrations/pgsql/0001_workflow_tasks.sql)，
 幂等 DDL，启动时执行）：
 
 - `tasks`：任务行（`workflow_id` / `run_id` / `task_id` / `status` / `claimed_by` /
@@ -50,6 +52,67 @@
 
 引擎表**不持有指向业务表的 FK**；消费方在自己的业务表之外执行 `pgsql_backend::migrate`
 建立引擎表，再以 `ALTER TABLE` 补充业务完整性约束（如 FK 到自己的业务表）。
+
+## 数据库（`sqlite` feature）
+
+SQLite 后端使用同样的 `tasks` / `task_counters` 模型，迁移独立保存在
+[`migrations/sqlite/0001_workflow_tasks.sql`](migrations/sqlite/0001_workflow_tasks.sql)。
+数组和 JSON 负载存为 JSON 文本，时间存为 UTC 文本。`migrate` 在事务内幂等建表。
+支持任务认领、租约回收、重试预算、成功/失败与后继入队原子提交、单实例扇入、map 去重、
+JOIN 前驱等齐和失败级联；`run_id = NULL` 是独立分组，不会与其他 run 合并。
+
+```toml
+workflow-engine = { path = "../workflow-engine", features = ["sqlite"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+```
+
+```rust,no_run
+use std::time::Duration;
+use serde_json::json;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use workflow_engine::sqlite_backend::{migrate, NewTask, SqliteTaskRepo, SqliteTaskStore};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let options = SqliteConnectOptions::new()
+    .filename("workflow.db")
+    .create_if_missing(true)
+    .journal_mode(SqliteJournalMode::Wal)
+    .busy_timeout(Duration::from_secs(5));
+let db = SqlitePoolOptions::new()
+    .max_connections(4)
+    .connect_with(options)
+    .await?;
+migrate(&db).await?;
+
+let repo = SqliteTaskRepo::new(db);
+repo.enqueue(&NewTask {
+    workflow_id: "demo".into(),
+    run_id: None,
+    name: "start".into(),
+    instance_id: None,
+    max_attempts: 3,
+    depends_on_ids: vec![],
+    depends_on_names: vec![],
+    input: json!({"message": "hello"}),
+}).await?;
+let store = SqliteTaskStore::new(repo, "demo".into());
+// 将 store 和 Arc<Graph<Ctx>> 交给 Scheduler::new；Ctx 实现 NodeContext<SqliteTask>。
+# let _ = store;
+# Ok(())
+# }
+```
+
+写事务使用 `BEGIN IMMEDIATE`，同一数据库的多个 worker 会串行完成认领与结算；节点执行
+仍可并发。文件数据库建议启用 WAL 与 `busy_timeout`，内存测试建议用单连接池
+（`max_connections(1)` + `sqlite::memory:`）。业务自管事务调用 `SqliteTaskRepo::insert_task`
+前若需要读取数据库，也应使用 `pool.begin_with("BEGIN IMMEDIATE")`，避免读事务升级锁冲突。
+
+SQLite 使用轮询发现就绪任务。单个 `Scheduler` 自带轮询；使用 `SchedulerPool` 时，可启动
+`sqlite_backend::run_task_ready_listener(repo, pool, poll)`：启动即扫描，之后周期性唤醒就绪
+工作流并封存预算耗尽任务，能发现其他连接或进程的提交。停止服务时中止该监听任务。
+SQLite 后端不提供跨进程重启通知。主动重建 worker 由应用协调：先暂停监听及其他 worker
+创建入口，停止该工作流的 worker，再调用 `repo.release_claims(workflow_id)` 释放租约，
+最后恢复监听。只有确认旧 worker 已停止时才能释放其租约。
 
 ## 使用
 
@@ -78,8 +141,14 @@ workflow-engine = { path = "../workflow-engine", features = ["pg"] }
 ```bash
 # 类型检查 / 测试
 cargo check
+cargo check --features sqlite
 cargo test --all-features
+# DSL 图 + SQLite 后端的端到端集成测试
+cargo test --features sqlite --test sqlite_backend
 ```
 
 PostgreSQL 集成测试需要 `WORKFLOW_ENGINE_TEST_DATABASE_URL`（或 `DATABASE_URL`）；
 未设置时，这些测试会跳过数据库连接。
+SQLite 测试使用内存数据库与临时文件，无需外部服务，覆盖并发认领、持久化重开和原子回滚。
+[`tests/sqlite_backend.rs`](tests/sqlite_backend.rs) 使用 `dsl::workflow!` 构建
+扇出 → 多源 JOIN → 汇总图，通过公开 API 验证任务依赖、输入输出与最终落库状态。

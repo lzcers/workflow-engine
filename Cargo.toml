@@ -2,15 +2,15 @@
 name = "workflow-engine"
 version = "0.1.0"
 edition = "2024"
-description = "Typed workflow graphs and schedulers with an optional PostgreSQL backend"
+description = "Typed workflow graphs and schedulers with optional PostgreSQL and SQLite backends"
 readme = "README.md"
 license = "MIT"
 
 [features]
 default = []
-# 启用 PostgreSQL 通用实现（[`crate::pg`]）：引入 sqlx/chrono。默认关闭，
-# 引擎核心（node/graph/task/scheduler）保持零数据库依赖。
-pg = ["dep:sqlx", "dep:chrono"]
+# 数据库驱动按后端启用；默认构建保持零数据库依赖。
+pg = ["dep:sqlx", "dep:chrono", "sqlx/postgres"]
+sqlite = ["dep:sqlx", "dep:chrono", "sqlx/sqlite"]
 
 [dependencies]
 futures = "0.3.32"
@@ -25,9 +25,9 @@ chrono = { version = "0.4.42", default-features = false, features = [
 ], optional = true }
 sqlx = { version = "0.8.6", default-features = false, features = [
     "runtime-tokio-rustls",
-    "postgres",
     "derive",
     "chrono",
+    "json",
 ], optional = true }
 
 [dev-dependencies]
@@ -38,7 +38,13 @@ chrono = { version = "0.4.42", default-features = false, features = [
 sqlx = { version = "0.8.6", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",
+    "sqlite",
     "derive",
     "chrono",
+    "json",
 ] }
 uuid = { version = "1.18.1", features = ["v4"] }
+
+[[test]]
+name = "sqlite_backend"
+required-features = ["sqlite"]
