@@ -8,7 +8,8 @@ use sqlx::PgPool;
 
 use super::repo::PgResult;
 
-/// 引擎 schema DDL（幂等，每次启动执行：全部 `CREATE ... IF NOT EXISTS`）。
+/// 引擎 schema DDL（幂等，每次启动执行：`CREATE ... IF NOT EXISTS` 建表及索引，
+/// `COMMENT ON` 同步表和字段说明）。
 pub const SCHEMA_DDL: &str = include_str!("../../migrations/pgsql/0001_workflow_tasks.sql");
 
 /// 执行引擎 schema 迁移（幂等，可每次启动执行）。

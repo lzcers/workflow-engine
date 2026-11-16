@@ -111,7 +111,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         Arc::new(graph),
         store,
         Duration::from_millis(2),
-        Duration::from_millis(10),
+        Some(Duration::from_millis(10)),
     )
     .with_max_concurrency(3);
     tokio::time::timeout(Duration::from_secs(5), scheduler.run())

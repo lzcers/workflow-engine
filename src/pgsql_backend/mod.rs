@@ -14,7 +14,7 @@
 //! 子模块划分：
 //! - [`repo`]：[`PgTaskRepo`]，通用 SQL 持久化操作（与业务查询解耦）；
 //! - [`store`]：[`PgTaskStore`]，[`crate::TaskStore`] 的 pgsql 实现；
-//! - [`listener`]：任务就绪监听（含恢复扫描）与工作流重启监听（通用进程级组件）；
+//! - [`listener`]：任务就绪监听与恢复扫描；
 //! - [`record`] / [`rows`]：任务行与记录类型（实现 [`crate::Task`]）；
 //! - [`schema`]：引擎自有 DDL 与迁移入口。
 
@@ -28,10 +28,10 @@ mod task;
 #[cfg(test)]
 mod test_support;
 
-pub use listener::{run_restart_listener, run_task_ready_listener};
+pub use listener::run_task_ready_listener;
 pub use repo::{
     FanoutInstances, PgError, PgResult, PgTaskRepo, ROW_COLS, TASK_READY_CHANNEL,
-    WORKFLOW_RESTART_CHANNEL, notify_tasks_ready, status,
+    notify_tasks_ready, status,
 };
 pub use rows::TaskRow;
 pub use schema::migrate;

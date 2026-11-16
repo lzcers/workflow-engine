@@ -1,9 +1,9 @@
-//! LISTEN/NOTIFY 监听（通用进程级组件）：任务就绪唤醒 + 工作流重启。
+//! LISTEN/NOTIFY 任务就绪监听与恢复扫描。
 //!
-//! 与业务无关：按 payload（scope 键）唤醒 worker、连接成功即恢复扫描、按当前配置重建 worker。
+//! 与业务无关：按 payload（scope 键）唤醒 worker、连接成功即恢复扫描。
 //! worker 生命周期管理由 [`crate::SchedulerPool`] 承担，是否唤醒由上层组合。
 
-use super::repo::{PgTaskRepo, TASK_READY_CHANNEL, WORKFLOW_RESTART_CHANNEL};
+use super::repo::{PgTaskRepo, TASK_READY_CHANNEL};
 use crate::SchedulerPool;
 
 /// 任务就绪监听断线/连接失败后的重试退避。
@@ -88,57 +88,4 @@ async fn recover_stalled_sessions(repo: PgTaskRepo, pool: SchedulerPool) {
             tracing::error!(error = %e, "recovery scan query failed");
         }
     }
-}
-
-/// 进程级工作流重启监听：收到请求即逐出旧 worker（中止其在途任务）、释放它持有的任务租约，
-/// 再按当前配置重建 worker。
-///
-/// 顺序不能颠倒：先 `evict().await` 确保旧 worker 已停止认领，再释放租约，否则新旧两个
-/// worker 会竞争——被旧 worker 抢走的任务在新 worker 里不可见，只能等租约过期（默认 300s）。
-/// 释放后重建的 worker 立即重新认领这些任务；被中断的那一次尝试已计入 `attempt`，重试计数
-/// 照常推进（预算耗尽的任务由认领闸门封存为 failed）。
-///
-/// 通知是提示语义：丢失时 worker 空闲退出（默认 60s）后的下一次任务就绪通知即自然采用新配置，
-/// 因此这里与任务就绪监听一样只尽力而为。
-pub async fn run_restart_listener(database_url: String, pool: SchedulerPool, repo: PgTaskRepo) {
-    loop {
-        let mut listener = match sqlx::postgres::PgListener::connect(&database_url).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                tracing::error!(error = %e, "workflow restart listener connect failed; retrying");
-                tokio::time::sleep(LISTENER_RECONNECT_BACKOFF).await;
-                continue;
-            }
-        };
-        if let Err(e) = listener.listen(WORKFLOW_RESTART_CHANNEL).await {
-            tracing::error!(error = %e, "workflow restart listener listen failed; retrying");
-            tokio::time::sleep(LISTENER_RECONNECT_BACKOFF).await;
-            continue;
-        }
-        loop {
-            match listener.recv().await {
-                Ok(notification) => {
-                    restart_workflow(&pool, &repo, notification.payload()).await;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "workflow restart listener connection lost; reconnecting");
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// 一次重启：逐出 → 释放租约 → 重建并唤醒。
-async fn restart_workflow(pool: &SchedulerPool, repo: &PgTaskRepo, workflow_id: &str) {
-    let evicted = pool.evict(workflow_id).await;
-    match repo.release_claims(workflow_id).await {
-        Ok(released) => {
-            tracing::info!(%workflow_id, evicted, released, "workflow restarted");
-        }
-        Err(e) => {
-            tracing::warn!(%workflow_id, error = %e, "release claims on restart failed");
-        }
-    }
-    pool.ensure_worker(workflow_id).notify_one();
 }

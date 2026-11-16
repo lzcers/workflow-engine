@@ -68,13 +68,6 @@ fn merge_join_input(acc: &mut Value, contribution: &Value) {
 /// 故收到通知时任务行必已提交可见。通知是提示（可丢失/可重复），丢失由调度器兜底轮询覆盖。
 pub const TASK_READY_CHANNEL: &str = "tasks_ready";
 
-/// 工作流重启通知通道：请求方（HTTP 层）`pg_notify` 本通道，payload 为 `workflow_id`；
-/// 引擎侧监听后逐出旧 worker、释放其在跑任务的租约，再按当前配置重建 worker。
-///
-/// 与任务就绪不同，这是**主动重建**语义（配置变更后立即生效）；通知丢失可自愈——worker
-/// 空闲退出后，下一次任务就绪通知拉起的 worker 自然采用新配置。
-pub const WORKFLOW_RESTART_CHANNEL: &str = "workflow_restart";
-
 /// 事务内发送任务就绪通知（随 COMMIT 投递，回滚不投递）。`pub`：消费方业务入队路径
 /// （如 advance 链根任务）在同一事务内复用。
 pub async fn notify_tasks_ready(
@@ -613,16 +606,6 @@ impl PgTaskRepo {
         Ok(result.rows_affected())
     }
 
-    /// 请求重启工作流（不等待）：`pg_notify` 重启通道，由进程内监听器逐出并重建 worker。
-    pub async fn request_restart(&self, workflow_id: &str) -> PgResult<()> {
-        sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(WORKFLOW_RESTART_CHANNEL)
-            .bind(workflow_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     /// 认领一批可执行任务：pending 或已过期的 running 均视为可认领；同一批内互相无依赖
     /// （`NOT EXISTS` 依赖闸门过滤掉依赖未成功的任务）。
     /// 用 `FOR UPDATE SKIP LOCKED` 保证多 worker 不冲突，`LIMIT $n` 限制单批认领数量。
@@ -892,10 +875,7 @@ mod tests {
 
     use super::super::test_support::connect_test;
     use super::BUDGET_EXHAUSTED_ERR;
-    use super::{
-        FanoutInstances, PgTaskRepo, TASK_READY_CHANNEL, WORKFLOW_RESTART_CHANNEL,
-        merge_join_input, status,
-    };
+    use super::{FanoutInstances, PgTaskRepo, TASK_READY_CHANNEL, merge_join_input, status};
     use crate::pgsql_backend::{NewTask, PgTask};
 
     /// 收取一条**本工作流**的任务就绪通知（2s 超时）：通知通道是集群级共享的，
@@ -1417,26 +1397,6 @@ mod tests {
             .expect("timed out waiting for committed notification")
             .unwrap();
         assert_eq!(notification.payload(), "committed");
-    }
-
-    /// 重启请求走独立通道：payload = workflow_id，与任务就绪通道互不串扰。
-    #[tokio::test]
-    async fn request_restart_notifies_the_restart_channel() {
-        let Some(database) = connect_test().await else {
-            return;
-        };
-        let repo = PgTaskRepo::new(database.pool().clone());
-        let mut listener = PgListener::connect(database.database_url()).await.unwrap();
-        listener.listen(WORKFLOW_RESTART_CHANNEL).await.unwrap();
-
-        repo.request_restart("restart_requested").await.unwrap();
-
-        let notification = tokio::time::timeout(Duration::from_secs(2), listener.recv())
-            .await
-            .expect("timed out waiting for restart notification")
-            .unwrap();
-        assert_eq!(notification.channel(), WORKFLOW_RESTART_CHANNEL);
-        assert_eq!(notification.payload(), "restart_requested");
     }
 
     /// 任务就绪通知发送点：入队 / 扇出 / 释放租约各自随提交投递，payload = workflow_id。

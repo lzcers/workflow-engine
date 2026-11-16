@@ -11,6 +11,8 @@
 - 调度器只依赖四个抽象：任务快照 `Task`、任务存储 `TaskStore`、图引擎 `Graph`、
   节点上下文 `NodeContext`。不解读任务语义，只驱动 `claim → settle` 循环并把图规划结果
   交给存储落库。
+- worker 的配置刷新、重启通知和重建编排由应用负责；引擎提供任务就绪监听、
+  `SchedulerPool` 生命周期操作及 `release_claims` 等存储原语。
 
 ## 核心模块
 
@@ -178,6 +180,13 @@ let description = graph.describe();
 `Scheduler::new(graph, store, poll, idle_timeout)` 直接接收 `Arc<Graph<Ctx>>`：图是固定的拓扑
 真相源，会话配置等易变依赖由上下文在 `NodeContext::fork`（异步）里按任务刷新——「配置变更对
 下一个认领的任务生效」。刷新失败由业务侧降级为沿用上一份已生效配置，不阻塞认领。
+
+`idle_timeout` 为 `None` 时，Scheduler 常驻等待任务，空闲或数据库查询失败不会让它退出；
+`Some(duration)` 用于需要空闲回收的动态 worker。停止常驻调度器时，调用
+`run_until(shutdown)` 并通过 `shutdown` future 发送停止信号；方法会取消并等待全部在途
+节点任务退出后返回。调度循环 panic 时也会先完成这一步清理，再传播 panic，供上层池观察。
+调用方需等待 `run_until` 完成，直接 abort 或丢弃其 future 无法等待清理结束。
+`run()` 用于依靠空闲时限退出，或由运行时终止的调度器。
 
 ## 开发
 

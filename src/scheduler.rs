@@ -19,8 +19,7 @@
 //! `finalize_node`）在下一轮认领立即被捡走，慢的 AI 任务仍在后台并发执行，避免慢任务
 //! 拖住整条就绪链。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use futures::FutureExt;
 use tracing::{Instrument, error, info, warn};
@@ -44,7 +43,8 @@ where
     store: Arc<Store>,
     graph: Arc<Graph<Ctx>>,
     poll: Duration,
-    idle_timeout: Duration,
+    /// None 常驻；Some(timeout) 在无在途任务且连续空闲达到 timeout 后退出。
+    idle_timeout: Option<Duration>,
     /// 并发闸门：同时在途结算的任务数上限（认领只补足到该上限，非整批结算后才放行）。
     max_concurrency: usize,
     /// 任务就绪唤醒信号（LISTEN/NOTIFY 分发，`None` 则纯轮询）。通知是提示语义：
@@ -58,8 +58,13 @@ where
     S: TaskStore + Send + Sync + 'static,
     S::Task: Task + Sync + 'static,
 {
-    /// 由已构造的图与任务存储构造调度器。
-    pub fn new(graph: Arc<Graph<Ctx>>, store: S, poll: Duration, idle_timeout: Duration) -> Self {
+    /// 由已构造的图与任务存储构造调度器；idle_timeout 为 None 时持续运行。
+    pub fn new(
+        graph: Arc<Graph<Ctx>>,
+        store: S,
+        poll: Duration,
+        idle_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             store: Arc::new(store),
             graph,
@@ -82,8 +87,8 @@ where
         self
     }
 
-    /// 产线运行：认领 → 并发结算（在途计数闸门），连续空闲超过 `idle_timeout` 后自动退出。
-    /// 调度器只服务「当前确实有任务推进」的时段。
+    /// 认领 → 并发结算；配置 Some(idle_timeout) 时连续空闲达到时限后退出。
+    /// None 表示常驻，包括暂时无法认领任务或数据库查询失败时。
     ///
     /// 认领到的任务立即 `spawn` 结算，不等待整批结算完成：每轮按
     /// `max_concurrency - 在途数` 认领补足并发槽位，并优先被「任务完成」事件唤醒
@@ -91,12 +96,36 @@ where
     /// 拖住整条就绪链。空闲等待优先由 `wake` 唤醒（毫秒级），`poll` 兜底租约到期恢复
     /// 与通知丢失。
     pub async fn run(self) {
+        self.run_until(std::future::pending()).await;
+    }
+
+    /// 运行到停止信号完成或配置的空闲时限到达，再取消并等待全部在途节点任务退出。
+    ///
+    /// 调度循环 panic 时同样先等待在途任务取消完成，再向上层传播 panic。
+    /// 调用方应完成 shutdown future 并等待本方法返回；直接中止本方法无法等待清理完成。
+    pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
+        let mut in_flight = tokio::task::JoinSet::new();
+        let outcome = std::panic::AssertUnwindSafe(async {
+            tokio::select! {
+                biased;
+                _ = shutdown => {},
+                _ = self.run_loop(&mut in_flight) => {},
+            }
+        })
+        .catch_unwind()
+        .await;
+        in_flight.shutdown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    async fn run_loop(&self, in_flight: &mut tokio::task::JoinSet<Result<(), S::Error>>) {
         let store = self.store.clone();
         let graph = self.graph.clone();
         let mut idle = Duration::ZERO;
         // 在途任务并发闸门：`JoinSet` 跟踪并发结算协程，`len <= max_concurrency`。
         // 从结构上保证并发上限，同时认领循环不被慢任务阻塞（快任务后继即时被认领）。
-        let mut in_flight = tokio::task::JoinSet::new();
         loop {
             // 非阻塞回收已完成在途任务的结算结果（含 panic/join 错误），释放并发槽位。
             while let Some(res) = in_flight.try_join_next() {
@@ -108,7 +137,7 @@ where
             let available = self.max_concurrency - in_flight.len();
             if available == 0 {
                 // 并发槽位已满：等一个在途任务完成释放槽位后继续认领。
-                wait_for_completion::<S>(&mut in_flight, self.poll).await;
+                wait_for_completion::<S>(in_flight, self.poll).await;
                 continue;
             }
 
@@ -131,7 +160,7 @@ where
                 }
                 Ok(_) => {
                     if in_flight.is_empty() {
-                        if idle >= self.idle_timeout {
+                        if self.idle_timeout.is_some_and(|timeout| idle >= timeout) {
                             info!("scheduler idle, exiting");
                             break;
                         }
@@ -142,13 +171,13 @@ where
                         // 无新任务可认领但有在途任务：等一个完成（可能带出后继）立即唤醒，
                         // 不累计空闲（产线仍在推进）。
                         idle = Duration::ZERO;
-                        wait_for_completion::<S>(&mut in_flight, self.poll).await;
+                        wait_for_completion::<S>(in_flight, self.poll).await;
                     }
                 }
                 Err(e) => {
                     error!(error = %e, "worker claim failed");
                     if in_flight.is_empty() {
-                        if idle >= self.idle_timeout {
+                        if self.idle_timeout.is_some_and(|timeout| idle >= timeout) {
                             break;
                         }
                         let wait_started = tokio::time::Instant::now();
@@ -156,7 +185,7 @@ where
                         idle += wait_started.elapsed();
                     } else {
                         idle = Duration::ZERO;
-                        wait_for_completion::<S>(&mut in_flight, self.poll).await;
+                        wait_for_completion::<S>(in_flight, self.poll).await;
                     }
                 }
             }

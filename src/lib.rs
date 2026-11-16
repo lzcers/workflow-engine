@@ -7,7 +7,7 @@
 //! - [`scheduler`]：通用调度器（[`Scheduler`]），认领任务、结算并规划后继。
 //! - [`pool`]：进程级 worker 池（[`SchedulerPool`]），按键管理 worker 生命周期、唤醒与逐出（重建）。
 //! - [`pgsql_backend`]（`pg` feature）：PostgreSQL 通用实现（`PgTaskRepo` / `PgTaskStore` /
-//!   任务就绪监听 + 工作流重启监听）。默认关闭，引擎核心保持零数据库依赖。
+//!   任务就绪监听与恢复扫描）。默认关闭，引擎核心保持零数据库依赖。
 //! - [`sqlite_backend`]（`sqlite` feature）：SQLite 通用实现（`SqliteTaskRepo` /
 //!   `SqliteTaskStore`），支持原子结算、租约恢复与任务就绪轮询。
 //!
