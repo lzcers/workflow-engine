@@ -5,10 +5,10 @@
 //! 数组与 JSON 输入输出存为 JSON 文本，时间存为 UTC 文本。
 //! 写事务通过 `BEGIN IMMEDIATE` 串行化，保证并发认领和扇入合并的原子性。
 //!
-//! SQLite 没有 LISTEN/NOTIFY；[`run_task_ready_listener`] 定期扫描数据库，
-//! 为就绪工作流创建或唤醒 worker，支持其他连接提交任务和进程重启后的恢复。
+//! SQLite 没有 LISTEN/NOTIFY；宿主应用定期调用
+//! [`SqliteTaskRepo::seal_budget_exhausted`] 和 [`SqliteTaskRepo::executable_workflow_ids`]，
+//! 为就绪工作流创建或唤醒调度器，发现其他连接提交的任务并恢复到期租约。
 
-mod listener;
 mod repo;
 mod rows;
 mod schema;
@@ -18,7 +18,6 @@ mod task;
 #[cfg(test)]
 mod tests;
 
-pub use listener::run_task_ready_listener;
 pub use repo::{FanoutInstances, ROW_COLS, SqliteError, SqliteResult, SqliteTaskRepo, status};
 pub use rows::TaskRow;
 pub use schema::migrate;

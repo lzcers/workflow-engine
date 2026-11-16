@@ -5,14 +5,14 @@
 
 ## 定位
 
-- 引擎核心（`node` / `graph` / `edge` / `task` / `scheduler` / `pool`）**零数据库依赖**；
+- 引擎核心（`node` / `graph` / `edge` / `task` / `scheduler`）**零数据库依赖**；
 - PostgreSQL 通用实现由 `pg` feature 门控（`workflow-engine = { features = ["pg"] }`）；
 - SQLite 通用实现由 `sqlite` feature 门控；两个后端可独立启用，也可同时启用；
 - 调度器只依赖四个抽象：任务快照 `Task`、任务存储 `TaskStore`、图引擎 `Graph`、
   节点上下文 `NodeContext`。不解读任务语义，只驱动 `claim → settle` 循环并把图规划结果
   交给存储落库。
-- worker 的配置刷新、重启通知和重建编排由应用负责；引擎提供任务就绪监听、
-  `SchedulerPool` 生命周期操作及 `release_claims` 等存储原语。
+- worker 生命周期、任务就绪监听、恢复扫描、配置刷新与重启编排由宿主应用负责；
+  引擎提供 `Scheduler`、任务就绪通知与恢复查询、`release_claims` 等存储原语。
 
 ## 核心模块
 
@@ -24,9 +24,8 @@
 | [`dsl`](src/dsl.rs) | 声明式图 DSL：`workflow!` 宏把 `nodes { … }` + `edges { … }` 展开为 Graph 构建链，并做**编译期**类型接线校验 |
 | [`task`](src/task.rs) | `Task` / `TaskStore` 抽象，把调度与具体持久化解耦 |
 | [`scheduler`](src/scheduler.rs) | 通用单会话调度器 [`Scheduler`](src/scheduler.rs)：批量认领无依赖任务 → 多协程并发结算 |
-| [`pool`](src/pool.rs) | 进程级 worker 池 [`SchedulerPool`](src/pool.rs)：按键管理 worker 生命周期与唤醒 |
-| [`pgsql_backend`](src/pgsql_backend)（`pg`） | PostgreSQL 通用实现：`PgTaskRepo` / `PgTaskStore` / 任务就绪 LISTEN/NOTIFY 监听 |
-| [`sqlite_backend`](src/sqlite_backend)（`sqlite`） | SQLite 通用实现：`SqliteTaskRepo` / `SqliteTaskStore` / 任务就绪轮询与租约恢复 |
+| [`pgsql_backend`](src/pgsql_backend)（`pg`） | PostgreSQL 通用实现：`PgTaskRepo` / `PgTaskStore` / 任务就绪通知与恢复查询 |
+| [`sqlite_backend`](src/sqlite_backend)（`sqlite`） | SQLite 通用实现：`SqliteTaskRepo` / `SqliteTaskStore` / 就绪工作流查询与租约恢复 |
 
 ## 关键机制
 
@@ -54,6 +53,11 @@
 
 引擎表**不持有指向业务表的 FK**；消费方在自己的业务表之外执行 `pgsql_backend::migrate`
 建立引擎表，再以 `ALTER TABLE` 补充业务完整性约束（如 FK 到自己的业务表）。
+
+任务就绪通知在事务提交后投递到 `TASK_READY_CHANNEL`，payload 为 `workflow_id`；
+业务自管入队事务可调用 `notify_tasks_ready`。宿主应用负责 LISTEN/NOTIFY 连接，
+收到通知后启动或唤醒对应的 `Scheduler`。启动或监听重连后的恢复流程由宿主调用
+`repo.seal_budget_exhausted()`，再通过 `repo.executable_workflow_ids()` 找出待启动的工作流。
 
 ## 数据库（`sqlite` feature）
 
@@ -109,12 +113,13 @@ let store = SqliteTaskStore::new(repo, "demo".into());
 （`max_connections(1)` + `sqlite::memory:`）。业务自管事务调用 `SqliteTaskRepo::insert_task`
 前若需要读取数据库，也应使用 `pool.begin_with("BEGIN IMMEDIATE")`，避免读事务升级锁冲突。
 
-SQLite 使用轮询发现就绪任务。单个 `Scheduler` 自带轮询；使用 `SchedulerPool` 时，可启动
-`sqlite_backend::run_task_ready_listener(repo, pool, poll)`：启动即扫描，之后周期性唤醒就绪
-工作流并封存预算耗尽任务，能发现其他连接或进程的提交。停止服务时中止该监听任务。
-SQLite 后端不提供跨进程重启通知。主动重建 worker 由应用协调：先暂停监听及其他 worker
-创建入口，停止该工作流的 worker，再调用 `repo.release_claims(workflow_id)` 释放租约，
-最后恢复监听。只有确认旧 worker 已停止时才能释放其租约。
+SQLite 使用轮询发现就绪任务。单个已启动的 `Scheduler` 自带轮询；跨工作流发现由宿主
+在启动时和定时扫描中先调用 `repo.seal_budget_exhausted()`，再调用
+`repo.executable_workflow_ids()`，为每个返回的工作流构造 `SqliteTaskStore` 并启动或唤醒
+对应的 `Scheduler`。这样可以发现其他连接或进程的提交，并恢复租约到期的任务。
+SQLite 后端不提供 worker 池、扫描循环或跨进程重启通知。主动重建由宿主协调：先阻止
+该工作流的其他启动入口，停止旧 worker 并等待其清理完成，再调用
+`repo.release_claims(workflow_id)` 释放租约，随后重建并恢复启动入口。
 
 ## 使用
 

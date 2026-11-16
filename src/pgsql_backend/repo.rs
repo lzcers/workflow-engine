@@ -694,7 +694,7 @@ impl PgTaskRepo {
         Ok(rows.into_iter().map(PgTask::from).collect())
     }
 
-    /// 存在可认领任务的工作流 id 列表，供引擎恢复扫描（启动时 + 监听重连后各执行一次）：
+    /// 存在可认领任务的工作流 id 列表，供应用恢复扫描（如启动时与监听重连后）：
     /// 兜底 NOTIFY 丢失（监听断线窗口 / 进程重启）。
     pub async fn executable_workflow_ids(&self) -> PgResult<Vec<String>> {
         let sql = format!(

@@ -10,15 +10,15 @@
 //! 引擎表不持有指向业务表的 FK；消费方在自己的业务表之外执行 [`migrate`] 建立引擎表，
 //! 再以 `ALTER TABLE` 补充业务完整性约束（如 FK 到自己的业务表）。
 //!
+//! 宿主应用监听 [`TASK_READY_CHANNEL`] 并按 payload 唤醒调度器，恢复时调用
+//! [`PgTaskRepo::seal_budget_exhausted`] 和 [`PgTaskRepo::executable_workflow_ids`]。
 //!
 //! 子模块划分：
 //! - [`repo`]：[`PgTaskRepo`]，通用 SQL 持久化操作（与业务查询解耦）；
 //! - [`store`]：[`PgTaskStore`]，[`crate::TaskStore`] 的 pgsql 实现；
-//! - [`listener`]：任务就绪监听与恢复扫描；
 //! - [`record`] / [`rows`]：任务行与记录类型（实现 [`crate::Task`]）；
 //! - [`schema`]：引擎自有 DDL 与迁移入口。
 
-mod listener;
 mod repo;
 mod rows;
 mod schema;
@@ -28,7 +28,6 @@ mod task;
 #[cfg(test)]
 mod test_support;
 
-pub use listener::run_task_ready_listener;
 pub use repo::{
     FanoutInstances, PgError, PgResult, PgTaskRepo, ROW_COLS, TASK_READY_CHANNEL,
     notify_tasks_ready, status,
