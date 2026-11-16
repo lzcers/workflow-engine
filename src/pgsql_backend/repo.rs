@@ -186,7 +186,7 @@ async fn enqueue_fanout_in_tx(
                 FROM tasks
                 WHERE workflow_id = $1
                   AND name = $2
-                  AND ($3::bigint IS NULL OR run_id = $3)
+                  AND run_id IS NOT DISTINCT FROM $3
                   AND instance_id IS NULL
                   AND status IN ('pending', 'running')
                 ORDER BY task_id
@@ -844,8 +844,9 @@ impl PgTaskRepo {
         Ok(())
     }
 
-    /// 级联前驱失败：把直接依赖 `task` 的 pending 任务标记为 `failed`，避免它们因前驱已永久
-    /// 失败而永远无法被认领（悬挂）。命中规则二选一：
+    /// 级联前驱失败：仅将同一 workflow、同一 run 内依赖 `task` 的 pending 任务标记为
+    /// `failed`，避免它们因前驱已永久失败而永远无法被认领（悬挂）。NULL run 仅匹配 NULL。
+    /// run_id 从源任务记录读取。命中规则二选一：
     /// - `depends_on_ids` 含 `task.task_id`（血缘/扇入合并的直接依赖）；
     /// - `depends_on_names` 含 `task_name`（JOIN 静态前驱：`task` 作为汇聚门某个前驱已失败，
     ///   即使它从未成功入队该 JOIN，也按名级联，避免 JOIN 悬挂）。
@@ -862,6 +863,12 @@ impl PgTaskRepo {
             SET status = 'failed', error = $4, lease_until = NULL, updated_at = NOW()
             WHERE workflow_id = $1
               AND status IN ('pending')
+              AND EXISTS (
+                  SELECT 1 FROM tasks source
+                  WHERE source.workflow_id = tasks.workflow_id
+                    AND source.task_id = $2
+                    AND source.run_id IS NOT DISTINCT FROM tasks.run_id
+              )
               AND ($2::bigint = ANY(depends_on_ids)
                    OR $3::text = ANY(depends_on_names))
             "#,

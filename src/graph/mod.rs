@@ -13,8 +13,17 @@ use super::edge::{AnyFailureEdge, AnySuccessEdge, EdgeError};
 use super::node::{AnyNode, NodeError, TaskType, TypeFingerprint};
 
 mod builder;
+mod description;
 
 pub use builder::GraphBuilder;
+pub use description::{EdgeDescription, EdgeKind, GraphDescription, NodeDescription};
+
+/// 节点实例与注册时的展示信息共用一条记录，保证描述对应实际执行的节点。
+struct GraphNode<Ctx> {
+    node: Box<dyn AnyNode<Ctx>>,
+    title: String,
+    description: String,
+}
 
 /// 图引擎：节点注册表 + 成功/失败边集合，持有上下文与节点实例，负责执行、后继规划、静态校验。
 ///
@@ -22,7 +31,7 @@ pub use builder::GraphBuilder;
 /// 对应两种独立路由维度：前向主 DAG 与后向回退图。
 pub struct Graph<Ctx> {
     context: Ctx,
-    nodes: HashMap<&'static str, Box<dyn AnyNode<Ctx>>>,
+    nodes: HashMap<&'static str, GraphNode<Ctx>>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
 }
@@ -59,21 +68,21 @@ impl<Ctx> Graph<Ctx> {
     /// 执行节点前发布任务开始事件。
     pub async fn on_start(&self, name: &str, ctx: &mut Ctx, input: &Value) {
         if let Some(node) = self.nodes.get(name) {
-            node.on_start(ctx, input).await;
+            node.node.on_start(ctx, input).await;
         }
     }
 
     /// 成功落库后发布任务成功事件。
     pub async fn on_success(&self, name: &str, ctx: &mut Ctx, output: &Value) {
         if let Some(node) = self.nodes.get(name) {
-            node.on_success(ctx, output).await;
+            node.node.on_success(ctx, output).await;
         }
     }
 
     /// 执行失败时发布任务失败事件。
     pub async fn on_error(&self, name: &str, ctx: &mut Ctx, error: &NodeError) {
         if let Some(node) = self.nodes.get(name) {
-            node.on_error(ctx, error).await;
+            node.node.on_error(ctx, error).await;
         }
     }
 
@@ -86,7 +95,7 @@ impl<Ctx> Graph<Ctx> {
             .nodes
             .get(name)
             .ok_or_else(|| NodeError::permanent(format!("no node registered for name={name}")))?;
-        node.execute(name, ctx, input).await
+        node.node.execute(name, ctx, input).await
     }
 
     /// 规划 `name` 节点的成功后继：遍历其出成功边，`when` 命中后经 `map` 产出 dst 输入，
@@ -185,7 +194,7 @@ impl<Ctx> Graph<Ctx> {
     fn task_type_of(&self, dst: &'static str) -> TaskType {
         self.nodes
             .get(dst)
-            .map_or(TaskType::Normal, |n| n.task_type())
+            .map_or(TaskType::Normal, |n| n.node.task_type())
     }
 
     /// 节点的静态前驱节点名集合：返回所有成功边汇入 `dst` 的源节点名全集。
@@ -216,25 +225,25 @@ impl<Ctx> Graph<Ctx> {
                 return Err(format!("edge dst={} not registered", e.dst()));
             };
             // 边把源节点输出反序列化为 SrcOut：要求与源节点 Out 一致（或边载荷为 Value）
-            if !readable(e.src_out_type(), src.out_type()) {
+            if !readable(e.src_out_type(), src.node.out_type()) {
                 return Err(format!(
                     "edge {} -> {}: transform 入参类型 {} 与节点 {} 输出类型 {} 不匹配",
                     e.src(),
                     e.dst(),
                     e.src_out_type().name(),
                     e.src(),
-                    src.out_type().name()
+                    src.node.out_type().name()
                 ));
             }
             // 目标节点把边产出反序列化为自身 In：要求与目标节点 In 一致（或节点输入为 Value）
-            if !writable(e.dst_in_type(), dst.in_type()) {
+            if !writable(e.dst_in_type(), dst.node.in_type()) {
                 return Err(format!(
                     "edge {} -> {}: transform 出参类型 {} 与节点 {} 输入类型 {} 不匹配",
                     e.src(),
                     e.dst(),
                     e.dst_in_type().name(),
                     e.dst(),
-                    dst.in_type().name()
+                    dst.node.in_type().name()
                 ));
             }
         }
@@ -247,25 +256,25 @@ impl<Ctx> Graph<Ctx> {
                 return Err(format!("edge dst={} not registered", e.dst()));
             };
             // 边把失败节点输入反序列化为 SrcIn：要求与源节点 In 一致（或边载荷为 Value）
-            if !readable(e.src_in_type(), src.in_type()) {
+            if !readable(e.src_in_type(), src.node.in_type()) {
                 return Err(format!(
                     "edge {} -> {}: transform 入参类型 {} 与节点 {} 输入类型 {} 不匹配",
                     e.src(),
                     e.dst(),
                     e.src_in_type().name(),
                     e.src(),
-                    src.in_type().name()
+                    src.node.in_type().name()
                 ));
             }
             // 目标节点把边产出反序列化为自身 In：与成功边同一规则
-            if !writable(e.dst_in_type(), dst.in_type()) {
+            if !writable(e.dst_in_type(), dst.node.in_type()) {
                 return Err(format!(
                     "edge {} -> {}: transform 出参类型 {} 与节点 {} 输入类型 {} 不匹配",
                     e.src(),
                     e.dst(),
                     e.dst_in_type().name(),
                     e.dst(),
-                    dst.in_type().name()
+                    dst.node.in_type().name()
                 ));
             }
         }

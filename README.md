@@ -18,7 +18,7 @@
 | --- | --- |
 | [`node`](src/node) | 强类型 [`Node`](src/node/mod.rs) trait、节点上下文 [`NodeContext`](src/node/mod.rs)、类型擦除 `AnyNode`、`JoinNode`（多源 AND 汇合） |
 | [`edge`](src/edge) | 边模型：成功/失败边、触发时机（`when` / `when_error`）、守卫、扇出；类型检查版构造函数 `map_checked` / `when_checked` / `on_error_checked` / `passthrough_checked` |
-| [`graph`](src/graph) | [`Graph`](src/graph/mod.rs) 图引擎：节点注册、边规划（`plan_success` / `plan_failure`）、执行（`execute`）、静态校验 |
+| [`graph`](src/graph) | [`Graph`](src/graph/mod.rs) 图引擎：节点注册、边规划（`plan_success` / `plan_failure`）、执行（`execute`）、静态校验、图描述（`describe`） |
 | [`dsl`](src/dsl.rs) | 声明式图 DSL：`workflow!` 宏把 `nodes { … }` + `edges { … }` 展开为 Graph 构建链，并做**编译期**类型接线校验 |
 | [`task`](src/task.rs) | `Task` / `TaskStore` 抽象，把调度与具体持久化解耦 |
 | [`scheduler`](src/scheduler.rs) | 通用单会话调度器 [`Scheduler`](src/scheduler.rs)：批量认领无依赖任务 → 多协程并发结算 |
@@ -131,6 +131,26 @@ workflow-engine = { path = "../workflow-engine", features = ["pg"] }
 `name => instance`；节点与上下文类型由实例推导，unit struct 可直接写 `name => NodeType`。
 节点实例跨任务复用，单次执行的可变状态保存在局部变量或 `NodeContext::fork` 产生的任务上下文中。
 调度顺序为 `on_start → execute → on_success/on_error`；`Graph::execute` 单独调用时不触发事件钩子。
+
+`graph.describe()` 从同一个执行图导出可序列化的 `GraphDescription { nodes, edges }`，
+适合供应用注册表和前端画布读取。描述不执行节点、条件或转换闭包，也不包含上下文和任务载荷。
+节点按注册名排序，`id` 与任务的 `name` 对应；`task_type` 为 `normal` 或 `join`，
+`input_type` / `output_type` 是 Rust 类型名，不是字段级 JSON Schema。
+
+节点默认以注册名为标题、说明为空。需要展示说明时，在注册实例的同一处使用：
+
+```rust,ignore
+let graph = Graph::builder(context)
+    .node_with_description("calculate", node, "计算指标", "根据行情计算技术指标")
+    .build()?;
+let description = graph.describe();
+```
+
+现有 `.node(...)`、`.node_with_key(...)` 和 DSL 保持兼容；重复节点名在 `build()` 时返回错误。
+成功边和失败边分别以 `kind: "success"` / `"failure"` 标识，平行边独立保留。
+边 ID 为 `success:0`、`failure:0` 等当前图内编号；注册顺序变化后不保证跨版本稳定。
+工作流身份、标题和运行状态仍由应用管理，应用可将描述与同一张 `Arc<Graph<Ctx>>` 的调度入口
+一并注册，无需另外维护一份画布拓扑。
 
 `Scheduler::new(graph, store, poll, idle_timeout)` 直接接收 `Arc<Graph<Ctx>>`：图是固定的拓扑
 真相源，会话配置等易变依赖由上下文在 `NodeContext::fork`（异步）里按任务刷新——「配置变更对

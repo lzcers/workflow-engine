@@ -31,7 +31,7 @@ pub use edge::{
     SuccessEdge, WhenBuilder, map, map_checked, on_error, on_error_checked, passthrough_checked,
     when, when_checked, when_error, when_error_checked,
 };
-pub use graph::Graph;
+pub use graph::{EdgeDescription, EdgeKind, Graph, GraphDescription, NodeDescription};
 pub use node::{AnyNode, JoinNode, Node, NodeContext, NodeError, NodeKey};
 pub use pool::SchedulerPool;
 pub use scheduler::Scheduler;

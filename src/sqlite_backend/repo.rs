@@ -657,8 +657,8 @@ impl SqliteTaskRepo {
         Ok(())
     }
 
-    /// Fail pending tasks whose direct dependencies or static predecessor names
-    /// include the failed task, preventing them from waiting indefinitely.
+    /// Fail pending tasks in the same run whose direct dependencies or static
+    /// predecessor names include the failed task, preventing indefinite waits.
     pub async fn cascade_failed_predecessor(
         &self,
         workflow_id: &str,
@@ -672,14 +672,14 @@ impl SqliteTaskRepo {
             SET status = 'failed', error = ?4, lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND status = 'pending'
+              AND EXISTS (
+                  SELECT 1 FROM tasks source
+                  WHERE source.workflow_id = ?1 AND source.task_id = ?2
+                    AND source.run_id IS tasks.run_id
+              )
               AND (?2 IN (SELECT value FROM json_each(depends_on_ids))
                    OR (task_type = 'join'
-                       AND ?3 IN (SELECT value FROM json_each(depends_on_names))
-                       AND EXISTS (
-                           SELECT 1 FROM tasks source
-                           WHERE source.workflow_id = ?1 AND source.task_id = ?2
-                             AND source.run_id IS tasks.run_id
-                       )))
+                       AND ?3 IN (SELECT value FROM json_each(depends_on_names))))
             "#,
         )
         .bind(workflow_id)

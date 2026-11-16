@@ -274,7 +274,7 @@ async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
 async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
     let (_, repo) = memory_repo().await;
     let mut ids = vec![];
-    for run_id in [Some(1), None, Some(2)] {
+    for run_id in [Some(1), Some(2), None, Some(0)] {
         let first = repo
             .enqueue_fanout(
                 "fanin",
@@ -309,8 +309,8 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         assert_eq!(merged.input, json!({"image": ["first", "second", "third"]}));
         ids.push(merged.task_id);
     }
-    assert_eq!(ids.into_iter().collect::<HashSet<_>>().len(), 3);
-    assert_eq!(repo.list_all("fanin").await.unwrap().len(), 3);
+    assert_eq!(ids.into_iter().collect::<HashSet<_>>().len(), 4);
+    assert_eq!(repo.list_all("fanin").await.unwrap().len(), 4);
 
     let first = repo
         .enqueue_fanout(
@@ -586,6 +586,79 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn cascade_matches_runs_for_named_and_direct_dependencies() {
+    let runs = [Some(1), Some(2), None, Some(0)];
+    for source_run in runs {
+        let (_, repo) = memory_repo().await;
+        let mut root = new_task("cascade_runs", "root");
+        root.run_id = source_run;
+        let root = repo.enqueue(&root).await.unwrap();
+        let mut targets = Vec::new();
+
+        for run_id in runs {
+            let mut child = new_task("cascade_runs", "child");
+            child.run_id = run_id;
+            child.depends_on_ids = vec![root.task_id];
+            targets.push(repo.enqueue(&child).await.unwrap());
+            targets.push(
+                repo.enqueue_fanout(
+                    "cascade_runs",
+                    run_id,
+                    "join",
+                    &[(None, json!({}))],
+                    &[],
+                    "join",
+                    &["root".into()],
+                    3,
+                )
+                .await
+                .unwrap()
+                .remove(0),
+            );
+        }
+
+        let mut other_workflow = new_task("other", "child");
+        other_workflow.run_id = source_run;
+        other_workflow.depends_on_ids = vec![root.task_id];
+        let other_workflow = repo.enqueue(&other_workflow).await.unwrap();
+
+        let mut completed = new_task("cascade_runs", "completed");
+        completed.run_id = source_run;
+        completed.depends_on_ids = vec![root.task_id];
+        let completed = repo.enqueue(&completed).await.unwrap();
+        repo.succeed("cascade_runs", completed.task_id, &json!("done"))
+            .await
+            .unwrap();
+
+        let store = SqliteTaskStore::new(repo.clone(), "cascade_runs".into());
+        store
+            .fail(&root, &TaskError::new("permanent failure"), false)
+            .await
+            .unwrap();
+        assert_eq!(store.cascade_failed_predecessor(&root).await.unwrap(), 2);
+
+        for target in targets {
+            let expected = if target.run_id == source_run {
+                status::FAILED
+            } else {
+                status::PENDING
+            };
+            assert_eq!(
+                get(&repo, &target).await.status,
+                expected,
+                "source run {source_run:?}, target {} in run {:?}",
+                target.name,
+                target.run_id,
+            );
+        }
+        assert_eq!(get(&repo, &other_workflow).await.status, status::PENDING);
+        let completed = get(&repo, &completed).await;
+        assert_eq!(completed.status, status::SUCCEEDED);
+        assert_eq!(completed.output, Some(json!("done")));
+    }
 }
 
 #[tokio::test]
