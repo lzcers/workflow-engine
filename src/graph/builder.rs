@@ -53,7 +53,21 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
         name: &'static str,
         node: N,
     ) -> (Self, NodeKey<Ctx, N>) {
-        (self.node(name, node), NodeKey::new(name))
+        self.node_with_description_and_key(name, node, name, "")
+    }
+
+    /// 注册带展示信息的实例，并保留类型化标识用于编译期接线检查。
+    pub fn node_with_description_and_key<N: Node<Ctx> + 'static>(
+        self,
+        name: &'static str,
+        node: N,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> (Self, NodeKey<Ctx, N>) {
+        (
+            self.node_with_description(name, node, title, description),
+            NodeKey::new(name),
+        )
     }
 
     /// 追加一条成功边（条件/转换，前向 DAG，擦除为 [`AnySuccessEdge`] 存储）。

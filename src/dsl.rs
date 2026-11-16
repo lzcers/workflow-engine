@@ -20,6 +20,8 @@
 //!
 //! `nodes` 直接接收实例表达式：`name => Type::new(...)` 或 `name => instance`。
 //! 上下文同样直接传入实例，节点类型和上下文类型都由编译器推导。
+//! 节点前可写 `#[title = "标题"]`、`#[description = "说明"]`，属性各自可选、顺序不限。
+//! 值接受可转换为 `String` 的表达式；省略时标题为节点名，说明为空。
 //!
 //! **多源 JOIN 不用方括号语法糖**：JOIN 是业务节点，在 `nodes` 块显式注册
 //! （如 `finalize_join => JoinNode`），再经普通边把各源汇入 JOIN，由 JOIN 经子句接下游。
@@ -33,6 +35,7 @@
 /// 返回 `Result<Graph<Ctx>, String>`。
 ///
 /// - `nodes`：`name => instance` 注册构造完成的节点，每个表达式只求值一次。
+///   可用 `#[title = expr]` / `#[description = expr]` 附加图描述，各最多出现一次。
 /// - `edges`：`src -> dst map/on_error/when(cond) map <expr>`，表达式为建边纯函数；
 ///   边经类型检查版构造函数（[`super::map_checked`] 等）装配，编译期校验类型接线。
 ///
@@ -51,7 +54,16 @@
 ///     type Out = String;
 ///     async fn execute(&self, _: &mut (), input: String) -> Result<String, NodeError> { Ok(input) }
 /// }
-/// let _ = workflow!(context: (); nodes { a => Number, b => Text } edges { a -> b, });
+/// let _ = workflow!(
+///     context: ();
+///     nodes {
+///         #[title = "数字"]
+///         #[description = "输出数字"]
+///         a => Number,
+///         b => Text,
+///     }
+///     edges { a -> b, }
+/// );
 /// ```
 /// 转换闭包的返回值也必须匹配目标节点输入：
 /// ```compile_fail
@@ -64,24 +76,85 @@
 /// }
 /// let _ = workflow!(
 ///     context: ();
-///     nodes { a => Number, b => Number }
+///     nodes {
+///         a => Number,
+///         #[description = "接收数字"]
+///         #[title = "目标"]
+///         b => Number,
+///     }
 ///     edges { a -> b |> |_| vec![String::from("wrong type")], }
+/// );
+/// ```
+/// 同一属性不能重复声明：
+/// ```compile_fail
+/// use workflow_engine::{JoinNode, workflow};
+/// let _ = workflow!(
+///     context: ();
+///     nodes {
+///         #[title = "第一个标题"]
+///         #[title = "第二个标题"]
+///         join => JoinNode,
+///     }
+///     edges {}
+/// );
+/// ```
+/// 未知属性会在编译期报错，不会被静默忽略：
+/// ```compile_fail
+/// use workflow_engine::{JoinNode, workflow};
+/// let _ = workflow!(
+///     context: ();
+///     nodes {
+///         #[titel = "拼错的标题属性"]
+///         join => JoinNode,
+///     }
+///     edges {}
 /// );
 /// ```
 #[macro_export]
 macro_rules! workflow {
     (
         context: $context:expr;
-        nodes { $($node_name:ident => $instance:expr),* $(,)? }
+        nodes { $($(#[$($metadata:tt)*])* $node_name:ident => $instance:expr),* $(,)? }
         edges { $($edge:tt)* }
     ) => {{
         let __builder = $crate::Graph::builder($context);
         $(
             #[allow(unused_variables)]
-            let (__builder, $node_name) = __builder.node_with_key(stringify!($node_name), $instance);
+            let (__builder, $node_name) = $crate::dsl::workflow!(
+                @node __builder; $node_name => $instance; $(#[$($metadata)*])*
+            );
         )*
         $crate::dsl::workflow!(@edges __builder; $($edge)*)
     }};
+
+    // 展示属性仅影响节点描述；所有分支都返回同一个类型化 NodeKey。
+    (@node $b:expr; $name:ident => $instance:expr;) => {
+        $b.node_with_key(stringify!($name), $instance)
+    };
+    (@node $b:expr; $name:ident => $instance:expr;
+        #[title = $title:expr] #[description = $description:expr]
+    ) => {
+        $b.node_with_description_and_key(stringify!($name), $instance, $title, $description)
+    };
+    (@node $b:expr; $name:ident => $instance:expr;
+        #[description = $description:expr] #[title = $title:expr]
+    ) => {
+        $crate::dsl::workflow!(@node $b; $name => $instance;
+            #[title = $title] #[description = $description]
+        )
+    };
+    (@node $b:expr; $name:ident => $instance:expr; #[title = $title:expr]) => {
+        $b.node_with_description_and_key(stringify!($name), $instance, $title, "")
+    };
+    (@node $b:expr; $name:ident => $instance:expr; #[description = $description:expr]) => {
+        $b.node_with_description_and_key(stringify!($name), $instance, stringify!($name), $description)
+    };
+    (@node $b:expr; $name:ident => $instance:expr; $($invalid:tt)+) => {
+        compile_error!(concat!(
+            "invalid metadata for node `", stringify!($name),
+            "`: expected at most one #[title = expression] and one #[description = expression]"
+        ))
+    };
 
     // 多源 AND 汇合不作为 DSL 语法糖：JOIN 是业务节点，在 `nodes` 块显式注册
     // （如 `finalize_join => JoinNode`），源经普通边汇入 JOIN。已移除的方括号语法
@@ -200,7 +273,9 @@ mod tests {
         let g: Graph<Ctx> = workflow!(
             context: Ctx;
             nodes {
+                #[title = "源节点"]
                 a => PassThrough,
+                #[description = "失败后分流"]
                 b => PassThrough,
                 c => PassThrough,
             }
@@ -212,6 +287,14 @@ mod tests {
             }
         )
         .unwrap();
+
+        let description = g.describe();
+        assert_eq!(description.nodes[0].title, "源节点");
+        assert_eq!(description.nodes[0].description, "");
+        assert_eq!(description.nodes[1].title, "b");
+        assert_eq!(description.nodes[1].description, "失败后分流");
+        assert_eq!(description.nodes[2].title, "c");
+        assert_eq!(description.nodes[2].description, "");
 
         // 可重试错误：无条件 on_error 与条件 when_error 都命中 → 路由到 a、c
         let retry = g
@@ -236,7 +319,11 @@ mod tests {
         let g: Graph<Ctx> = workflow!(
             context: Ctx;
             nodes {
+                #[title = "上游"]
+                #[description = "原样输出"]
                 a => PassThrough,
+                #[description = "原样接收"]
+                #[title = "下游"]
                 b => PassThrough,
             }
             edges {
@@ -244,6 +331,12 @@ mod tests {
             }
         )
         .unwrap();
+
+        let description = g.describe();
+        assert_eq!(description.nodes[0].title, "上游");
+        assert_eq!(description.nodes[0].description, "原样输出");
+        assert_eq!(description.nodes[1].title, "下游");
+        assert_eq!(description.nodes[1].description, "原样接收");
 
         let succ = g.plan_success("a", &serde_json::json!({"k": 1})).unwrap();
         assert_eq!(succ.len(), 1);
@@ -265,9 +358,13 @@ mod tests {
         let mut constructions = 0;
         // Neither node nor context implements Clone/Copy; expressions may move owned values.
         let destination = OffsetNode(4);
+        let title = String::from("带偏移的源节点");
+        let description = String::from("节点和上下文共同计算偏移");
         let graph = workflow!(
             context: { constructions += 1; OffsetContext(3) };
             nodes {
+                #[title = { constructions += 1; title }]
+                #[description = { constructions += 1; description }]
                 source => { constructions += 1; OffsetNode(2) },
                 destination => destination,
             }
@@ -277,8 +374,16 @@ mod tests {
             }
         )
         .unwrap();
-        assert_eq!(constructions, 2);
+        assert_eq!(constructions, 4);
         assert_eq!(graph.context().0, 3);
+        let source = graph
+            .describe()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == "source")
+            .unwrap();
+        assert_eq!(source.title, "带偏移的源节点");
+        assert_eq!(source.description, "节点和上下文共同计算偏移");
         let mut context = OffsetContext(graph.context().0);
         let output = graph
             .execute("source", &mut context, serde_json::json!(5))

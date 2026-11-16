@@ -137,7 +137,26 @@ workflow-engine = { path = "../workflow-engine", features = ["pg"] }
 节点按注册名排序，`id` 与任务的 `name` 对应；`task_type` 为 `normal` 或 `join`，
 `input_type` / `output_type` 是 Rust 类型名，不是字段级 JSON Schema。
 
-节点默认以注册名为标题、说明为空。需要展示说明时，在注册实例的同一处使用：
+节点默认以注册名为标题、说明为空。DSL 可在节点实例前声明展示信息：
+
+```rust,ignore
+let graph = dsl::workflow! {
+    context: context;
+    nodes {
+        #[title = "计算指标"]
+        #[description = "根据行情计算技术指标"]
+        calculate => node,
+    }
+    edges {}
+}?;
+let description = graph.describe();
+```
+
+`title` 和 `description` 都可省略，顺序不限，每个属性最多出现一次；未知属性会在编译期报错。
+属性值接受可转换为 `String` 的表达式，每个表达式仅求值一次。展示信息与节点实例一起注册，
+节点 ID、执行行为和边的编译期类型检查保持一致。
+
+命令式构图也可在注册实例时指定相同信息：
 
 ```rust,ignore
 let graph = Graph::builder(context)
