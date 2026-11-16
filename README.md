@@ -124,15 +124,17 @@ workflow-engine = { path = "../workflow-engine", features = ["pg"] }
 
 构建一张图有两种方式（见 [`graph`](src/graph/tests.rs) 和 [`dsl`](src/dsl.rs) 中的测试）：
 
-1. 命令式 `Graph::<Ctx>::builder(ctx).node(..).edge(..)…build()`；
-2. 声明式 `dsl::workflow!(context: ctx; nodes { … } edges { … })`。
+1. 命令式 `Graph::<Ctx>::builder(workflow_id, title, ctx).node(..).edge(..)…build()`；
+2. 声明式 `dsl::workflow!(workflow_id: id; title: title; context: ctx; nodes { … } edges { … })`。
 
-图直接持有上下文与构造完成的节点。`.node(name, instance)` 对应 DSL 的
+图直接持有工作流身份、标题、上下文与构造完成的节点。
+`workflow_id` 与 `title` 必填且不能仅含空白；构图后通过 `graph.workflow_id()`、
+`graph.title()` 只读访问。`workflow_id` 是任务关联的稳定身份，标题只用于展示。`.node(name, instance)` 对应 DSL 的
 `name => instance`；节点与上下文类型由实例推导，unit struct 可直接写 `name => NodeType`。
 节点实例跨任务复用，单次执行的可变状态保存在局部变量或 `NodeContext::fork` 产生的任务上下文中。
 调度顺序为 `on_start → execute → on_success/on_error`；`Graph::execute` 单独调用时不触发事件钩子。
 
-`graph.describe()` 从同一个执行图导出可序列化的 `GraphDescription { nodes, edges }`，
+`graph.describe()` 从同一个执行图导出可序列化的 `GraphDescription { workflow_id, title, nodes, edges }`，
 适合供应用注册表和前端画布读取。描述不执行节点、条件或转换闭包，也不包含上下文和任务载荷。
 节点按注册名排序，`id` 与任务的 `name` 对应；`task_type` 为 `normal` 或 `join`，
 `input_type` / `output_type` 是 Rust 类型名，不是字段级 JSON Schema。
@@ -141,6 +143,8 @@ workflow-engine = { path = "../workflow-engine", features = ["pg"] }
 
 ```rust,ignore
 let graph = dsl::workflow! {
+    workflow_id: "stock_indicators";
+    title: "股票指标";
     context: context;
     nodes {
         #[title = "计算指标"]
@@ -152,24 +156,24 @@ let graph = dsl::workflow! {
 let description = graph.describe();
 ```
 
-`title` 和 `description` 都可省略，顺序不限，每个属性最多出现一次；未知属性会在编译期报错。
+节点的 `title` 和 `description` 都可省略，顺序不限，每个属性最多出现一次；未知属性会在编译期报错。
 属性值接受可转换为 `String` 的表达式，每个表达式仅求值一次。展示信息与节点实例一起注册，
 节点 ID、执行行为和边的编译期类型检查保持一致。
 
 命令式构图也可在注册实例时指定相同信息：
 
 ```rust,ignore
-let graph = Graph::builder(context)
+let graph = Graph::builder("stock_indicators", "股票指标", context)
     .node_with_description("calculate", node, "计算指标", "根据行情计算技术指标")
     .build()?;
 let description = graph.describe();
 ```
 
-现有 `.node(...)`、`.node_with_key(...)` 和 DSL 保持兼容；重复节点名在 `build()` 时返回错误。
+节点可通过 `.node(...)`、`.node_with_key(...)` 或 DSL 注册；重复节点名在 `build()` 时返回错误。
 成功边和失败边分别以 `kind: "success"` / `"failure"` 标识，平行边独立保留。
 边 ID 为 `success:0`、`failure:0` 等当前图内编号；注册顺序变化后不保证跨版本稳定。
-工作流身份、标题和运行状态仍由应用管理，应用可将描述与同一张 `Arc<Graph<Ctx>>` 的调度入口
-一并注册，无需另外维护一份画布拓扑。
+工作流身份和标题只在图中定义；应用注册表直接索引完整的图描述，不重复指定身份和名称。
+运行状态仍由任务存储管理，无需另外维护一份画布拓扑。
 
 `Scheduler::new(graph, store, poll, idle_timeout)` 直接接收 `Arc<Graph<Ctx>>`：图是固定的拓扑
 真相源，会话配置等易变依赖由上下文在 `NodeContext::fork`（异步）里按任务刷新——「配置变更对

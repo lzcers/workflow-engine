@@ -29,12 +29,14 @@
 //! 不会收到该源贡献，JOIN 门因此不会被创建）。JOIN 的输出类型为 `Value`，接下游的转换
 //! 函数入参需写成 `&Value`，在函数内部反序列化为强类型视图。
 //!
-//! 上下文实例作为首个参数传入：`workflow!(context: ctx; nodes { ... } edges { ... })`。
+//! 图必须声明 `workflow_id` 和 `title`，随后传入 `context` 实例、节点与边。
 
-/// 把 `nodes { name => instance }` 与 `edges { ... }` 展开为 `Graph::<Ctx>::builder(ctx)...build()`，
+/// 把工作流身份、`nodes { name => instance }` 与 `edges { ... }` 展开为
+/// `Graph::<Ctx>::builder(workflow_id, title, ctx)...build()`，
 /// 返回 `Result<Graph<Ctx>, String>`。
 ///
-/// - `nodes`：`name => instance` 注册构造完成的节点，每个表达式只求值一次。
+/// - `workflow_id` / `title`：必填的稳定 ID 与展示标题，接受可转换为 `String` 的表达式。
+/// - `nodes`：`name => instance` 注册构造完成的节点，所有构建表达式只求值一次。
 ///   可用 `#[title = expr]` / `#[description = expr]` 附加图描述，各最多出现一次。
 /// - `edges`：`src -> dst map/on_error/when(cond) map <expr>`，表达式为建边纯函数；
 ///   边经类型检查版构造函数（[`super::map_checked`] 等）装配，编译期校验类型接线。
@@ -55,6 +57,8 @@
 ///     async fn execute(&self, _: &mut (), input: String) -> Result<String, NodeError> { Ok(input) }
 /// }
 /// let _ = workflow!(
+///     workflow_id: "example";
+///     title: "示例工作流";
 ///     context: ();
 ///     nodes {
 ///         #[title = "数字"]
@@ -75,6 +79,8 @@
 ///     async fn execute(&self, _: &mut (), input: i32) -> Result<i32, NodeError> { Ok(input) }
 /// }
 /// let _ = workflow!(
+///     workflow_id: "example";
+///     title: "示例工作流";
 ///     context: ();
 ///     nodes {
 ///         a => Number,
@@ -89,6 +95,8 @@
 /// ```compile_fail
 /// use workflow_engine::{JoinNode, workflow};
 /// let _ = workflow!(
+///     workflow_id: "example";
+///     title: "示例工作流";
 ///     context: ();
 ///     nodes {
 ///         #[title = "第一个标题"]
@@ -102,6 +110,8 @@
 /// ```compile_fail
 /// use workflow_engine::{JoinNode, workflow};
 /// let _ = workflow!(
+///     workflow_id: "example";
+///     title: "示例工作流";
 ///     context: ();
 ///     nodes {
 ///         #[titel = "拼错的标题属性"]
@@ -113,11 +123,13 @@
 #[macro_export]
 macro_rules! workflow {
     (
+        workflow_id: $workflow_id:expr;
+        title: $title:expr;
         context: $context:expr;
         nodes { $($(#[$($metadata:tt)*])* $node_name:ident => $instance:expr),* $(,)? }
         edges { $($edge:tt)* }
     ) => {{
-        let __builder = $crate::Graph::builder($context);
+        let __builder = $crate::Graph::builder($workflow_id, $title, $context);
         $(
             #[allow(unused_variables)]
             let (__builder, $node_name) = $crate::dsl::workflow!(
@@ -271,6 +283,8 @@ mod tests {
     #[test]
     fn failure_edge_dsl_syntax() {
         let g: Graph<Ctx> = workflow!(
+            workflow_id: "test";
+            title: "测试工作流";
             context: Ctx;
             nodes {
                 #[title = "源节点"]
@@ -317,6 +331,8 @@ mod tests {
     #[test]
     fn bare_success_passthrough() {
         let g: Graph<Ctx> = workflow!(
+            workflow_id: "test";
+            title: "测试工作流";
             context: Ctx;
             nodes {
                 #[title = "上游"]
@@ -358,9 +374,13 @@ mod tests {
         let mut constructions = 0;
         // Neither node nor context implements Clone/Copy; expressions may move owned values.
         let destination = OffsetNode(4);
+        let workflow_id = String::from("offset_workflow");
+        let workflow_title = String::from("偏移工作流");
         let title = String::from("带偏移的源节点");
         let description = String::from("节点和上下文共同计算偏移");
         let graph = workflow!(
+            workflow_id: { constructions += 1; workflow_id };
+            title: { constructions += 1; workflow_title };
             context: { constructions += 1; OffsetContext(3) };
             nodes {
                 #[title = { constructions += 1; title }]
@@ -374,7 +394,11 @@ mod tests {
             }
         )
         .unwrap();
-        assert_eq!(constructions, 4);
+        assert_eq!(constructions, 6);
+        assert_eq!(graph.workflow_id(), "offset_workflow");
+        assert_eq!(graph.title(), "偏移工作流");
+        assert_eq!(graph.describe().workflow_id, graph.workflow_id());
+        assert_eq!(graph.describe().title, graph.title());
         assert_eq!(graph.context().0, 3);
         let source = graph
             .describe()

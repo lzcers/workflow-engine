@@ -7,6 +7,8 @@ use std::collections::HashSet;
 
 /// 图构建器：注册节点、追加边、组装并校验。
 pub struct GraphBuilder<Ctx> {
+    workflow_id: String,
+    title: String,
     context: Ctx,
     nodes: Vec<(&'static str, GraphNode<Ctx>)>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
@@ -14,8 +16,10 @@ pub struct GraphBuilder<Ctx> {
 }
 
 impl<Ctx: Send> GraphBuilder<Ctx> {
-    pub fn new(context: Ctx) -> Self {
+    pub fn new(workflow_id: impl Into<String>, title: impl Into<String>, context: Ctx) -> Self {
         Self {
+            workflow_id: workflow_id.into(),
+            title: title.into(),
             context,
             nodes: Vec::new(),
             success_edges: Vec::new(),
@@ -92,6 +96,8 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
             }
         }
         let graph = Graph {
+            workflow_id: self.workflow_id,
+            title: self.title,
             context: self.context,
             nodes: self.nodes.into_iter().collect(),
             success_edges: self.success_edges,

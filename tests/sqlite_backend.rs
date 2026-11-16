@@ -70,6 +70,8 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     // start ─┬─ worker × 2 ─┬─ collect (JOIN) ─ total
     //        └─ summary ────┘
     let graph = dsl::workflow! {
+        workflow_id: "dsl-workflow";
+        title: "扇出与汇合";
         context: Context::default();
         nodes {
             start => AddOne,

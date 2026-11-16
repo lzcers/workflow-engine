@@ -30,6 +30,8 @@ struct GraphNode<Ctx> {
 /// 成功边与失败边分置两个集合（[`Graph::success_edges`] / [`Graph::failure_edges`]），
 /// 对应两种独立路由维度：前向主 DAG 与后向回退图。
 pub struct Graph<Ctx> {
+    workflow_id: String,
+    title: String,
     context: Ctx,
     nodes: HashMap<&'static str, GraphNode<Ctx>>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
@@ -52,12 +54,26 @@ pub struct Successor {
 }
 
 impl<Ctx> Graph<Ctx> {
-    /// 便捷入口：构建器。
-    pub fn builder(context: Ctx) -> GraphBuilder<Ctx>
+    /// 构建工作流图；稳定 ID 和展示标题由图定义统一声明。
+    pub fn builder(
+        workflow_id: impl Into<String>,
+        title: impl Into<String>,
+        context: Ctx,
+    ) -> GraphBuilder<Ctx>
     where
         Ctx: Send,
     {
-        GraphBuilder::new(context)
+        GraphBuilder::new(workflow_id, title, context)
+    }
+
+    /// 工作流的稳定身份，用于关联任务与运行。
+    pub fn workflow_id(&self) -> &str {
+        &self.workflow_id
+    }
+
+    /// 工作流的展示标题。
+    pub fn title(&self) -> &str {
+        &self.title
     }
 
     /// 图持有的上下文快照；任务从这里 fork 独立的瞬态字段。
@@ -216,6 +232,12 @@ impl<Ctx> Graph<Ctx> {
     /// 闭包自洽的类型参数，与注册节点 `In`/`Out` 的错线此前要到任务结算时才以 serde 错误
     /// 暴露，这里在 build 期提前拒绝（`Value` 边界兼容规则见 [`readable`]/[`writable`]）。
     pub fn validate(&self) -> Result<(), String> {
+        if self.workflow_id.trim().is_empty() {
+            return Err("workflow_id must not be empty".into());
+        }
+        if self.title.trim().is_empty() {
+            return Err("workflow title must not be empty".into());
+        }
         // 节点名与边引用一致性 + 边类型接线指纹（成功边）
         for e in self.success_edges.iter() {
             let Some(src) = self.nodes.get(e.src()) else {

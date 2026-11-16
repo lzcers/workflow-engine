@@ -7,6 +7,8 @@ use super::Graph;
 /// 已构建执行图的可序列化拓扑。节点按 ID 排序，边按成功/失败及各自注册顺序输出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GraphDescription {
+    pub workflow_id: String,
+    pub title: String,
     pub nodes: Vec<NodeDescription>,
     pub edges: Vec<EdgeDescription>,
 }
@@ -81,6 +83,11 @@ impl<Ctx> Graph<Ctx> {
             )
             .collect();
 
-        GraphDescription { nodes, edges }
+        GraphDescription {
+            workflow_id: self.workflow_id.clone(),
+            title: self.title.clone(),
+            nodes,
+            edges,
+        }
     }
 }

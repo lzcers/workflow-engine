@@ -40,7 +40,7 @@ impl Node<Ctx> for Exploder {
 }
 
 fn small_graph() -> Result<Graph<Ctx>, String> {
-    Graph::builder(Ctx)
+    Graph::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", Exploder)
         .node("c", AddOne)
@@ -60,6 +60,9 @@ fn small_graph() -> Result<Graph<Ctx>, String> {
 #[test]
 fn execute_routes_by_external_name() {
     let g = small_graph().unwrap();
+    let description = serde_json::to_value(g.describe()).unwrap();
+    assert_eq!(description["workflow_id"], g.workflow_id());
+    assert_eq!(description["title"], g.title());
     let mut ctx = Ctx;
     let out = tokio::runtime::Runtime::new().unwrap().block_on(g.execute(
         "a",
@@ -67,6 +70,23 @@ fn execute_routes_by_external_name() {
         serde_json::json!(1),
     ));
     assert_eq!(out.unwrap(), serde_json::json!(2));
+}
+
+#[test]
+fn build_rejects_empty_workflow_identity_or_title() {
+    for (workflow_id, title, expected) in [
+        ("", "工作流", "workflow_id must not be empty"),
+        (" \t", "工作流", "workflow_id must not be empty"),
+        ("test", "", "workflow title must not be empty"),
+        ("test", " \n", "workflow title must not be empty"),
+    ] {
+        let error = Graph::builder(workflow_id, title, Ctx)
+            .node("a", AddOne)
+            .build()
+            .err()
+            .expect("empty workflow identity or title must fail build");
+        assert_eq!(error, expected);
+    }
 }
 
 #[test]
@@ -83,7 +103,7 @@ fn missing_node_errors() {
 
 #[test]
 fn validate_rejects_cycle() {
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![1]))
@@ -94,7 +114,7 @@ fn validate_rejects_cycle() {
 
 #[test]
 fn validate_allows_failure_to_upstream() {
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .node("c", AddOne)
@@ -107,7 +127,7 @@ fn validate_allows_failure_to_upstream() {
 
 #[test]
 fn validate_rejects_failure_self_loop() {
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![1]))
@@ -141,7 +161,7 @@ fn plan_success_applies_map_fanout() {
 
 #[test]
 fn plan_success_aggregates_fanout_per_dst() {
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![1, 2, 3]))
@@ -160,7 +180,7 @@ fn plan_success_aggregates_fanout_per_dst() {
 
 #[test]
 fn plan_success_join_declares_static_predecessors() {
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .node("join", JoinNode)
@@ -200,7 +220,7 @@ fn plan_failure_rebuilds_retry_input() {
 fn plan_failure_applies_when_then_map() {
     // 失败条件边（when_error）：条件可基于错误类型/输入，命中后经 map 扇出 dst 输入，
     // 与 plan_success 的 when+map 完全对称——失败边不止「回退」，可按错误分支路由。
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .node("c", AddOne)
@@ -228,7 +248,7 @@ fn plan_failure_applies_when_then_map() {
 #[test]
 fn plan_failure_passthrough_failed_input() {
     // 失败条件边透传（when_error(...).passthrough()）：条件命中后把失败输入原样喂给 dst。
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![1]))
@@ -249,7 +269,7 @@ fn plan_failure_passthrough_failed_input() {
 #[test]
 fn plan_failure_aggregates_fanout_per_dst() {
     // 失败边 map 扇出多条 → 按 dst 聚合为单条 Successor 的多输入（与 plan_success 一致）。
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .node("c", AddOne)
@@ -276,7 +296,7 @@ fn plan_failure_aggregates_fanout_per_dst() {
 fn plan_failure_reflects_dst_task_type() {
     // task_type 如实反映 dst 节点类型（失败边可汇聚到 JOIN/错误处理节点），
     // 不硬编码为普通节点；depends_on_names 因存储层不支持「等齐失败」保持为空。
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("join", JoinNode)
         .edge(map("a", "join", |_: &i32| vec![1]))
@@ -296,7 +316,7 @@ fn plan_failure_reflects_dst_task_type() {
 fn plan_failure_surfaces_type_mismatch_as_error() {
     // 失败边期望 SrcIn: i32；若失败节点输入为字符串，规划应返回 Err 而非静默剪枝
     // （对称于成功边的 plan_success_surfaces_type_mismatch_as_error）。
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![1]))
@@ -317,7 +337,7 @@ fn plan_failure_surfaces_type_mismatch_as_error() {
 fn validate_rejects_type_mismatched_edge() {
     // 命令式路径无编译期接线检查：边声明载荷与注册节点 In/Out 不一致时，
     // build 期指纹校验拒绝（此前要到任务结算时才以 serde 错误暴露）。
-    let result = Graph::<Ctx>::builder(Ctx)
+    let result = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne) // Out = i32
         .node("b", AddOne) // In = i32
         .edge(map("a", "b", |_: &String| vec![String::new()])) // SrcOut = String ≠ i32
@@ -330,7 +350,7 @@ fn validate_rejects_type_mismatched_edge() {
 #[test]
 fn validate_rejects_dst_type_mismatch() {
     // 出参方向：DstIn = String ≠ 目标节点 In = i32。
-    let result = Graph::<Ctx>::builder(Ctx)
+    let result = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![String::new()]))
@@ -345,7 +365,7 @@ fn validate_rejects_dst_type_mismatch() {
 #[test]
 fn validate_rejects_failure_edge_type_mismatch() {
     // 失败边入参方向：SrcIn = String ≠ 失败节点 In = i32。
-    let result = Graph::<Ctx>::builder(Ctx)
+    let result = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![1]))
@@ -359,7 +379,7 @@ fn validate_rejects_failure_edge_type_mismatch() {
 fn validate_allows_value_boundary_into_join() {
     // Value 边界：具体载荷（i32）汇入 JoinNode（In = Value）恒兼容——节点侧反序列化为
     // Value 必成功，无需类型一致（DSL 的 JOIN 汇入边产出 Value 则是另一侧的兼容方向）。
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("join", JoinNode)
         .edge(map("a", "join", |_: &i32| vec![1]))
@@ -371,7 +391,7 @@ fn validate_allows_value_boundary_into_join() {
 #[test]
 fn plan_success_surfaces_type_mismatch_as_error() {
     // a → b 的 map 期望 SrcOut: i32；若上游输出为字符串，规划应返回 Err 而非静默剪枝。
-    let g = Graph::<Ctx>::builder(Ctx)
+    let g = Graph::<Ctx>::builder("test", "测试工作流", Ctx)
         .node("a", AddOne)
         .node("b", AddOne)
         .edge(map("a", "b", |_: &i32| vec![1]))
