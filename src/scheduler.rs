@@ -16,14 +16,14 @@ use tracing::{Instrument, error, info, warn};
 
 use super::graph::{Graph, Successor};
 use super::node::{NodeContext, NodeError};
-use super::task::{FanoutPlan, Task, TaskError, TaskStore};
+use super::task::{FanoutPlan, TaskError, TaskRecord, TaskStore};
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
 
 /// 单会话调度器，负责认领、并发执行与结算，依赖关系由存储过滤。
 pub struct Scheduler<Ctx, Store>
 where
-    Ctx: NodeContext<Store::Task> + Sync + 'static,
+    Ctx: NodeContext + Sync + 'static,
     Store: TaskStore,
 {
     store: Arc<Store>,
@@ -35,18 +35,17 @@ where
     wake: Option<Arc<Notify>>,
 }
 
-impl<Ctx, S> Scheduler<Ctx, S>
+impl<Ctx, Store> Scheduler<Ctx, Store>
 where
-    Ctx: NodeContext<S::Task> + Sync + 'static,
-    S: TaskStore + Send + 'static,
-    S::Task: 'static,
+    Ctx: NodeContext + Sync + 'static,
+    Store: TaskStore + Send + 'static,
 {
     /// 由固定的图与会话级任务存储构造调度器。
     pub fn new(
         graph: Arc<Graph<Ctx>>,
-        store: S,
-        poll: Duration,
-        idle_timeout: Option<Duration>,
+        store: Store,
+        poll: Duration,                 // 多久轮询一次
+        idle_timeout: Option<Duration>, // 超时时间
     ) -> Self {
         Self {
             store: Arc::new(store),
@@ -70,17 +69,12 @@ where
         self
     }
 
-    /// 持续认领并结算任务，直到配置的空闲时限到达。
-    /// 数据库查询失败也计入空闲；idle_timeout 为 None 时持续运行。
-    pub async fn run(self) {
-        self.run_until(std::future::pending()).await;
-    }
-
     /// 运行到停止信号完成或空闲时限到达，再取消并等待全部在途节点退出。
     ///
+    /// 无需外部停止时传入 `std::future::pending()`；没有空闲时限时持续运行。
     /// 调度循环 panic 时同样先等待清理，再传播 panic。
     /// 调用方应完成 shutdown future 并等待返回；直接中止本方法无法等待清理完成。
-    pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
+    pub async fn run(self, shutdown: impl Future<Output = ()>) {
         let mut in_flight = JoinSet::new();
         let outcome = std::panic::AssertUnwindSafe(async {
             tokio::select! {
@@ -110,7 +104,7 @@ where
             if available > 0 {
                 match self.store.claim_many(available).await {
                     Ok(tasks) if !tasks.is_empty() => {
-                        info!(tasks = ?tasks.iter().map(Task::name).collect::<Vec<_>>(), "claim tasks");
+                        info!(tasks = ?tasks.iter().map(|task| task.name.as_str()).collect::<Vec<_>>(), "claim tasks");
                         idle_since = None;
                         for task in tasks {
                             in_flight.spawn(settle_safely(
@@ -164,15 +158,15 @@ where
 }
 
 /// 执行节点并原子提交状态与后继；存储错误交给结算入口处理。
-async fn settle<Ctx, S>(graph: &Graph<Ctx>, store: &S, task: &S::Task) -> Result<(), S::Error>
+async fn settle<Ctx, S>(graph: &Graph<Ctx>, store: &S, task: &TaskRecord) -> Result<(), S::Error>
 where
-    Ctx: NodeContext<S::Task> + Sync,
+    Ctx: NodeContext + Sync,
     S: TaskStore,
 {
-    let name = task.name();
+    let name = task.name.as_str();
     let mut ctx = graph.context().fork(task).await;
-    graph.on_start(name, &mut ctx, task.input()).await;
-    match graph.execute(name, &mut ctx, task.input().clone()).await {
+    graph.on_start(name, &mut ctx, &task.input).await;
+    match graph.execute(name, &mut ctx, task.input.clone()).await {
         Ok(output) => {
             // 规划失败属于永久节点错误，不能提交成功却遗漏后继。
             let successors = match graph.plan_success(name, &output) {
@@ -203,18 +197,18 @@ async fn settle_failure<Ctx, S>(
     graph: &Graph<Ctx>,
     store: &S,
     ctx: &mut Ctx,
-    task: &S::Task,
+    task: &TaskRecord,
     e: &NodeError,
 ) -> Result<(), S::Error>
 where
-    Ctx: NodeContext<S::Task> + Sync,
+    Ctx: NodeContext + Sync,
     S: TaskStore,
 {
-    let name = task.name();
+    let name = task.name.as_str();
     warn!(error = %e, "task failed");
     graph.on_error(name, ctx, e).await;
 
-    let fanouts: Vec<_> = match graph.plan_failure(name, task.input(), e) {
+    let fanouts: Vec<_> = match graph.plan_failure(name, &task.input, e) {
         Ok(successors) => successors.into_iter().map(FanoutPlan::from).collect(),
         Err(err) => {
             warn!(error = %err, "plan failure successors failed");
@@ -227,13 +221,12 @@ where
 }
 
 /// 统一记录结算错误与 panic，并释放租约供重试（at-least-once 执行）。
-async fn settle_safely<Ctx, S>(graph: Arc<Graph<Ctx>>, store: Arc<S>, task: S::Task)
+async fn settle_safely<Ctx, S>(graph: Arc<Graph<Ctx>>, store: Arc<S>, task: TaskRecord)
 where
-    Ctx: NodeContext<S::Task> + Sync + 'static,
+    Ctx: NodeContext + Sync + 'static,
     S: TaskStore + Send + 'static,
-    S::Task: 'static,
 {
-    let span = tracing::info_span!("settle", task_id = task.task_id(), name = task.name());
+    let span = tracing::info_span!("settle", task_id = task.task_id, name = task.name.as_str());
     async {
         info!("settle task");
         match std::panic::AssertUnwindSafe(settle(graph.as_ref(), store.as_ref(), &task))

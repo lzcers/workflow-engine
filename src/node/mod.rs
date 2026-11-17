@@ -18,7 +18,7 @@ use std::pin::Pin;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use super::task::Task;
+use super::task::TaskRecord;
 
 mod join;
 
@@ -147,15 +147,14 @@ pub trait AnyNode<Ctx>: Send + Sync {
 }
 
 /// 调度器对节点上下文的最小契约：调度器只依赖此接口驱动节点，不感知具体上下文类型。
-/// 泛型参数 `T` 为具体任务记录（实现 [`Task`]）；调度器把任务快照视为不透明对象，
-/// 只经本接口透传给上下文，不解读任何业务字段。
-pub trait NodeContext<T: Task>: Send {
+/// 每次执行都接收统一的 [`TaskRecord`]，由业务上下文按需读取任务信息。
+pub trait NodeContext: Send {
     /// 从共享基座按任务复制一份上下文（共享字段借用同一 `Arc`，仅瞬态字段随任务注入）。
     ///
     /// 异步：每个被认领的任务在执行前都会走一次，因此这是业务侧准备或刷新任务所需上下文的
     /// 天然位置（例如重新读取配置、冻结快照）。失败由实现自行降级（沿用上一份可用上下文）：
     /// 任务已经认领，返回错误只会白烧一次尝试预算。
-    fn fork(&self, task: &T) -> impl Future<Output = Self> + Send;
+    fn fork(&self, task: &TaskRecord) -> impl Future<Output = Self> + Send;
 }
 
 impl<Ctx, N> AnyNode<Ctx> for N

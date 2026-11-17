@@ -7,17 +7,18 @@ use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::{Notify, mpsc, oneshot};
 use workflow_engine::{
-    JoinNode, Node, NodeContext, NodeError, Scheduler, dsl,
-    sqlite_backend::{NewTask, SqliteTask, SqliteTaskRepo, SqliteTaskStore, migrate, status},
+    Database, JoinNode, Node, NodeContext, NodeError, Scheduler, Task, TaskRecord, TaskStatus,
+    backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
+    dsl,
 };
 
 #[derive(Default)]
 struct Context {
-    task: Option<SqliteTask>,
+    task: Option<TaskRecord>,
 }
 
-impl NodeContext<SqliteTask> for Context {
-    async fn fork(&self, task: &SqliteTask) -> Self {
+impl NodeContext for Context {
+    async fn fork(&self, task: &TaskRecord) -> Self {
         Self {
             task: Some(task.clone()),
         }
@@ -36,7 +37,7 @@ impl Node<Context> for AddOne {
             .as_ref()
             .expect("scheduler supplies a task snapshot");
         assert_eq!(task.input, json!(input));
-        assert_eq!(task.status, status::RUNNING);
+        assert_eq!(task.status, TaskStatus::Running);
         Ok(input + 1)
     }
 }
@@ -60,13 +61,16 @@ impl Node<Context> for Sum {
 
 #[tokio::test]
 async fn dsl_workflow_persists_fanout_join_and_final_output() {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    migrate(&db).await.unwrap();
-    let repo = SqliteTaskRepo::new(db.clone());
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    database.check().await.unwrap();
+    let shared_database = database.clone();
+    let pool = match &database {
+        Database::Sqlite(pool) => pool.clone(),
+        #[cfg(feature = "pg")]
+        Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
+    };
+    let repo = SqliteTaskRepo::new(pool);
 
     // start ─┬─ worker × 2 ─┬─ collect (JOIN) ─ total
     //        └─ summary ────┘
@@ -95,7 +99,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     .unwrap();
 
     let root = repo
-        .enqueue(&NewTask {
+        .enqueue(&Task {
             workflow_id: "dsl-workflow".into(),
             run_id: Some(7),
             name: "start".into(),
@@ -115,9 +119,12 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         Some(Duration::from_millis(10)),
     )
     .with_max_concurrency(3);
-    tokio::time::timeout(Duration::from_secs(5), scheduler.run())
-        .await
-        .expect("workflow finishes and scheduler exits after becoming idle");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.run(std::future::pending()),
+    )
+    .await
+    .expect("workflow finishes and scheduler exits after becoming idle");
 
     let tasks = repo.list_all(&root.workflow_id).await.unwrap();
     assert_eq!(
@@ -126,7 +133,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         "root, two workers, summary, JOIN, and total"
     );
     for task in &tasks {
-        assert_eq!(task.status, status::SUCCEEDED, "{task:?}");
+        assert_eq!(task.status, TaskStatus::Succeeded, "{task:?}");
         assert_eq!(task.attempt, 1);
         assert_eq!(task.run_id, root.run_id);
         assert!(task.error.is_none());
@@ -174,7 +181,8 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(total.input, join.input);
     assert_eq!(total.output, Some(json!(16)));
     assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
-    db.close().await;
+    database.close().await;
+    assert!(shared_database.check().await.is_err());
 }
 
 struct SignalNode {
@@ -212,7 +220,7 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         .unwrap();
     migrate(&db).await.unwrap();
     let repo = SqliteTaskRepo::new(db.clone());
-    let mut task = NewTask {
+    let mut task = Task {
         workflow_id: "scheduler-wake".into(),
         run_id: None,
         name: "slow".into(),
@@ -254,7 +262,7 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     released_rx.recv().await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let worker = tokio::spawn(scheduler.run_until(async move {
+    let worker = tokio::spawn(scheduler.run(async move {
         shutdown_rx.await.unwrap();
     }));
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -312,9 +320,12 @@ async fn scheduler_exits_at_idle_timeout_before_the_next_poll() {
         Some(idle_timeout),
     );
     let started = tokio::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(5), scheduler.run())
-        .await
-        .expect("idle deadline must not wait for the 60-second poll");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.run(std::future::pending()),
+    )
+    .await
+    .expect("idle deadline must not wait for the 60-second poll");
     assert!(started.elapsed() >= idle_timeout);
     db.close().await;
 }

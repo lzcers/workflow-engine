@@ -8,17 +8,7 @@ use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
-use super::task::{NewTask, SqliteTask};
-
-/// Persisted task states, shared with the other workflow backends.
-pub mod status {
-    pub const PENDING: &str = "pending";
-    pub const RUNNING: &str = "running";
-    pub const SUCCEEDED: &str = "succeeded";
-    pub const FAILED: &str = "failed";
-    pub const SKIPPED: &str = "skipped";
-    pub const SUPERSEDED: &str = "superseded";
-}
+use crate::{FanoutInstances, StorageError, Task, TaskRecord, TaskStatus};
 
 const LEASE_SECONDS: i64 = 300;
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";
@@ -27,28 +17,6 @@ const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, name, instance_id, status, \
     claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
     input_json, output_json, error, created_at, updated_at";
-
-/// A repository operation failed or its settlement target no longer exists.
-#[derive(Debug, thiserror::Error)]
-pub enum SqliteError {
-    #[error("sqlite error: {0}")]
-    Sqlx(#[from] sqlx::Error),
-    #[error("task {workflow_id}:{task_id} missing after settle")]
-    MissingTask { workflow_id: String, task_id: i64 },
-}
-
-pub type SqliteResult<T> = Result<T, SqliteError>;
-
-/// One successor plan for settlement and fanout in the same transaction.
-#[derive(Debug, Clone)]
-pub struct FanoutInstances {
-    pub name: String,
-    pub task_type: String,
-    /// `None` merges into a single pending/running task; `Some(i)` creates a map instance.
-    pub instances: Vec<(Option<i32>, Value)>,
-    /// All static predecessor names required by a JOIN task.
-    pub depends_on_names: Vec<String>,
-}
 
 /// Workflow task repository. Clones share the same connection pool.
 #[derive(Clone)]
@@ -61,7 +29,7 @@ pub struct SqliteTaskRepo {
 pub async fn allocate_task_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
-) -> SqliteResult<i64> {
+) -> Result<i64, StorageError> {
     Ok(sqlx::query_scalar(
         r#"
         INSERT INTO task_counters (workflow_id, next_task_id)
@@ -151,7 +119,7 @@ async fn enqueue_fanout_in_tx(
     task_type: &str,
     depends_on_names: &[String],
     max_attempts: i32,
-) -> SqliteResult<Vec<SqliteTask>> {
+) -> Result<Vec<TaskRecord>, StorageError> {
     let mut rows = Vec::with_capacity(instances.len());
     for (instance_id, input) in instances {
         if let Some(instance_id) = instance_id {
@@ -259,9 +227,9 @@ async fn enqueue_fanout_in_tx(
             .bind(run_id)
             .bind(name)
             .bind(if failed_predecessor {
-                status::FAILED
+                TaskStatus::Failed.as_str()
             } else {
-                status::PENDING
+                TaskStatus::Pending.as_str()
             })
             .bind(max_attempts)
             .bind(task_type)
@@ -285,8 +253,8 @@ impl SqliteTaskRepo {
     /// Start with `pool.begin_with("BEGIN IMMEDIATE")` when the transaction also reads.
     pub async fn insert_task(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        task: &NewTask,
-    ) -> SqliteResult<SqliteTask> {
+        task: &Task,
+    ) -> Result<TaskRecord, StorageError> {
         let task_id = allocate_task_id(tx, &task.workflow_id).await?;
         let row = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
@@ -311,7 +279,7 @@ impl SqliteTaskRepo {
         Ok(row.into())
     }
 
-    pub async fn enqueue(&self, task: &NewTask) -> SqliteResult<SqliteTask> {
+    pub async fn enqueue(&self, task: &Task) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = Self::insert_task(&mut tx, task).await?;
         tx.commit().await?;
@@ -331,7 +299,7 @@ impl SqliteTaskRepo {
         task_type: &str,
         depends_on_names: &[String],
         max_attempts: i32,
-    ) -> SqliteResult<Vec<SqliteTask>> {
+    ) -> Result<Vec<TaskRecord>, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows = enqueue_fanout_in_tx(
             &mut tx,
@@ -358,7 +326,7 @@ impl SqliteTaskRepo {
         output: &Value,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
-    ) -> SqliteResult<SqliteTask> {
+    ) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let settled = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
@@ -374,7 +342,7 @@ impl SqliteTaskRepo {
         .bind(output)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| SqliteError::MissingTask {
+        .ok_or_else(|| StorageError::MissingTask {
             workflow_id: workflow_id.to_owned(),
             task_id,
         })?;
@@ -407,7 +375,7 @@ impl SqliteTaskRepo {
         error: &str,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
-    ) -> SqliteResult<()> {
+    ) -> Result<(), StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // Settle first so a failure self-edge creates a fresh pending task instead
         // of merging its retry input into the still-running source task.
@@ -422,15 +390,15 @@ impl SqliteTaskRepo {
         .bind(workflow_id)
         .bind(task_id)
         .bind(if fanouts.is_empty() {
-            status::FAILED
+            TaskStatus::Failed.as_str()
         } else {
-            status::SUPERSEDED
+            TaskStatus::Superseded.as_str()
         })
         .bind(error)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(SqliteError::MissingTask {
+            return Err(StorageError::MissingTask {
                 workflow_id: workflow_id.to_owned(),
                 task_id,
             });
@@ -477,7 +445,7 @@ impl SqliteTaskRepo {
     }
 
     /// Release a lease so the next scan can immediately reclaim the task.
-    pub async fn release_claim(&self, workflow_id: &str, task_id: i64) -> SqliteResult<()> {
+    pub async fn release_claim(&self, workflow_id: &str, task_id: i64) -> Result<(), StorageError> {
         sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL,
@@ -493,7 +461,7 @@ impl SqliteTaskRepo {
     }
 
     /// Release all running leases in one workflow without resetting retry counts.
-    pub async fn release_claims(&self, workflow_id: &str) -> SqliteResult<u64> {
+    pub async fn release_claims(&self, workflow_id: &str) -> Result<u64, StorageError> {
         Ok(sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL,
@@ -514,7 +482,7 @@ impl SqliteTaskRepo {
         workflow_id: &str,
         worker: &str,
         limit: usize,
-    ) -> SqliteResult<Vec<SqliteTask>> {
+    ) -> Result<Vec<TaskRecord>, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(&format!(
             r#"
@@ -555,21 +523,21 @@ impl SqliteTaskRepo {
         .await?;
         tx.commit().await?;
         rows.sort_unstable_by_key(|row| row.task_id);
-        Ok(rows.into_iter().map(SqliteTask::from).collect())
+        Ok(rows.into_iter().map(TaskRecord::from).collect())
     }
 
-    pub async fn list_all(&self, workflow_id: &str) -> SqliteResult<Vec<SqliteTask>> {
+    pub async fn list_all(&self, workflow_id: &str) -> Result<Vec<TaskRecord>, StorageError> {
         let rows = sqlx::query_as::<_, TaskRow>(&format!(
             "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = ?1 ORDER BY task_id"
         ))
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(SqliteTask::from).collect())
+        Ok(rows.into_iter().map(TaskRecord::from).collect())
     }
 
     /// Workflows with claimable tasks, for the backend's periodic recovery scan.
-    pub async fn executable_workflow_ids(&self) -> SqliteResult<Vec<String>> {
+    pub async fn executable_workflow_ids(&self) -> Result<Vec<String>, StorageError> {
         Ok(sqlx::query_scalar(&format!(
             r#"
             SELECT DISTINCT wt.workflow_id FROM tasks wt
@@ -583,7 +551,7 @@ impl SqliteTaskRepo {
 
     /// Seal exhausted runnable tasks across workflows, including workflows that
     /// cannot appear in recovery scans because none of their tasks have budget.
-    pub async fn seal_budget_exhausted(&self) -> SqliteResult<u64> {
+    pub async fn seal_budget_exhausted(&self) -> Result<u64, StorageError> {
         Ok(sqlx::query(&format!(
             r#"
             UPDATE tasks AS wt
@@ -598,7 +566,11 @@ impl SqliteTaskRepo {
         .rows_affected())
     }
 
-    pub async fn get(&self, workflow_id: &str, task_id: i64) -> SqliteResult<Option<SqliteTask>> {
+    pub async fn get(
+        &self,
+        workflow_id: &str,
+        task_id: i64,
+    ) -> Result<Option<TaskRecord>, StorageError> {
         let row = sqlx::query_as::<_, TaskRow>(&format!(
             "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = ?1 AND task_id = ?2"
         ))
@@ -606,7 +578,7 @@ impl SqliteTaskRepo {
         .bind(task_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(SqliteTask::from))
+        Ok(row.map(TaskRecord::from))
     }
 
     pub async fn succeed(
@@ -614,7 +586,7 @@ impl SqliteTaskRepo {
         workflow_id: &str,
         task_id: i64,
         output: &Value,
-    ) -> SqliteResult<SqliteTask> {
+    ) -> Result<TaskRecord, StorageError> {
         let row = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
             UPDATE tasks
@@ -629,15 +601,20 @@ impl SqliteTaskRepo {
         .bind(output)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(SqliteTask::from)
-            .ok_or_else(|| SqliteError::MissingTask {
+        row.map(TaskRecord::from)
+            .ok_or_else(|| StorageError::MissingTask {
                 workflow_id: workflow_id.to_owned(),
                 task_id,
             })
     }
 
-    pub async fn fail(&self, workflow_id: &str, task_id: i64, error: &str) -> SqliteResult<()> {
-        self.set_terminal(workflow_id, task_id, status::FAILED, error)
+    pub async fn fail(
+        &self,
+        workflow_id: &str,
+        task_id: i64,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        self.set_terminal(workflow_id, task_id, TaskStatus::Failed.as_str(), error)
             .await
     }
 
@@ -646,13 +623,18 @@ impl SqliteTaskRepo {
         workflow_id: &str,
         task_id: i64,
         error: &str,
-    ) -> SqliteResult<()> {
-        self.set_terminal(workflow_id, task_id, status::SUPERSEDED, error)
+    ) -> Result<(), StorageError> {
+        self.set_terminal(workflow_id, task_id, TaskStatus::Superseded.as_str(), error)
             .await
     }
 
-    pub async fn skip(&self, workflow_id: &str, task_id: i64, reason: &str) -> SqliteResult<()> {
-        self.set_terminal(workflow_id, task_id, status::SKIPPED, reason)
+    pub async fn skip(
+        &self,
+        workflow_id: &str,
+        task_id: i64,
+        reason: &str,
+    ) -> Result<(), StorageError> {
+        self.set_terminal(workflow_id, task_id, TaskStatus::Skipped.as_str(), reason)
             .await
     }
 
@@ -662,7 +644,7 @@ impl SqliteTaskRepo {
         task_id: i64,
         status: &str,
         error: &str,
-    ) -> SqliteResult<()> {
+    ) -> Result<(), StorageError> {
         sqlx::query(
             r#"
             UPDATE tasks SET status = ?3, error = ?4, lease_until = NULL,

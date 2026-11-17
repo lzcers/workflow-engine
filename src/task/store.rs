@@ -1,21 +1,16 @@
-//! 通用任务抽象：调度器只见任务的最小形态，与具体持久化/业务字段解耦。
-//!
-//! - [`Task`]：调度器眼中唯一可见的任务记录形态（身份 + 节点名 + 输入负载）。
-//!   业务字段（如 `commit_id`）不进入本 trait——调度器不解读任务语义，只把它作为
-//!   不透明快照经 [`crate::node::NodeContext::fork`] 注入上下文。
-//! - [`TaskStore`]：任务持久化抽象（认领 / 结算 / 入队后继）。实现应**会话级**
-//!   构造（绑定会话作用域与具体存储），故 `claim` 不再需要会话参数。
+//! 调度器与存储之间的认领、结算及后继入队契约。
 
 use std::future::Future;
 
 use serde_json::Value;
 
+use super::TaskRecord;
+
 /// 存储层可见的任务失败载荷：仅携带落库所需的消息文本。
 ///
 /// 错误种类（可重试 / 永久）属于图路由词汇（[`crate::node::NodeError`]），已在
 /// 调度器规划失败后继时消费完毕；本类型刻意只投影消息，使 `task` 层不依赖 `node` 层
-/// （`TaskStore` 实现只与字符串打交道）。将来若存储需要按错误种类落库 / 自治重试，
-/// 再向后兼容地补字段即可。
+/// （`TaskStore` 实现只与字符串打交道）。
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 pub struct TaskError {
@@ -48,27 +43,28 @@ pub struct FanoutPlan {
     pub depends_on_names: Vec<String>,
 }
 
-/// 调度器眼中唯一可见的任务形态：身份 + 节点名 + 输入负载。
-pub trait Task: Clone + Send {
-    /// 全局任务身份（会话内唯一，供日志与依赖追踪）。
-    fn task_id(&self) -> i64;
-    /// 节点名（调度器据此查图执行）。
-    fn name(&self) -> &str;
-    /// 任务输入负载。
-    fn input(&self) -> &Value;
+/// 一条后继入队计划（原子结算方法专用）：目标节点名、任务类型、实例列表、静态前驱名集。
+/// 各持久化后端在结算事务中使用同一模型。
+#[derive(Debug, Clone)]
+pub struct FanoutInstances {
+    /// 目标节点名。
+    pub name: String,
+    /// 目标节点产出的任务类型（`normal` / `join`），落库到 `task_type` 列。
+    pub task_type: String,
+    /// `(instance_id, input)` 实例列表：`None` = 单实例（扇入合并）；`Some(i)` = 第 i 个多实例。
+    pub instances: Vec<(Option<i32>, Value)>,
+    /// 目标节点的静态前驱节点名全集（仅 `task_type = 'join'` 用作等齐前驱的认领闸门）。
+    pub depends_on_names: Vec<String>,
 }
 
 /// 调度器的任务持久化抽象：认领 / 结算 / 入队后继。
 ///
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
-/// 具体存储实现（如绑定 `workflow_id + repo` 的工作流级 store）负责解读 `Task` 快照。
+/// 具体存储实现（如绑定 `workflow_id + repo` 的工作流级 store）使用统一的 [`TaskRecord`] 快照。
 ///
-/// `Self: Sync` 与 `Self::Task: Sync` 供默认实现把共享引用带过 `.await`
+/// `Self: Sync` 供默认实现把共享引用带过 `.await`
 /// （与调度器 `S: TaskStore + Send + Sync` 的使用约束一致）。
 pub trait TaskStore: Sync {
-    /// 具体任务记录类型（实现 [`Task`]）。
-    type Task: Task + Sync;
-
     /// 存储层错误类型：允许不同存储实现定义各自的错误，同时保证引擎层可统一传播
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。
     type Error: std::error::Error + Send + Sync + 'static;
@@ -78,14 +74,14 @@ pub trait TaskStore: Sync {
     fn claim_many(
         &self,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<Self::Task>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Vec<TaskRecord>, Self::Error>> + Send;
 
     /// 结算为成功：写产物并返回回填后的任务（供上下文同步身份，如 `commit_id`）。
     fn succeed(
         &self,
-        task: &Self::Task,
+        task: &TaskRecord,
         output: &Value,
-    ) -> impl Future<Output = Result<Self::Task, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<TaskRecord, Self::Error>> + Send;
 
     /// 结算为失败 / 被后继取代：`has_successors = true` 时标记 `superseded`（失败已被下游
     /// 后继接管，对外不暴露为失败），否则标记 `failed`。
@@ -94,7 +90,7 @@ pub trait TaskStore: Sync {
     /// 兜底还是错误分支，只知道自己是否产出了后继。
     fn fail(
         &self,
-        task: &Self::Task,
+        task: &TaskRecord,
         err: &TaskError,
         has_successors: bool,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -112,7 +108,7 @@ pub trait TaskStore: Sync {
     /// 成功后继依赖 `from_task`，失败后继**不依赖** `from_task`（否则会被认领闸门永久阻塞）。
     fn enqueue_fanout(
         &self,
-        from_task: &Self::Task,
+        from_task: &TaskRecord,
         name: &str,
         task_type: &str,
         inputs: &[Value],
@@ -130,10 +126,10 @@ pub trait TaskStore: Sync {
     /// 保留旧行为）；绑定单一关系库的存储实现应覆盖本方法，在单个事务内完成二者。
     fn succeed_and_enqueue(
         &self,
-        task: &Self::Task,
+        task: &TaskRecord,
         output: &Value,
         fanouts: &[FanoutPlan],
-    ) -> impl Future<Output = Result<Self::Task, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<TaskRecord, Self::Error>> + Send {
         async move {
             let settled = self.succeed(task, output).await?;
             for f in fanouts {
@@ -143,7 +139,7 @@ pub trait TaskStore: Sync {
                     f.task_type,
                     &f.inputs,
                     &f.depends_on_names,
-                    &[settled.task_id()],
+                    &[settled.task_id],
                 )
                 .await?;
             }
@@ -158,7 +154,7 @@ pub trait TaskStore: Sync {
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn fail_and_enqueue(
         &self,
-        task: &Self::Task,
+        task: &TaskRecord,
         err: &TaskError,
         fanouts: &[FanoutPlan],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -170,7 +166,7 @@ pub trait TaskStore: Sync {
     /// `UPDATE ... SET lease_until = NULL`。
     fn release_claim(
         &self,
-        _task: &Self::Task,
+        _task: &TaskRecord,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move { Ok(()) }
     }

@@ -13,13 +13,11 @@ mod repo;
 mod rows;
 mod schema;
 mod store;
-mod task;
 
 #[cfg(test)]
 mod tests;
 
-pub use repo::{FanoutInstances, ROW_COLS, SqliteError, SqliteResult, SqliteTaskRepo, status};
+pub use repo::{ROW_COLS, SqliteTaskRepo};
 pub use rows::TaskRow;
 pub use schema::migrate;
-pub use store::{SqliteStoreError, SqliteTaskStore};
-pub use task::{NewTask, SqliteTask};
+pub use store::SqliteTaskStore;

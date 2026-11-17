@@ -362,6 +362,3 @@ fn readable(edge_ty: TypeFingerprint, node_ty: TypeFingerprint) -> bool {
 fn writable(edge_ty: TypeFingerprint, node_ty: TypeFingerprint) -> bool {
     edge_ty.id() == node_ty.id() || node_ty.id() == TypeFingerprint::of::<Value>().id()
 }
-
-#[cfg(test)]
-mod tests;

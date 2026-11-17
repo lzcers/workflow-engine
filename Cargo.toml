@@ -9,10 +9,11 @@ license = "MIT"
 [features]
 default = []
 # 数据库驱动按后端启用；默认构建保持零数据库依赖。
-pg = ["dep:sqlx", "dep:chrono", "sqlx/postgres"]
-sqlite = ["dep:sqlx", "dep:chrono", "sqlx/sqlite"]
+pg = ["dep:sqlx", "sqlx/postgres"]
+sqlite = ["dep:sqlx", "dep:form_urlencoded", "sqlx/sqlite"]
 
 [dependencies]
+form_urlencoded = { version = "1.2.2", optional = true }
 futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -22,24 +23,20 @@ tracing = "0.1.44"
 chrono = { version = "0.4.42", default-features = false, features = [
     "clock",
     "serde",
-], optional = true }
+] }
 sqlx = { version = "0.8.6", default-features = false, features = [
     "runtime-tokio-rustls",
-    "derive",
+    "macros",
     "chrono",
     "json",
 ], optional = true }
 
 [dev-dependencies]
-chrono = { version = "0.4.42", default-features = false, features = [
-    "clock",
-    "serde",
-] }
 sqlx = { version = "0.8.6", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",
     "sqlite",
-    "derive",
+    "macros",
     "chrono",
     "json",
 ] }
