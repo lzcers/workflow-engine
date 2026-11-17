@@ -120,17 +120,6 @@ pub trait TaskStore: Sync {
         depends_on_ids: &[i64],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// 前驱永久失败后，级联失败所有直接依赖它的 pending 任务，
-    /// 避免它们因前驱已永久失败而永远无法被认领（悬挂）。返回被级联标记为失败的任务数。
-    ///
-    /// 默认空实现（不级联）；需要级联语义的存储应覆盖此方法。
-    fn cascade_failed_predecessor(
-        &self,
-        _task: &Self::Task,
-    ) -> impl Future<Output = Result<usize, Self::Error>> + Send {
-        async move { Ok(0) }
-    }
-
     /// 结算为成功并在**同一事务**内入队全部成功后继（原子化 [`TaskStore::succeed`] + fanout）。
     ///
     /// 返回回填后的任务记录（如 `commit_scene` 结算时附着的 `commit_id`），供调用方同步
@@ -162,36 +151,17 @@ pub trait TaskStore: Sync {
         }
     }
 
-    /// 结算为失败并在**同一事务**内入队全部失败后继（原子化 [`TaskStore::fail`] + fanout）。
+    /// 在同一事务内结算失败，并入队失败后继或级联已有依赖任务。
     ///
-    /// `has_successors` 由调度层根据 `fanouts` 是否非空计算——有后继接管时标记
-    /// `superseded`（对外不暴露为失败），否则标记 `failed`。失败后继不依赖源任务
-    /// （`depends_on_ids = []`），否则会被认领闸门永久阻塞。
-    ///
-    /// 默认实现先逐个入队失败后继（各自事务）再 [`TaskStore::fail`]，非原子；绑定单一
-    /// 关系库的存储实现应覆盖本方法，在单个事务内完成二者。
+    /// `fanouts` 非空时标记 `superseded`，失败后继不依赖源任务；为空时标记 `failed`，
+    /// 并将同一工作流、同一 run 内直接依赖该任务 ID 或节点名的已有 pending 任务标记失败。
+    /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn fail_and_enqueue(
         &self,
         task: &Self::Task,
         err: &TaskError,
-        has_successors: bool,
         fanouts: &[FanoutPlan],
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            for f in fanouts {
-                self.enqueue_fanout(
-                    task,
-                    f.dst,
-                    f.task_type,
-                    &f.inputs,
-                    &f.depends_on_names,
-                    &[],
-                )
-                .await?;
-            }
-            self.fail(task, err, has_successors).await
-        }
-    }
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务在下一轮认领即可
     /// 重入，不必等待租约过期。

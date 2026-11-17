@@ -513,11 +513,9 @@ impl PgTaskRepo {
         Ok(settled.into())
     }
 
-    /// 原子化失败结算：`fail`/`supersede` + 全部失败后继入队**同一事务**。
-    ///
-    /// `has_successors` 决定源任务终态：`true` → `superseded`（被后继接管，不对外暴露为
-    /// 失败），`false` → `failed`。失败后继不依赖源任务（`depends_on_ids = []`），
-    /// 否则会被认领闸门永久阻塞。
+    /// 原子失败结算：有后继时标记 `superseded` 并入队；无后继时标记 `failed` 并级联
+    /// 同一 workflow、同一 run 内依赖源任务的已有 pending 任务。
+    /// 失败后继不依赖源任务（`depends_on_ids = []`）。
     #[allow(clippy::too_many_arguments)]
     pub async fn fail_and_enqueue(
         &self,
@@ -525,7 +523,6 @@ impl PgTaskRepo {
         task_id: i64,
         run_id: Option<i64>,
         error: &str,
-        has_successors: bool,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
     ) -> PgResult<()> {
@@ -544,10 +541,10 @@ impl PgTaskRepo {
             )
             .await?;
         }
-        let status = if has_successors {
-            status::SUPERSEDED
-        } else {
+        let status = if fanouts.is_empty() {
             status::FAILED
+        } else {
+            status::SUPERSEDED
         };
         sqlx::query(
             r#"
@@ -562,6 +559,26 @@ impl PgTaskRepo {
         .bind(error)
         .execute(&mut *tx)
         .await?;
+        if fanouts.is_empty() {
+            sqlx::query(
+                r#"
+                UPDATE tasks AS dependent
+                SET status = 'failed', error = $3, lease_until = NULL, updated_at = NOW()
+                FROM tasks AS source
+                WHERE source.workflow_id = $1 AND source.task_id = $2
+                  AND dependent.workflow_id = source.workflow_id
+                  AND dependent.run_id IS NOT DISTINCT FROM source.run_id
+                  AND dependent.status = 'pending'
+                  AND (source.task_id = ANY(dependent.depends_on_ids)
+                       OR source.name = ANY(dependent.depends_on_names))
+                "#,
+            )
+            .bind(workflow_id)
+            .bind(task_id)
+            .bind(format!("predecessor task {task_id} failed"))
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -826,44 +843,6 @@ impl PgTaskRepo {
         .await?;
         Ok(())
     }
-
-    /// 级联前驱失败：仅将同一 workflow、同一 run 内依赖 `task` 的 pending 任务标记为
-    /// `failed`，避免它们因前驱已永久失败而永远无法被认领（悬挂）。NULL run 仅匹配 NULL。
-    /// run_id 从源任务记录读取。命中规则二选一：
-    /// - `depends_on_ids` 含 `task.task_id`（血缘/扇入合并的直接依赖）；
-    /// - `depends_on_names` 含 `task_name`（JOIN 静态前驱：`task` 作为汇聚门某个前驱已失败，
-    ///   即使它从未成功入队该 JOIN，也按名级联，避免 JOIN 悬挂）。
-    pub async fn cascade_failed_predecessor(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-        task_name: &str,
-        error: &str,
-    ) -> PgResult<usize> {
-        let done = sqlx::query(
-            r#"
-            UPDATE tasks
-            SET status = 'failed', error = $4, lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1
-              AND status IN ('pending')
-              AND EXISTS (
-                  SELECT 1 FROM tasks source
-                  WHERE source.workflow_id = tasks.workflow_id
-                    AND source.task_id = $2
-                    AND source.run_id IS NOT DISTINCT FROM tasks.run_id
-              )
-              AND ($2::bigint = ANY(depends_on_ids)
-                   OR $3::text = ANY(depends_on_names))
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(task_name)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(done.rows_affected() as usize)
-    }
 }
 
 #[cfg(test)]
@@ -1018,7 +997,7 @@ mod tests {
     }
 
     /// 原子失败结算：有后继 → `superseded` 且后继入队（不依赖源任务）；
-    /// 无后继 → `failed`。
+    /// 无后继 → `failed` 并级联已有依赖，级联失败时源任务终态一起回滚。
     #[tokio::test]
     async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         let Some(database) = connect_test().await else {
@@ -1045,7 +1024,6 @@ mod tests {
             retried.task_id,
             None,
             "validation failed",
-            true,
             &[FanoutInstances {
                 name: "scene_proposal".to_string(),
                 task_type: "normal".to_string(),
@@ -1086,12 +1064,70 @@ mod tests {
             })
             .await
             .unwrap();
+        let mut dependents = Vec::new();
+        for (name, run_id, by_name) in [
+            ("audio_dependent", None, false),
+            ("audio_join", None, true),
+            ("other_run", Some(1), true),
+        ] {
+            let dependent = repo
+                .enqueue(&NewTask {
+                    workflow_id: workflow_id.to_string(),
+                    run_id,
+                    name: name.to_string(),
+                    instance_id: None,
+                    max_attempts: 3,
+                    depends_on_ids: if by_name {
+                        vec![]
+                    } else {
+                        vec![failed.task_id]
+                    },
+                    depends_on_names: if by_name {
+                        vec![failed.name.clone()]
+                    } else {
+                        vec![]
+                    },
+                    input: json!({}),
+                })
+                .await
+                .unwrap();
+            dependents.push(dependent);
+        }
+
+        // 级联写入失败必须回滚源任务的失败状态。
+        sqlx::query(
+            "ALTER TABLE tasks ADD CONSTRAINT reject_cascade \
+             CHECK (name <> 'audio_join' OR status <> 'failed')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            repo.fail_and_enqueue(
+                workflow_id,
+                failed.task_id,
+                None,
+                "budget exhausted",
+                &[],
+                3,
+            )
+            .await
+            .is_err()
+        );
+        for task in std::iter::once(&failed).chain(&dependents) {
+            let unchanged = repo.get(workflow_id, task.task_id).await.unwrap().unwrap();
+            assert_eq!(unchanged.status, status::PENDING);
+        }
+        sqlx::query("ALTER TABLE tasks DROP CONSTRAINT reject_cascade")
+            .execute(database.pool())
+            .await
+            .unwrap();
+
         repo.fail_and_enqueue(
             workflow_id,
             failed.task_id,
             None,
             "budget exhausted",
-            false,
             &[],
             3,
         )
@@ -1103,6 +1139,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(settled.status, status::FAILED);
+        for dependent in dependents {
+            let settled = repo
+                .get(workflow_id, dependent.task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = if dependent.run_id.is_none() {
+                status::FAILED
+            } else {
+                status::PENDING
+            };
+            assert_eq!(settled.status, expected);
+        }
     }
 
     /// 释放租约后任务立即可被重新认领（无需等待租约过期），attempt 照常递增。

@@ -437,7 +437,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     let error = TaskError::new("execution failed");
     assert!(
         store
-            .fail_and_enqueue(&claimed, &error, true, &[recovery.clone(), invalid])
+            .fail_and_enqueue(&claimed, &error, &[recovery.clone(), invalid])
             .await
             .is_err()
     );
@@ -448,7 +448,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     let reclaimed = store.claim_many(1).await.unwrap().remove(0);
     assert_eq!(reclaimed.attempt, 2);
     store
-        .fail_and_enqueue(&reclaimed, &error, true, &[recovery])
+        .fail_and_enqueue(&reclaimed, &error, &[recovery])
         .await
         .unwrap();
     let settled = get(&repo, &task).await;
@@ -461,7 +461,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert_eq!(recovery.run_id, Some(4));
     assert!(recovery.depends_on_ids.is_empty());
     store
-        .fail_and_enqueue(&recovery, &error, false, &[])
+        .fail_and_enqueue(&recovery, &error, &[])
         .await
         .unwrap();
     assert_eq!(get(&repo, &recovery).await.status, status::FAILED);
@@ -477,7 +477,6 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
         .fail_and_enqueue(
             &source,
             &TaskError::new("retry requested"),
-            true,
             &[plan("retry", "normal", vec![json!({"retry": true})])],
         )
         .await
@@ -516,7 +515,7 @@ async fn release_all_claims_and_store_operations_stay_in_their_workflow() {
 
 #[tokio::test]
 async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
-    let (_, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo().await;
     let root = repo.enqueue(&new_task("cascade", "root")).await.unwrap();
     let mut child = new_task("cascade", "child");
     child.depends_on_ids = vec![root.task_id];
@@ -551,11 +550,36 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .remove(0);
     let unrelated = repo.enqueue(&new_task("other", "root")).await.unwrap();
     let store = SqliteTaskStore::new(repo.clone(), "cascade".into());
-    store
-        .fail(&root, &TaskError::new("permanent failure"), false)
+    let root = store.claim_many(1).await.unwrap().remove(0);
+    let error = TaskError::new("permanent failure");
+
+    // A failed cascade must also roll back the source's terminal state and lease.
+    sqlx::query(
+        r#"
+        CREATE TRIGGER reject_cascade BEFORE UPDATE OF status ON tasks
+        WHEN NEW.workflow_id = 'cascade' AND OLD.name = 'child' AND NEW.status = 'failed'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected cascade failure');
+        END
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(store.fail_and_enqueue(&root, &error, &[]).await.is_err());
+    let unchanged = get(&repo, &root).await;
+    assert_eq!(unchanged.status, status::RUNNING);
+    assert_eq!(unchanged.lease_until, root.lease_until);
+    assert!(unchanged.error.is_none());
+    assert_eq!(get(&repo, &child).await.status, status::PENDING);
+    assert_eq!(get(&repo, &join).await.status, status::PENDING);
+    sqlx::query("DROP TRIGGER reject_cascade")
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(store.cascade_failed_predecessor(&root).await.unwrap(), 2);
+
+    store.fail_and_enqueue(&root, &error, &[]).await.unwrap();
+    assert_eq!(get(&repo, &root).await.status, status::FAILED);
     assert_eq!(get(&repo, &child).await.status, status::FAILED);
     assert_eq!(get(&repo, &join).await.status, status::FAILED);
     assert_eq!(
@@ -635,10 +659,9 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
 
         let store = SqliteTaskStore::new(repo.clone(), "cascade_runs".into());
         store
-            .fail(&root, &TaskError::new("permanent failure"), false)
+            .fail_and_enqueue(&root, &TaskError::new("permanent failure"), &[])
             .await
             .unwrap();
-        assert_eq!(store.cascade_failed_predecessor(&root).await.unwrap(), 2);
 
         for target in targets {
             let expected = if target.run_id == source_run {

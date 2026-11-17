@@ -183,12 +183,11 @@ impl TaskStore for SqliteTaskStore {
             })
     }
 
-    /// 原子失败结算：fail/superseded + 全部失败后继入队同一事务。
+    /// 原子失败结算：有后继则入队并标记 superseded，否则标记 failed 并级联已有依赖。
     async fn fail_and_enqueue(
         &self,
         task: &SqliteTask,
         err: &TaskError,
-        has_successors: bool,
         fanouts: &[FanoutPlan],
     ) -> Result<(), SqliteStoreError> {
         let fanouts: Vec<FanoutInstances> = fanouts.iter().map(to_fanout_instances).collect();
@@ -198,7 +197,6 @@ impl TaskStore for SqliteTaskStore {
                 task.task_id,
                 task.run_id,
                 &err.to_string(),
-                has_successors,
                 &fanouts,
                 self.max_attempts,
             )
@@ -210,21 +208,6 @@ impl TaskStore for SqliteTaskStore {
     async fn release_claim(&self, task: &SqliteTask) -> Result<(), SqliteStoreError> {
         self.repo
             .release_claim(&self.workflow_id, task.task_id)
-            .await
-            .map_err(SqliteStoreError::Repo)
-    }
-
-    async fn cascade_failed_predecessor(
-        &self,
-        task: &SqliteTask,
-    ) -> Result<usize, SqliteStoreError> {
-        self.repo
-            .cascade_failed_predecessor(
-                &self.workflow_id,
-                task.task_id,
-                &task.name,
-                &format!("predecessor task {} failed", task.task_id),
-            )
             .await
             .map_err(SqliteStoreError::Repo)
     }

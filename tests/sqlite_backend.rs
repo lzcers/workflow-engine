@@ -5,6 +5,7 @@ use std::{sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePoolOptions;
+use tokio::sync::{Notify, mpsc, oneshot};
 use workflow_engine::{
     JoinNode, Node, NodeContext, NodeError, Scheduler, dsl,
     sqlite_backend::{NewTask, SqliteTask, SqliteTaskRepo, SqliteTaskStore, migrate, status},
@@ -173,5 +174,147 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(total.input, join.input);
     assert_eq!(total.output, Some(json!(16)));
     assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
+    db.close().await;
+}
+
+struct SignalNode {
+    started: Arc<Notify>,
+    block: bool,
+}
+
+impl Node<Context> for SignalNode {
+    type In = i32;
+    type Out = i32;
+
+    async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
+        self.started.notify_one();
+        if self.block {
+            std::future::pending::<()>().await;
+        }
+        Ok(input)
+    }
+}
+
+#[tokio::test]
+async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
+    let (released_tx, mut released_rx) = mpsc::unbounded_channel();
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_release(move |_, _| {
+            let released_tx = released_tx.clone();
+            Box::pin(async move {
+                let _ = released_tx.send(());
+                Ok(true)
+            })
+        })
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    migrate(&db).await.unwrap();
+    let repo = SqliteTaskRepo::new(db.clone());
+    let mut task = NewTask {
+        workflow_id: "scheduler-wake".into(),
+        run_id: None,
+        name: "slow".into(),
+        instance_id: None,
+        max_attempts: 3,
+        depends_on_ids: vec![],
+        depends_on_names: vec![],
+        input: json!(0),
+    };
+    repo.enqueue(&task).await.unwrap();
+
+    let slow_started = Arc::new(Notify::new());
+    let fast_started = Arc::new(Notify::new());
+    let graph = dsl::workflow! {
+        workflow_id: "scheduler-wake";
+        title: "调度唤醒";
+        context: Context::default();
+        nodes {
+            slow => SignalNode { started: slow_started.clone(), block: true },
+            fast => SignalNode { started: fast_started.clone(), block: false },
+        }
+        edges {}
+    }
+    .unwrap();
+    let wake = Arc::new(Notify::new());
+    let scheduler = Scheduler::new(
+        Arc::new(graph),
+        SqliteTaskStore::new(repo.clone(), task.workflow_id.clone()),
+        Duration::from_secs(60),
+        None,
+    )
+    .with_max_concurrency(2)
+    .with_wake(Some(wake.clone()));
+
+    // 清空建库和入队产生的归还事件。单连接池保证此后仅观察调度器的认领事务。
+    let connection = db.acquire().await.unwrap();
+    while released_rx.try_recv().is_ok() {}
+    drop(connection);
+    released_rx.recv().await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let worker = tokio::spawn(scheduler.run_until(async move {
+        shutdown_rx.await.unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        slow_started.notified().await;
+        // 第一次认领 slow；第二次认领为空，此时仍有一个空槽，调度器进入等待。
+        released_rx.recv().await.unwrap();
+        released_rx.recv().await.unwrap();
+    })
+    .await
+    .expect("scheduler starts the slow node and finishes its next claim");
+
+    task.name = "fast".into();
+    repo.enqueue(&task).await.unwrap();
+    wake.notify_one();
+    let started = tokio::time::timeout(Duration::from_secs(5), fast_started.notified()).await;
+
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("shutdown cancels the blocked node")
+        .unwrap();
+    assert!(
+        started.is_ok(),
+        "new work must start before the 60-second poll"
+    );
+    assert_eq!(
+        Arc::strong_count(&slow_started),
+        1,
+        "blocked node was dropped"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn scheduler_exits_at_idle_timeout_before_the_next_poll() {
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    migrate(&db).await.unwrap();
+    let graph = dsl::workflow! {
+        workflow_id: "scheduler-idle";
+        title: "空闲回收";
+        context: Context::default();
+        nodes { start => AddOne }
+        edges {}
+    }
+    .unwrap();
+    let idle_timeout = Duration::from_millis(20);
+    let scheduler = Scheduler::new(
+        Arc::new(graph),
+        SqliteTaskStore::new(SqliteTaskRepo::new(db.clone()), "scheduler-idle".into()),
+        Duration::from_secs(60),
+        Some(idle_timeout),
+    );
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), scheduler.run())
+        .await
+        .expect("idle deadline must not wait for the 60-second poll");
+    assert!(started.elapsed() >= idle_timeout);
     db.close().await;
 }

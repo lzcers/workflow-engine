@@ -396,8 +396,8 @@ impl SqliteTaskRepo {
         Ok(settled.into())
     }
 
-    /// Atomically settle as superseded/failed and enqueue failure successors.
-    /// Failure successors do not depend on the failed source task.
+    /// Atomically settle and enqueue failure successors, or fail pending dependents
+    /// in the same run when there are no successors.
     #[allow(clippy::too_many_arguments)]
     pub async fn fail_and_enqueue(
         &self,
@@ -405,7 +405,6 @@ impl SqliteTaskRepo {
         task_id: i64,
         run_id: Option<i64>,
         error: &str,
-        has_successors: bool,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
     ) -> SqliteResult<()> {
@@ -422,10 +421,10 @@ impl SqliteTaskRepo {
         )
         .bind(workflow_id)
         .bind(task_id)
-        .bind(if has_successors {
-            status::SUPERSEDED
-        } else {
+        .bind(if fanouts.is_empty() {
             status::FAILED
+        } else {
+            status::SUPERSEDED
         })
         .bind(error)
         .execute(&mut *tx)
@@ -448,6 +447,29 @@ impl SqliteTaskRepo {
                 &fanout.depends_on_names,
                 max_attempts,
             )
+            .await?;
+        }
+        if fanouts.is_empty() {
+            sqlx::query(
+                r#"
+                UPDATE tasks
+                SET status = 'failed', error = ?3, lease_until = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE workflow_id = ?1 AND status = 'pending'
+                  AND EXISTS (
+                      SELECT 1 FROM tasks source
+                      WHERE source.workflow_id = tasks.workflow_id AND source.task_id = ?2
+                        AND source.run_id IS tasks.run_id
+                        AND (source.task_id IN (SELECT value FROM json_each(tasks.depends_on_ids))
+                             OR (tasks.task_type = 'join'
+                                 AND source.name IN (SELECT value FROM json_each(tasks.depends_on_names))))
+                  )
+                "#,
+            )
+            .bind(workflow_id)
+            .bind(task_id)
+            .bind(format!("predecessor task {task_id} failed"))
+            .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
@@ -655,39 +677,5 @@ impl SqliteTaskRepo {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Fail pending tasks in the same run whose direct dependencies or static
-    /// predecessor names include the failed task, preventing indefinite waits.
-    pub async fn cascade_failed_predecessor(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-        task_name: &str,
-        error: &str,
-    ) -> SqliteResult<usize> {
-        let result = sqlx::query(
-            r#"
-            UPDATE tasks
-            SET status = 'failed', error = ?4, lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND status = 'pending'
-              AND EXISTS (
-                  SELECT 1 FROM tasks source
-                  WHERE source.workflow_id = ?1 AND source.task_id = ?2
-                    AND source.run_id IS tasks.run_id
-              )
-              AND (?2 IN (SELECT value FROM json_each(depends_on_ids))
-                   OR (task_type = 'join'
-                       AND ?3 IN (SELECT value FROM json_each(depends_on_names))))
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(task_name)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() as usize)
     }
 }

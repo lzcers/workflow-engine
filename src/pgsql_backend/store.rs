@@ -179,12 +179,11 @@ impl TaskStore for PgTaskStore {
             })
     }
 
-    /// 原子失败结算：fail/superseded + 全部失败后继入队同一事务。
+    /// 原子失败结算：标记终态，并入队失败后继或级联已有依赖任务。
     async fn fail_and_enqueue(
         &self,
         task: &PgTask,
         err: &TaskError,
-        has_successors: bool,
         fanouts: &[FanoutPlan],
     ) -> Result<(), PgStoreError> {
         let fanouts: Vec<FanoutInstances> = fanouts.iter().map(to_fanout_instances).collect();
@@ -194,7 +193,6 @@ impl TaskStore for PgTaskStore {
                 task.task_id,
                 task.run_id,
                 &err.to_string(),
-                has_successors,
                 &fanouts,
                 self.max_attempts,
             )
@@ -206,18 +204,6 @@ impl TaskStore for PgTaskStore {
     async fn release_claim(&self, task: &PgTask) -> Result<(), PgStoreError> {
         self.repo
             .release_claim(&self.workflow_id, task.task_id)
-            .await
-            .map_err(PgStoreError::Repo)
-    }
-
-    async fn cascade_failed_predecessor(&self, task: &PgTask) -> Result<usize, PgStoreError> {
-        self.repo
-            .cascade_failed_predecessor(
-                &self.workflow_id,
-                task.task_id,
-                &task.name,
-                &format!("predecessor task {} failed", task.task_id),
-            )
             .await
             .map_err(PgStoreError::Repo)
     }
