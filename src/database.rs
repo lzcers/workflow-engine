@@ -1,8 +1,12 @@
-//! 数据库连接与引擎表初始化；后端选择由连接 URL 决定。
+//! 数据库连接、引擎表初始化与任务存储创建；后端选择由连接 URL 决定。
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use crate::StorageError;
+#[cfg(feature = "pg")]
+use crate::backend::pgsql::{PgTaskRepo, PgTaskStore};
+#[cfg(feature = "sqlite")]
+use crate::backend::sqlite::{SqliteTaskRepo, SqliteTaskStore};
+use crate::{StorageError, TaskStore};
 
 /// 工作流存储的共享连接句柄。
 ///
@@ -105,6 +109,26 @@ impl Database {
                 }
             }
             _ => Err(StorageError::UnsupportedScheme),
+        }
+    }
+
+    /// 按连接时选定的后端创建工作流级存储，与当前数据库共享连接池。
+    /// 由 Engine 内部调用，不重新连接或初始化表。
+    pub(crate) fn task_store(
+        &self,
+        workflow_id: &str,
+    ) -> Arc<dyn TaskStore<Error = StorageError> + Send> {
+        match self {
+            #[cfg(feature = "pg")]
+            Self::Postgres(pool) => Arc::new(PgTaskStore::new(
+                PgTaskRepo::new(pool.clone()),
+                workflow_id.to_owned(),
+            )),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(pool) => Arc::new(SqliteTaskStore::new(
+                SqliteTaskRepo::new(pool.clone()),
+                workflow_id.to_owned(),
+            )),
         }
     }
 

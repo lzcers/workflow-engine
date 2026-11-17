@@ -24,7 +24,7 @@ const DEFAULT_MAX_CONCURRENCY: usize = 8;
 pub struct Scheduler<Ctx, Store>
 where
     Ctx: NodeContext + Sync + 'static,
-    Store: TaskStore,
+    Store: TaskStore + ?Sized,
 {
     store: Arc<Store>,
     graph: Arc<Graph<Ctx>>,
@@ -38,17 +38,17 @@ where
 impl<Ctx, Store> Scheduler<Ctx, Store>
 where
     Ctx: NodeContext + Sync + 'static,
-    Store: TaskStore + Send + 'static,
+    Store: TaskStore + Send + ?Sized + 'static,
 {
-    /// 由固定的图与会话级任务存储构造调度器。
+    /// 由固定的图与共享的工作流级任务存储构造调度器，支持具体存储或 trait object。
     pub fn new(
         graph: Arc<Graph<Ctx>>,
-        store: Store,
+        store: Arc<Store>,
         poll: Duration,                 // 多久轮询一次
         idle_timeout: Option<Duration>, // 超时时间
     ) -> Self {
         Self {
-            store: Arc::new(store),
+            store,
             graph,
             poll,
             idle_timeout,
@@ -74,7 +74,7 @@ where
     /// 无需外部停止时传入 `std::future::pending()`；没有空闲时限时持续运行。
     /// 调度循环 panic 时同样先等待清理，再传播 panic。
     /// 调用方应完成 shutdown future 并等待返回；直接中止本方法无法等待清理完成。
-    pub async fn run(self, shutdown: impl Future<Output = ()>) {
+    pub async fn run(&mut self, shutdown: impl Future<Output = ()>) {
         let mut in_flight = JoinSet::new();
         let outcome = std::panic::AssertUnwindSafe(async {
             tokio::select! {
@@ -161,7 +161,7 @@ where
 async fn settle<Ctx, S>(graph: &Graph<Ctx>, store: &S, task: &TaskRecord) -> Result<(), S::Error>
 where
     Ctx: NodeContext + Sync,
-    S: TaskStore,
+    S: TaskStore + ?Sized,
 {
     let name = task.name.as_str();
     let mut ctx = graph.context().fork(task).await;
@@ -205,7 +205,7 @@ async fn settle_failure<Ctx, S>(
 ) -> Result<(), S::Error>
 where
     Ctx: NodeContext + Sync,
-    S: TaskStore,
+    S: TaskStore + ?Sized,
 {
     let name = task.name.as_str();
     warn!(error = %e, "task failed");
@@ -225,7 +225,7 @@ where
 async fn settle_safely<Ctx, S>(graph: Arc<Graph<Ctx>>, store: Arc<S>, task: TaskRecord)
 where
     Ctx: NodeContext + Sync + 'static,
-    S: TaskStore + Send + 'static,
+    S: TaskStore + Send + ?Sized + 'static,
 {
     let span = tracing::info_span!("settle", task_id = task.task_id, name = task.name.as_str());
     async {

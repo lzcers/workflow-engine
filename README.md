@@ -5,7 +5,9 @@
 
 ## 定位
 
-- 引擎核心（`node` / `graph` / `edge` / `task` / `scheduler`）**零数据库依赖**；
+- 图与调度核心（`node` / `graph` / `edge` / `task` / `scheduler`）**零数据库依赖**；
+- 上层通过 `Engine<Ctx>` 使用单图控制平面，传入 `Graph` 和 `Database` 即可，
+  无需构造仓储或实现 `TaskStore`；`Engine` 随 `pg` / `sqlite` feature 启用；
 - PostgreSQL 通用实现由 `pg` feature 门控（`workflow-engine = { features = ["pg"] }`）；
 - SQLite 通用实现由 `sqlite` feature 门控；两个后端可独立启用，也可同时启用；
 - 调度器使用统一的任务快照 `TaskRecord`，依赖任务存储 `TaskStore`、图引擎 `Graph`、
@@ -42,6 +44,9 @@ database.close().await;
 `close` 关闭共享连接池，所有克隆句柄都会受到影响。连接、初始化、仓储和任务存储统一返回
 `StorageError`，保留底层错误来源。
 
+`Database` 内部按 URL 已确定的后端创建对应 `TaskStore`，绑定引擎传入的工作流身份，
+复用现有连接池。此工厂仅供库内部调用，上层使用 `Engine` 时无需选择或构造存储。
+
 SQLite 可写文件连接默认启用 WAL 和 5 秒锁等待，未指定 `mode` 时允许创建文件；显式的
 `mode` 和 `immutable` 参数保持原意。内存及临时数据库使用单连接且不按空闲时间或存活时间回收。
 PostgreSQL 使用最多 10 个连接和 5 秒连接池获取超时。
@@ -57,10 +62,59 @@ PostgreSQL 使用最多 10 个连接和 5 秒连接池获取超时。
 | [`graph`](src/graph) | [`Graph`](src/graph/mod.rs) 图引擎：节点注册、边规划（`plan_success` / `plan_failure`）、执行（`execute`）、静态校验、图描述（`describe`） |
 | [`dsl`](src/dsl.rs) | 声明式图 DSL：`workflow!` 宏把 `nodes { … }` + `edges { … }` 展开为 Graph 构建链，并做**编译期**类型接线校验 |
 | [`task`](src/task) | `record` 定义公共任务记录和输入，`store` 定义认领、结算与后继入队契约 |
-| [`database`](src/database.rs) | 统一连接、初始化、健康检查与关闭入口 |
+| [`database`](src/database.rs) | 统一连接、初始化、健康检查与关闭入口，内部按后端创建任务存储 |
 | [`scheduler`](src/scheduler.rs) | 通用单会话调度器 [`Scheduler`](src/scheduler.rs)：批量认领无依赖任务 → 多协程并发结算 |
+| [`engine`](src/engine.rs)（`pg` / `sqlite`） | 单图控制平面 `Engine`：从 `Database` 创建内部存储，持有调度器，通过 `submit` 提交任务并返回 `RunHandle` |
 | [`backend::pgsql`](src/backend/pgsql)（`pg`） | PostgreSQL 通用实现：`PgTaskRepo` / `PgTaskStore` / 任务就绪通知与恢复查询 |
 | [`backend::sqlite`](src/backend/sqlite)（`sqlite`） | SQLite 通用实现：`SqliteTaskRepo` / `SqliteTaskStore` / 就绪工作流查询与租约恢复 |
+
+## 单图控制平面
+
+`Engine::new(graph, database, poll, idle_timeout)` 接收一张完整的图和统一数据库连接，
+内部通过 `Database` 获取绑定图 `workflow_id` 的存储，再创建并持有一个 `Scheduler`。
+公开类型为 `Engine<Ctx>`，错误类型为 `EngineError`，都不携带存储泛型。
+`Database` 负责连接与表初始化；构造引擎不会启动调度，调用 `run(shutdown)` 开始执行。
+同一引擎不能同时启动多个调度循环。
+
+```rust,no_run
+use std::time::Duration;
+use workflow_engine::{Database, Engine, Graph, NodeContext, Task};
+
+async fn execute<Ctx>(
+    graph: Graph<Ctx>,
+    task: Task,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    Ctx: NodeContext + Sync + 'static,
+{
+    let database = Database::connect("sqlite://workflow.db").await?;
+    database.initialize().await?;
+    let engine = Engine::new(
+        graph,
+        database,
+        Duration::from_secs(1),
+        Some(Duration::from_secs(5)),
+    );
+    let handle = engine.submit(&task).await?;
+    // status 当前为空方法，不返回实际运行状态。
+    handle.status().await;
+    engine.run(std::future::pending()).await?;
+    Ok(())
+}
+```
+
+`submit(&Task)` 校验工作流身份与节点名，成功持久化后唤醒调度器，再返回 `RunHandle`。
+句柄保存 `workflow_id`、`run_id` 和提交任务的 `task_id`。入口由 `Task.name` 明确指定；
+`run_id` 沿用传入值，不自动分配，独立运行应使用不同的分组键，`None` 共享同一分组。
+运行期间可继续提交：`run` 和 `submit` 都借用引擎，可以通过 `tokio::join!` 并发调用，
+或用 `Arc<Engine<Ctx>>` 在宿主任务之间共享。停止时应完成 shutdown future 并等待
+`run` 返回；返回后可再次调用 `run`。
+
+`TaskStore` 保留为底层 `Scheduler` 的扩展契约；异步方法返回 `BoxFuture`，可直接作为
+trait object。`Database` 负责后端选择与存储创建，`Engine` 与调度器共享同一个
+`Arc<dyn TaskStore>`；使用 `Engine` 时无需接触该契约。
+上述示例启用 `sqlite` feature，PostgreSQL 使用 `pg` feature 和对应连接 URL；同一个
+`Database` 可通过 `clone()` 共享给多个图的引擎，各自自动绑定图身份。
 
 ## 关键机制
 
@@ -134,7 +188,7 @@ repo.enqueue(&Task {
     input: json!({"message": "hello"}),
 }).await?;
 let store = SqliteTaskStore::new(repo, "demo".into());
-// 将 store 和 Arc<Graph<Ctx>> 交给 Scheduler::new；Ctx 实现 NodeContext。
+// 将 Arc::new(store) 和 Arc<Graph<Ctx>> 交给 Scheduler::new；Ctx 实现 NodeContext。
 # let _ = store;
 # Ok(())
 # }
@@ -214,7 +268,10 @@ let description = graph.describe();
 工作流身份和标题只在图中定义；应用注册表直接索引完整的图描述，不重复指定身份和名称。
 运行状态仍由任务存储管理，无需另外维护一份画布拓扑。
 
-`Scheduler::new(graph, store, poll, idle_timeout)` 直接接收 `Arc<Graph<Ctx>>`：图是固定的拓扑
+直接使用调度器时，`Scheduler::run` 可变借用调度器；将其放进 `tokio::spawn` 时，用
+`async move` 块持有 `mut scheduler` 并等待 `scheduler.run(shutdown)`。
+`Scheduler::new(graph, store, poll, idle_timeout)` 接收 `Arc<Graph<Ctx>>` 和 `Arc<Store>`，
+支持具体存储和 `dyn TaskStore`。图是固定的拓扑
 真相源，会话配置等易变依赖由上下文在 `NodeContext::fork`（异步）里按任务刷新——「配置变更对
 下一个认领的任务生效」。刷新失败由业务侧降级为沿用上一份已生效配置，不阻塞认领。
 

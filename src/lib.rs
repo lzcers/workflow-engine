@@ -5,6 +5,8 @@
 //! - [`graph`]：图引擎（[`Graph`]），负责节点注册、边规划、执行与静态校验。
 //! - [`task`]：任务内容 [`Task`]、记录 [`TaskRecord`] 与持久化契约 [`TaskStore`]。
 //! - [`scheduler`]：通用调度器（[`Scheduler`]），认领任务、结算并规划后继。
+//! - `engine`（`pg` / `sqlite` feature）：单图控制平面（`Engine`），创建调度器、
+//!   提交任务并返回 `RunHandle`。
 //! - [`backend::pgsql`]（`pg` feature）：PostgreSQL 通用实现（`PgTaskRepo` / `PgTaskStore` /
 //!   任务就绪通知与恢复查询）。默认关闭，引擎核心保持零数据库依赖。
 //! - [`backend::sqlite`]（`sqlite` feature）：SQLite 通用实现（`SqliteTaskRepo` /
@@ -28,6 +30,8 @@ pub use database::Database;
 pub mod backend;
 pub mod dsl;
 pub mod edge;
+#[cfg(any(feature = "pg", feature = "sqlite"))]
+pub mod engine;
 pub mod graph;
 pub mod node;
 pub mod scheduler;
@@ -38,6 +42,8 @@ pub use edge::{
     SuccessEdge, WhenBuilder, map, map_checked, on_error, on_error_checked, passthrough_checked,
     when, when_checked, when_error, when_error_checked,
 };
+#[cfg(any(feature = "pg", feature = "sqlite"))]
+pub use engine::{Engine, EngineError, RunHandle};
 pub use graph::{EdgeDescription, EdgeKind, Graph, GraphDescription, NodeDescription};
 pub use node::{AnyNode, JoinNode, Node, NodeContext, NodeError, NodeKey};
 pub use scheduler::Scheduler;

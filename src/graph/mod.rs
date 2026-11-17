@@ -81,6 +81,12 @@ impl<Ctx> Graph<Ctx> {
         &self.context
     }
 
+    /// 控制平面在入队前检查任务引用的节点。
+    #[cfg(any(feature = "pg", feature = "sqlite"))]
+    pub(crate) fn contains_node(&self, name: &str) -> bool {
+        self.nodes.contains_key(name)
+    }
+
     /// 执行节点前发布任务开始事件。
     pub async fn on_start(&self, name: &str, ctx: &mut Ctx, input: &Value) {
         if let Some(node) = self.nodes.get(name) {

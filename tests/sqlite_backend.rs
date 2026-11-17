@@ -112,9 +112,9 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .await
         .unwrap();
     let store = SqliteTaskStore::new(repo.clone(), root.workflow_id.clone()).with_max_attempts(5);
-    let scheduler = Scheduler::new(
+    let mut scheduler = Scheduler::new(
         Arc::new(graph),
-        store,
+        Arc::new(store),
         Duration::from_millis(2),
         Some(Duration::from_millis(10)),
     )
@@ -246,9 +246,9 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     }
     .unwrap();
     let wake = Arc::new(Notify::new());
-    let scheduler = Scheduler::new(
+    let mut scheduler = Scheduler::new(
         Arc::new(graph),
-        SqliteTaskStore::new(repo.clone(), task.workflow_id.clone()),
+        Arc::new(SqliteTaskStore::new(repo.clone(), task.workflow_id.clone())),
         Duration::from_secs(60),
         None,
     )
@@ -262,9 +262,13 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     released_rx.recv().await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let worker = tokio::spawn(scheduler.run(async move {
-        shutdown_rx.await.unwrap();
-    }));
+    let worker = tokio::spawn(async move {
+        scheduler
+            .run(async move {
+                shutdown_rx.await.unwrap();
+            })
+            .await;
+    });
     tokio::time::timeout(Duration::from_secs(5), async {
         slow_started.notified().await;
         // 第一次认领 slow；第二次认领为空，此时仍有一个空槽，调度器进入等待。
@@ -313,9 +317,12 @@ async fn scheduler_exits_at_idle_timeout_before_the_next_poll() {
     }
     .unwrap();
     let idle_timeout = Duration::from_millis(20);
-    let scheduler = Scheduler::new(
+    let mut scheduler = Scheduler::new(
         Arc::new(graph),
-        SqliteTaskStore::new(SqliteTaskRepo::new(db.clone()), "scheduler-idle".into()),
+        Arc::new(SqliteTaskStore::new(
+            SqliteTaskRepo::new(db.clone()),
+            "scheduler-idle".into(),
+        )),
         Duration::from_secs(60),
         Some(idle_timeout),
     );
