@@ -4,4 +4,4 @@ pub mod record;
 pub mod store;
 
 pub use record::{Task, TaskRecord, TaskStatus};
-pub use store::{FanoutInstances, FanoutPlan, TaskError, TaskStore};
+pub use store::{FanoutInstances, FanoutPlan, TaskStore};

@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
 use super::{SqliteTaskRepo, SqliteTaskStore, migrate};
-use crate::{FanoutPlan, StorageError, Task, TaskError, TaskRecord, TaskStatus, TaskStore};
+use crate::{FanoutPlan, StorageError, Task, TaskRecord, TaskStatus, TaskStore};
 
 async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
     let pool = SqlitePoolOptions::new()
@@ -386,7 +386,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     let invalid = plan("invalid", "unsupported", vec![json!({})]);
     assert!(
         store
-            .succeed_and_enqueue(&claimed, &json!({"done": true}), &[valid.clone(), invalid])
+            .settle_success(&claimed, &json!({"done": true}), &[valid.clone(), invalid])
             .await
             .is_err()
     );
@@ -400,10 +400,11 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         .execute(&pool)
         .await
         .unwrap();
-    let settled = store
-        .succeed_and_enqueue(&claimed, &json!({"done": true}), &[valid])
+    store
+        .settle_success(&claimed, &json!({"done": true}), &[valid])
         .await
         .unwrap();
+    let settled = get(&repo, &claimed).await;
     assert_eq!(settled.run_id, Some(9));
     assert_eq!(settled.status, TaskStatus::Succeeded);
     assert!(settled.lease_until.is_none());
@@ -433,10 +434,10 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     let claimed = store.claim_many(1).await.unwrap().remove(0);
     let recovery = plan("recovery", "normal", vec![json!({"retry": true})]);
     let invalid = plan("invalid", "unsupported", vec![json!({})]);
-    let error = TaskError::new("execution failed");
+    let message = "execution failed";
     assert!(
         store
-            .fail_and_enqueue(&claimed, &error, &[recovery.clone(), invalid])
+            .settle_failure(&claimed, message, &[recovery.clone(), invalid])
             .await
             .is_err()
     );
@@ -447,7 +448,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     let reclaimed = store.claim_many(1).await.unwrap().remove(0);
     assert_eq!(reclaimed.attempt, 2);
     store
-        .fail_and_enqueue(&reclaimed, &error, &[recovery])
+        .settle_failure(&reclaimed, message, &[recovery])
         .await
         .unwrap();
     let settled = get(&repo, &task).await;
@@ -459,10 +460,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert_eq!(recovery.instance_id, None);
     assert_eq!(recovery.run_id, Some(4));
     assert!(recovery.depends_on_ids.is_empty());
-    store
-        .fail_and_enqueue(&recovery, &error, &[])
-        .await
-        .unwrap();
+    store.settle_failure(&recovery, message, &[]).await.unwrap();
     assert_eq!(get(&repo, &recovery).await.status, TaskStatus::Failed);
 }
 
@@ -473,9 +471,9 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
     let store = SqliteTaskStore::new(repo.clone(), "same_name".into());
     let source = store.claim_many(1).await.unwrap().remove(0);
     store
-        .fail_and_enqueue(
+        .settle_failure(
             &source,
-            &TaskError::new("retry requested"),
+            "retry requested",
             &[plan("retry", "normal", vec![json!({"retry": true})])],
         )
         .await
@@ -506,7 +504,10 @@ async fn release_all_claims_and_store_operations_stay_in_their_workflow() {
             .is_empty()
     );
 
-    store.succeed(&ours, &json!("ours")).await.unwrap();
+    store
+        .settle_success(&ours, &json!("ours"), &[])
+        .await
+        .unwrap();
     assert_eq!(get(&repo, &ours).await.status, TaskStatus::Succeeded);
     assert_eq!(get(&repo, &theirs).await.status, TaskStatus::Running);
     assert_eq!(get(&repo, &theirs).await.output, None);
@@ -550,7 +551,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     let unrelated = repo.enqueue(&new_task("other", "root")).await.unwrap();
     let store = SqliteTaskStore::new(repo.clone(), "cascade".into());
     let root = store.claim_many(1).await.unwrap().remove(0);
-    let error = TaskError::new("permanent failure");
+    let message = "permanent failure";
 
     // A failed cascade must also roll back the source's terminal state and lease.
     sqlx::query(
@@ -565,7 +566,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     .execute(&pool)
     .await
     .unwrap();
-    assert!(store.fail_and_enqueue(&root, &error, &[]).await.is_err());
+    assert!(store.settle_failure(&root, message, &[]).await.is_err());
     let unchanged = get(&repo, &root).await;
     assert_eq!(unchanged.status, TaskStatus::Running);
     assert_eq!(unchanged.lease_until, root.lease_until);
@@ -577,7 +578,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .await
         .unwrap();
 
-    store.fail_and_enqueue(&root, &error, &[]).await.unwrap();
+    store.settle_failure(&root, message, &[]).await.unwrap();
     assert_eq!(get(&repo, &root).await.status, TaskStatus::Failed);
     assert_eq!(get(&repo, &child).await.status, TaskStatus::Failed);
     assert_eq!(get(&repo, &join).await.status, TaskStatus::Failed);
@@ -658,7 +659,7 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
 
         let store = SqliteTaskStore::new(repo.clone(), "cascade_runs".into());
         store
-            .fail_and_enqueue(&root, &TaskError::new("permanent failure"), &[])
+            .settle_failure(&root, "permanent failure", &[])
             .await
             .unwrap();
 

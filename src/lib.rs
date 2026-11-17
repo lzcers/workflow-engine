@@ -41,4 +41,4 @@ pub use edge::{
 pub use graph::{EdgeDescription, EdgeKind, Graph, GraphDescription, NodeDescription};
 pub use node::{AnyNode, JoinNode, Node, NodeContext, NodeError, NodeKey};
 pub use scheduler::Scheduler;
-pub use task::{FanoutInstances, FanoutPlan, Task, TaskError, TaskRecord, TaskStatus, TaskStore};
+pub use task::{FanoutInstances, FanoutPlan, Task, TaskRecord, TaskStatus, TaskStore};

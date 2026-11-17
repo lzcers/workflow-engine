@@ -16,7 +16,7 @@ use tracing::{Instrument, error, info, warn};
 
 use super::graph::{Graph, Successor};
 use super::node::{NodeContext, NodeError};
-use super::task::{FanoutPlan, TaskError, TaskRecord, TaskStore};
+use super::task::{FanoutPlan, TaskRecord, TaskStore};
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
 
@@ -182,8 +182,11 @@ where
                     .await;
                 }
             };
-            let fanouts: Vec<_> = successors.into_iter().map(FanoutPlan::from).collect();
-            store.succeed_and_enqueue(task, &output, &fanouts).await?;
+            let fanouts = successors
+                .into_iter()
+                .map(FanoutPlan::from)
+                .collect::<Vec<FanoutPlan>>();
+            store.settle_success(task, &output, &fanouts).await?;
             // 成功回调发生在状态与后继提交之后。
             graph.on_success(name, &mut ctx, &output).await;
             Ok(())
@@ -215,9 +218,7 @@ where
             Vec::new()
         }
     };
-    store
-        .fail_and_enqueue(task, &TaskError::from(e), &fanouts)
-        .await
+    store.settle_failure(task, &e.to_string(), &fanouts).await
 }
 
 /// 统一记录结算错误与 panic，并释放租约供重试（at-least-once 执行）。
@@ -261,12 +262,5 @@ impl From<Successor> for FanoutPlan {
             inputs: s.inputs,
             depends_on_names: s.depends_on_names,
         }
-    }
-}
-
-/// 错误种类已用于失败路由，存储只需错误消息。
-impl From<&NodeError> for TaskError {
-    fn from(e: &NodeError) -> Self {
-        TaskError::new(e.to_string())
     }
 }

@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use super::repo::PgTaskRepo;
-use crate::{FanoutInstances, FanoutPlan, StorageError, TaskError, TaskRecord, TaskStore};
+use crate::{FanoutInstances, FanoutPlan, StorageError, TaskRecord, TaskStore};
 
 /// 工作流级任务存储：绑定 `workflow_id + PgTaskRepo`，把 [`TaskStore`] 落到 `tasks` 表。
 #[derive(Clone)]
@@ -35,7 +35,7 @@ impl PgTaskStore {
 
 /// 把 `inputs` 折叠为 `(instance_id, input)` 实例列表：`len == 1` → 单实例（`None`，
 /// 扇入合并）；`len > 1` → map 边扇出的多实例（各占一个独立 `instance_id`）。
-/// 与 [`TaskStore::enqueue_fanout`] 的既有实例模型一致，成功/失败后继共用。
+/// 成功后继和失败后继共用此实例模型。
 fn fold_instances(inputs: &[Value]) -> Vec<(Option<i32>, Value)> {
     if inputs.len() == 1 {
         vec![(None, inputs[0].clone())]
@@ -67,70 +67,14 @@ impl TaskStore for PgTaskStore {
             .await
     }
 
-    async fn succeed(&self, task: &TaskRecord, output: &Value) -> Result<TaskRecord, StorageError> {
-        // RETURNING 一步拿回节点回填的最新行（如业务侧 `attach_commit` 附着的分组键），
-        // 无需二次回读；行缺失视为确定性错误。
-        self.repo
-            .succeed(&self.workflow_id, task.task_id, output)
-            .await
-    }
-
-    async fn fail(
-        &self,
-        task: &TaskRecord,
-        err: &TaskError,
-        has_successors: bool,
-    ) -> Result<(), StorageError> {
-        // 有后继接管失败 → 标记 superseded（对外不暴露为失败，前端看到后继在推进）；
-        // 无后继 → 标记 failed。
-        if has_successors {
-            self.repo
-                .supersede(&self.workflow_id, task.task_id, &err.to_string())
-                .await
-        } else {
-            self.repo
-                .fail(&self.workflow_id, task.task_id, &err.to_string())
-                .await
-        }
-    }
-
-    async fn enqueue_fanout(
-        &self,
-        task: &TaskRecord,
-        name: &str,
-        task_type: &str,
-        inputs: &[Value],
-        depends_on_names: &[String],
-        depends_on_ids: &[i64],
-    ) -> Result<(), StorageError> {
-        // 统一 fanout 实例模型（成功/失败后继共用）：单实例（len==1）→ instance_id=None
-        // （扇入合并）；多实例 → 各占一个独立 instance_id。扇出父一次性登记实例全集：
-        // 父的 task_id 与其全部实例共同构成 JOIN 依赖。
-        let instances = fold_instances(inputs);
-        self.repo
-            .enqueue_fanout(
-                &self.workflow_id,
-                task.run_id,
-                name,
-                &instances,
-                depends_on_ids,
-                task_type,
-                depends_on_names,
-                self.max_attempts,
-            )
-            .await
-            .map(|_| ())
-    }
-
-    /// 原子成功结算：succeed + 全部成功后继入队同一事务，返回回填后的任务记录
-    /// （如业务节点结算时附着的分组键）。
-    async fn succeed_and_enqueue(
+    /// 原子成功结算：写入输出并入队全部成功后继，后继使用任务最新的分组键。
+    async fn settle_success(
         &self,
         task: &TaskRecord,
         output: &Value,
-        fanouts: &[FanoutPlan],
-    ) -> Result<TaskRecord, StorageError> {
-        let fanouts: Vec<FanoutInstances> = fanouts.iter().map(to_fanout_instances).collect();
+        successors: &[FanoutPlan],
+    ) -> Result<(), StorageError> {
+        let fanouts: Vec<FanoutInstances> = successors.iter().map(to_fanout_instances).collect();
         self.repo
             .succeed_and_enqueue(
                 &self.workflow_id,
@@ -140,22 +84,23 @@ impl TaskStore for PgTaskStore {
                 self.max_attempts,
             )
             .await
+            .map(|_| ())
     }
 
     /// 原子失败结算：标记终态，并入队失败后继或级联已有依赖任务。
-    async fn fail_and_enqueue(
+    async fn settle_failure(
         &self,
         task: &TaskRecord,
-        err: &TaskError,
-        fanouts: &[FanoutPlan],
+        message: &str,
+        successors: &[FanoutPlan],
     ) -> Result<(), StorageError> {
-        let fanouts: Vec<FanoutInstances> = fanouts.iter().map(to_fanout_instances).collect();
+        let fanouts: Vec<FanoutInstances> = successors.iter().map(to_fanout_instances).collect();
         self.repo
             .fail_and_enqueue(
                 &self.workflow_id,
                 task.task_id,
                 task.run_id,
-                &err.to_string(),
+                message,
                 &fanouts,
                 self.max_attempts,
             )
