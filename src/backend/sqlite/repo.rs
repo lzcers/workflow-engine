@@ -16,7 +16,7 @@ use crate::task::store::{LEASE_DURATION, merge_join_input};
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";
 
 /// Columns suitable for application queries against the same task table.
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, name, instance_id, status, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, producer_task_id, name, instance_id, status, \
     claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
     input_json, output_json, error, created_at, updated_at";
 
@@ -97,6 +97,7 @@ async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
+    producer_task_id: Option<i64>,
     name: &str,
     instances: &[(Option<i32>, Value)],
     depends_on_ids: &[i64],
@@ -112,8 +113,9 @@ async fn enqueue_fanout_in_tx(
                 r#"
                 INSERT INTO tasks
                     (workflow_id, task_id, run_id, name, instance_id, status,
-                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json)
-                VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?8, ?9, ?10)
+                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
+                     producer_task_id)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?8, ?9, ?10, ?11)
                 ON CONFLICT DO NOTHING
                 RETURNING {ROW_COLS}
                 "#
@@ -128,6 +130,7 @@ async fn enqueue_fanout_in_tx(
             .bind(Json(depends_on_ids))
             .bind(Json(depends_on_names))
             .bind(input)
+            .bind(producer_task_id)
             .fetch_optional(&mut **tx)
             .await?;
             if let Some(row) = row {
@@ -201,8 +204,9 @@ async fn enqueue_fanout_in_tx(
                 r#"
                 INSERT INTO tasks
                     (workflow_id, task_id, run_id, name, instance_id, status,
-                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json)
-                VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, ?6, ?7, ?8, ?9, ?10)
+                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
+                     producer_task_id)
+                VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)
                 RETURNING {ROW_COLS}
                 "#
             ))
@@ -220,6 +224,7 @@ async fn enqueue_fanout_in_tx(
             .bind(Json(depends_on_ids))
             .bind(Json(depends_on_names))
             .bind(input)
+            .bind(producer_task_id)
             .fetch_one(&mut **tx)
             .await?
         };
@@ -245,8 +250,9 @@ impl SqliteTaskRepo {
             r#"
             INSERT INTO tasks
                 (workflow_id, task_id, run_id, name, instance_id, status,
-                 attempt, max_attempts, depends_on_ids, depends_on_names, input_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?8, ?9)
+                 attempt, max_attempts, depends_on_ids, depends_on_names, input_json,
+                 producer_task_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?8, ?9, ?10)
             RETURNING {ROW_COLS}
             "#
         ))
@@ -259,6 +265,7 @@ impl SqliteTaskRepo {
         .bind(Json(&task.depends_on_ids))
         .bind(Json(&task.depends_on_names))
         .bind(&task.input)
+        .bind(task.producer_task_id)
         .fetch_one(&mut **tx)
         .await?;
         Ok(row.into())
@@ -273,12 +280,14 @@ impl SqliteTaskRepo {
     }
 
     /// Enqueue all instances atomically. Single instances merge dependencies (and
-    /// JOIN input); numbered map instances are deduplicated by their unique key.
+    /// JOIN input) across producers, preserving the initial producer. Numbered map
+    /// instances are deduplicated within each producer's output to the destination.
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_fanout(
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
+        producer_task_id: Option<i64>,
         name: &str,
         instances: &[(Option<i32>, Value)],
         depends_on_ids: &[i64],
@@ -291,6 +300,7 @@ impl SqliteTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
+            producer_task_id,
             name,
             instances,
             depends_on_ids,
@@ -337,6 +347,7 @@ impl SqliteTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                Some(task.task_id),
                 &fanout.name,
                 &fanout.instances,
                 &[settled.task_id],
@@ -390,6 +401,7 @@ impl SqliteTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                Some(task.task_id),
                 &fanout.name,
                 &fanout.instances,
                 &[],

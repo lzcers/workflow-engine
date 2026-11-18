@@ -18,10 +18,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一。
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。
     task_id INTEGER NOT NULL CHECK (task_id > 0),
+    -- 首次创建任务的源任务 ID；入口可为 NULL，汇合保留首个创建者，全部前驱由 depends_on_ids 记录。
+    producer_task_id INTEGER CHECK (producer_task_id > 0),
     -- 工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。
     name TEXT NOT NULL,
     -- 节点扇出的实例序号；NULL 表示单实例，多实例从 0 开始编号。
-    -- 与 workflow_id、run_id、name 一起用于扇出去重。
+    -- 与 workflow_id、run_id、producer_task_id、name 一起用于扇出去重。
     instance_id INTEGER,
     -- pending 待认领，running 已认领，succeeded 成功，failed 永久失败，
     -- skipped 跳过，superseded 失败已由后继接管。
@@ -66,10 +68,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_recovery ON tasks(status, workflow_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_predecessors ON tasks(workflow_id, run_id, name, status);
 
 -- 分开约束 NULL 与非 NULL 的 run，避免把 NULL 与有效 run_id（如 0）合并。
+-- 未指定创建者使用独立的 0 键空间；有效任务 ID 必须为正数。单实例不受此唯一键约束。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_fanout_instance
-ON tasks(workflow_id, run_id, name, instance_id)
+ON tasks(workflow_id, run_id, COALESCE(producer_task_id, 0), name, instance_id)
 WHERE instance_id IS NOT NULL AND run_id IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_fanout_instance_without_run
-ON tasks(workflow_id, name, instance_id)
+ON tasks(workflow_id, COALESCE(producer_task_id, 0), name, instance_id)
 WHERE instance_id IS NOT NULL AND run_id IS NULL;

@@ -20,7 +20,7 @@ const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_
 
 /// 任务行 SELECT / RETURNING 列（顺序与表结构一致）。`pub`：消费方的业务查询
 /// 与同一张表交互时复用同一列序。
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, name, instance_id, status, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, producer_task_id, name, instance_id, status, \
      claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
      input_json, output_json, error, created_at, updated_at";
 
@@ -169,6 +169,7 @@ async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
     run_id: Option<i64>,
+    producer_task_id: Option<i64>,
     name: &str,
     instances: &[(Option<i32>, Value)],
     depends_on_ids: &[i64],
@@ -190,10 +191,10 @@ async fn enqueue_fanout_in_tx(
                 INSERT INTO tasks
                     (workflow_id, task_id, run_id, name, instance_id, status, claimed_by, lease_until,
                      attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
-                     output_json, error, created_at, updated_at)
+                     output_json, error, created_at, updated_at, producer_task_id)
                 VALUES
                     ($1, $2, $3, $4, $5, 'pending', NULL, NULL, 0, $6, $7, $8, $9, $10::jsonb,
-                     NULL, NULL, NOW(), NOW())
+                     NULL, NULL, NOW(), NOW(), $11)
                 ON CONFLICT DO NOTHING
                 {return_cols}
                 "#
@@ -208,6 +209,7 @@ async fn enqueue_fanout_in_tx(
             .bind(depends_on_ids)
             .bind(depends_on_names)
             .bind(input)
+            .bind(producer_task_id)
             .fetch_optional(&mut **tx)
             .await?;
             if let Some(row) = inserted {
@@ -307,10 +309,10 @@ async fn enqueue_fanout_in_tx(
                     INSERT INTO tasks
                         (workflow_id, task_id, run_id, name, instance_id, status, claimed_by, lease_until,
                          attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
-                         output_json, error, created_at, updated_at)
+                         output_json, error, created_at, updated_at, producer_task_id)
                     VALUES
                         ($1, $2, $3, $4, NULL, $5, NULL, NULL, 0, $6, $7, $8, $9, $10::jsonb,
-                         NULL, NULL, NOW(), NOW())
+                         NULL, NULL, NOW(), NOW(), $11)
                     {return_cols}
                     "#
                 ))
@@ -324,6 +326,7 @@ async fn enqueue_fanout_in_tx(
                 .bind(depends_on_ids)
                 .bind(depends_on_names)
                 .bind(input)
+                .bind(producer_task_id)
                 .fetch_one(&mut **tx)
                 .await?
             };
@@ -413,13 +416,13 @@ impl PgTaskRepo {
                 (
                     workflow_id, task_id, run_id, name, instance_id, status,
                     claimed_by, lease_until, attempt, max_attempts, depends_on_ids, depends_on_names,
-                    input_json, output_json, error, created_at, updated_at
+                    input_json, output_json, error, created_at, updated_at, producer_task_id
                 )
             VALUES
                 (
                     $1, $2, $3, $4, $5, 'pending',
                     NULL, NULL, 0, $6, $7, $8,
-                    $9::jsonb, NULL, NULL, NOW(), NOW()
+                    $9::jsonb, NULL, NULL, NOW(), NOW(), $10
                 )
             RETURNING {ROW_COLS}
             "#
@@ -434,6 +437,7 @@ impl PgTaskRepo {
             .bind(&task.depends_on_ids)
             .bind(&task.depends_on_names)
             .bind(&task.input)
+            .bind(task.producer_task_id)
             .fetch_one(&mut **tx)
             .await?;
         Ok(row.into())
@@ -457,9 +461,11 @@ impl PgTaskRepo {
     ///   `depends_on_ids`，避免对同一后继重复入队）。运行级事务锁覆盖“查无记录再创建”的窗口，
     ///   已有记录通过行锁合并。
     /// - `instance_id = Some(i)`：**多实例**（map 边扇出的第 i 个实例），独立成行、互不合并；
-    ///   去重由唯一键 `uq_tasks_fanout_instance` 兜底（同键重入队经
-    ///   `ON CONFLICT DO NOTHING` 跳过，覆盖「结算事务已提交但响应丢失」的重执行场景）。
+    ///   按 workflow、run、producer_task_id、name、instance_id 唯一，
+    ///   不同产生者的实例编号互不冲突；同键重入队经唯一键
+    ///   `ON CONFLICT DO NOTHING` 跳过。
     ///
+    /// producer_task_id 记录首次创建者；单实例汇合匹配不按产生者隔离，合并时保留原值。
     /// 全部实例在**同一事务**内分配连续 task_id 并插入/合并，返回每个实例的记录
     /// （供扇出父一次性把实例全集登记进 JOIN 节点的 `depends_on_ids`；冲突跳过的实例不在内）。
     /// `task_type` 为目标节点产出的任务类型（`normal`/`join`）；`depends_on_names` 为目标节点
@@ -469,6 +475,7 @@ impl PgTaskRepo {
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
+        producer_task_id: Option<i64>,
         name: &str,
         instances: &[(Option<i32>, Value)],
         depends_on_ids: &[i64],
@@ -486,6 +493,7 @@ impl PgTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
+            producer_task_id,
             name,
             instances,
             depends_on_ids,
@@ -519,6 +527,7 @@ impl PgTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                Some(task.task_id),
                 &f.name,
                 &f.instances,
                 &[task.task_id],
@@ -557,6 +566,7 @@ impl PgTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                Some(task.task_id),
                 &f.name,
                 &f.instances,
                 &[],

@@ -31,9 +31,16 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
 `Task::new(workflow_id, name, input)` 默认创建无依赖的独立运行入口，尝试预算为 3；
-入队前可设置 `run_id`、`depends_on_ids`、`depends_on_names`、`instance_id` 和 `max_attempts`。
+入队前可设置 `run_id`、`producer_task_id`、`depends_on_ids`、`depends_on_names`、`instance_id` 和 `max_attempts`。
 存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
 业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
+
+`producer_task_id` 记录首次创建任务的源任务 ID，独立入口为 `None`。成功和失败后继均由
+引擎自动填写；它不替代 `depends_on_ids`，失败后继可以记录创建者而不依赖其成功。
+多实例以 `workflow_id + run_id + producer_task_id + name + instance_id` 去重，因此两层扇出中
+不同父任务各自生成的同序号子任务独立存在，同一父任务重复入队仍去重。
+单实例（`instance_id = None`）继续按运行和节点名汇合，JOIN 跨父任务累积依赖及输入，
+保留首次创建时的 `producer_task_id`；所有前驱仍由 `depends_on_ids` 记录。
 
 ## 引擎与工作流实例
 

@@ -20,6 +20,7 @@ fn task() -> Task {
     Task {
         workflow_id: "connection-check".into(),
         run_id: Some(1),
+        producer_task_id: None,
         name: "start".into(),
         instance_id: None,
         max_attempts: 3,

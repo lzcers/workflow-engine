@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     workflow_id TEXT   NOT NULL,
     run_id      BIGINT,
     task_id     BIGINT NOT NULL CHECK (task_id > 0),
+    producer_task_id BIGINT CHECK (producer_task_id > 0),
     name        TEXT   NOT NULL,
     instance_id INT,
     status      TEXT   NOT NULL,
@@ -47,7 +48,8 @@ COMMENT ON COLUMN tasks.workflow_id IS '工作流标识；用于隔离任务、�
 COMMENT ON COLUMN tasks.run_id IS '运行分组键；同一工作流内用于扇入去重、JOIN 等齐前驱及失败级联，后继继承源任务的值；enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。';
 COMMENT ON COLUMN tasks.task_id IS '工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一，用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。';
 COMMENT ON COLUMN tasks.name IS '工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。';
-COMMENT ON COLUMN tasks.instance_id IS '节点扇出的实例序号；NULL 表示单实例，多实例从 0 开始编号，与 workflow_id、run_id、name 一起用于扇出去重。';
+COMMENT ON COLUMN tasks.producer_task_id IS '首次创建任务的源任务 ID；入口可为 NULL，汇合保留首个创建者，全部前驱由 depends_on_ids 记录。多实例去重按创建者隔离，单实例汇合不按创建者隔离。';
+COMMENT ON COLUMN tasks.instance_id IS '节点扇出的实例序号；NULL 表示单实例，每个创建者的多实例从 0 开始编号，与 workflow_id、run_id、producer_task_id、name 一起用于扇出去重。';
 COMMENT ON COLUMN tasks.status IS '任务状态：pending 待认领，running 已认领，succeeded 成功，failed 永久失败，skipped 跳过，superseded 失败已由后继接管。';
 COMMENT ON COLUMN tasks.claimed_by IS '最近一次认领任务的 worker 标识；未认领时为 NULL，任务结算后保留，不代表租约仍有效。';
 COMMENT ON COLUMN tasks.lease_until IS '认领租约的到期时间；NULL 表示无有效租约，pending/running 任务在无租约或租约到期后可按依赖和次数预算重新认领；结算或释放时清空。';
@@ -71,10 +73,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_pending_sessions
 ON tasks(status, workflow_id)
 WHERE status = 'pending';
 
--- 多实例扇出去重键：同一 (workflow, run, name, instance) 的多实例行唯一。
+-- 多实例扇出去重键：同一 (workflow, run, producer, name, instance) 的多实例行唯一。
 -- 覆盖「原子结算事务已提交但响应丢失」的重执行场景。用 COALESCE(run_id, 0) 兜底
 -- NULL（PG 唯一索引默认 NULL 互不相等）。部分索引只覆盖 instance_id IS NOT NULL 的
 -- 多实例行；单实例行走 FOR UPDATE 扇入合并去重，不在此键内。
+-- 未指定创建者使用独立的 0 键空间；有效任务 ID 必须为正数。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_fanout_instance
-ON tasks (workflow_id, COALESCE(run_id, 0), name, instance_id)
+ON tasks (workflow_id, COALESCE(run_id, 0), COALESCE(producer_task_id, 0), name, instance_id)
 WHERE instance_id IS NOT NULL;

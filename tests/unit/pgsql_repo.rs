@@ -45,6 +45,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
 
     let child = Task {
         run_id: first.run_id,
+        producer_task_id: Some(first.task_id),
         instance_id: Some(5),
         max_attempts: 7,
         depends_on_ids: vec![first.task_id],
@@ -60,6 +61,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     assert_eq!(stored.run_id, first.run_id);
     assert_eq!(stored.name, child.name);
     assert_eq!(stored.instance_id, child.instance_id);
+    assert_eq!(stored.producer_task_id, child.producer_task_id);
     assert_eq!(stored.max_attempts, child.max_attempts);
     assert_eq!(stored.depends_on_ids, child.depends_on_ids);
     assert_eq!(stored.depends_on_names, child.depends_on_names);
@@ -81,6 +83,7 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
         workflow_id: workflow_id.to_string(),
         run_id: None,
         name: "image_prompt".to_string(),
+        producer_task_id: None,
         instance_id: None,
         max_attempts: 3,
         depends_on_ids: vec![],
@@ -134,63 +137,132 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     let finalize: Vec<_> = rows.iter().filter(|t| t.name == "finalize_node").collect();
     assert_eq!(finalize.len(), 1);
     assert_eq!(finalize[0].instance_id, None);
+    assert_eq!(finalize[0].producer_task_id, Some(source.task_id));
     assert_eq!(finalize[0].depends_on_ids, vec![source.task_id]);
     let generates: Vec<_> = rows.iter().filter(|t| t.name == "image_generate").collect();
     assert_eq!(generates.len(), 2);
     assert_eq!(generates[0].instance_id, Some(0));
     assert_eq!(generates[1].instance_id, Some(1));
     for g in &generates {
+        assert_eq!(g.producer_task_id, Some(source.task_id));
         assert_eq!(g.depends_on_ids, vec![source.task_id]);
     }
 }
 
-/// 多实例唯一键去重：同键重入队（模拟「结算事务已提交但响应丢失」后的重执行）经
-/// `ON CONFLICT DO NOTHING` 跳过，不产生重复实例行。
+/// 同一产生者重入队去重，不同产生者可在同一运行中使用相同实例序号。
 #[tokio::test]
-async fn multi_instance_fanout_dedups_conflicting_keys() {
+async fn multi_instance_fanout_dedups_only_within_the_same_producer() {
     let Some(database) = connect_test().await else {
         return;
     };
     let repo = PgTaskRepo::new(database.pool().clone());
     let workflow_id = "multi_instance_dedup";
-    let instances: Vec<(Option<i32>, serde_json::Value)> = vec![
-        (Some(0), json!({"prompt": "a"})),
-        (Some(1), json!({"prompt": "b"})),
-    ];
-    let first = repo
-        .enqueue_fanout(
-            workflow_id,
-            None,
-            "image_generate",
-            &instances,
-            &[7],
-            "normal",
-            &[],
+    for run_id in [None, Some(42)] {
+        for producer_task_id in [None, Some(7), Some(8)] {
+            let instances = [
+                (Some(0), json!({"producer": producer_task_id, "item": "a"})),
+                (Some(1), json!({"producer": producer_task_id, "item": "b"})),
+            ];
+            let first = repo
+                .enqueue_fanout(
+                    workflow_id,
+                    run_id,
+                    producer_task_id,
+                    "image_generate",
+                    &instances,
+                    &[],
+                    "normal",
+                    &[],
+                    3,
+                )
+                .await
+                .unwrap();
+            assert_eq!(first.len(), 2);
+            for (row, (instance_id, input)) in first.iter().zip(&instances) {
+                assert_eq!(row.run_id, run_id);
+                assert_eq!(row.producer_task_id, producer_task_id);
+                assert_eq!(row.instance_id, *instance_id);
+                assert_eq!(&row.input, input);
+            }
+            let repeated = repo
+                .enqueue_fanout(
+                    workflow_id,
+                    run_id,
+                    producer_task_id,
+                    "image_generate",
+                    &instances,
+                    &[],
+                    "normal",
+                    &[],
+                    3,
+                )
+                .await
+                .unwrap();
+            assert!(repeated.is_empty());
+        }
+    }
+    assert_eq!(repo.list_all(workflow_id).await.unwrap().len(), 12);
+}
+
+#[tokio::test]
+async fn join_merges_different_producers_and_waits_for_all_instances() {
+    let Some(database) = connect_test().await else {
+        return;
+    };
+    let repo = PgTaskRepo::new(database.pool().clone());
+    let workflow_id = "join-producers";
+    seed(&repo, workflow_id, "source", Some(42)).await;
+    seed(&repo, workflow_id, "source", Some(42)).await;
+    let sources = repo.claim_many(workflow_id, "worker", 2).await.unwrap();
+    assert_eq!(sources.len(), 2);
+    for (index, source) in sources.iter().enumerate() {
+        let contribution = json!({"source": source.task_id});
+        repo.succeed_and_enqueue(
+            source,
+            &contribution,
+            &[FanoutInstances {
+                name: "collect".into(),
+                task_type: "join".into(),
+                instances: vec![(None, contribution.clone())],
+                depends_on_names: vec!["source".into()],
+            }],
             3,
         )
         .await
         .unwrap();
-    assert_eq!(first.len(), 2);
-
-    // 同键重入队：全部冲突跳过，返回空。
-    let second = repo
-        .enqueue_fanout(
-            workflow_id,
-            None,
-            "image_generate",
-            &instances,
-            &[7],
-            "normal",
-            &[],
-            3,
-        )
-        .await
-        .unwrap();
-    assert!(second.is_empty());
-
+        if index == 0 {
+            assert!(
+                repo.claim_many(workflow_id, "join-worker", 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
     let rows = repo.list_all(workflow_id).await.unwrap();
-    let generates: Vec<_> = rows.iter().filter(|t| t.name == "image_generate").collect();
-    assert_eq!(generates.len(), 2);
+    let joins: Vec<_> = rows.iter().filter(|task| task.name == "collect").collect();
+    assert_eq!(
+        joins.len(),
+        1,
+        "different producers must contribute to the same JOIN"
+    );
+    let join = joins[0];
+    assert_eq!(join.instance_id, None);
+    assert_eq!(join.producer_task_id, Some(sources[0].task_id));
+    assert_eq!(
+        join.depends_on_ids,
+        [sources[0].task_id, sources[1].task_id]
+    );
+    assert_eq!(
+        join.input,
+        json!({"source": [sources[0].task_id, sources[1].task_id]})
+    );
+    let claims = repo
+        .claim_many(workflow_id, "join-worker", 10)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].task_id, join.task_id);
 }
 
 /// 原子失败结算：有后继 → `superseded` 且后继入队（不依赖源任务）；
@@ -207,6 +279,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         workflow_id: workflow_id.to_string(),
         run_id: None,
         name: "commit_scene".to_string(),
+        producer_task_id: None,
         instance_id: None,
         max_attempts: 3,
         depends_on_ids: vec![],
@@ -248,6 +321,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         .find(|t| t.name == "scene_proposal" && t.task_id != retried.task_id)
         .unwrap();
     assert!(successor.depends_on_ids.is_empty());
+    assert_eq!(successor.producer_task_id, Some(retried.task_id));
 
     // 无后继：failed。
     let failed = repo
@@ -255,6 +329,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "audio_generate".to_string(),
+            producer_task_id: None,
             instance_id: None,
             max_attempts: 3,
             depends_on_ids: vec![],
@@ -281,6 +356,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
                 workflow_id: workflow_id.to_string(),
                 run_id,
                 name: name.to_string(),
+                producer_task_id: None,
                 instance_id: None,
                 max_attempts: 3,
                 depends_on_ids: if by_name {
@@ -365,6 +441,7 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "narration".to_string(),
+            producer_task_id: None,
             instance_id: None,
             max_attempts: 3,
             depends_on_ids: vec![],
@@ -433,6 +510,7 @@ async fn claims_require_all_dependencies_including_missing_ids() {
         .enqueue_fanout(
             "other_dependencies",
             None,
+            None,
             "source",
             &[
                 (Some(0), json!(null)),
@@ -460,6 +538,7 @@ async fn claims_require_all_dependencies_including_missing_ids() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "child".to_string(),
+            producer_task_id: None,
             instance_id: None,
             max_attempts: 3,
             depends_on_ids: dependency_ids.clone(),
@@ -480,6 +559,7 @@ async fn claims_require_all_dependencies_including_missing_ids() {
         .enqueue_fanout(
             workflow_id,
             child.run_id,
+            None,
             "source",
             &instances,
             &[],
@@ -529,6 +609,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: name.to_string(),
+            producer_task_id: None,
             instance_id: None,
             max_attempts: 3,
             depends_on_ids: deps,
@@ -598,6 +679,7 @@ async fn recovery_seal_marks_budget_exhausted_rows_failed() {
             workflow_id: stale.to_string(),
             run_id: None,
             name: "scene_proposal".to_string(),
+            producer_task_id: None,
             instance_id: None,
             max_attempts: 3,
             depends_on_ids: vec![],
@@ -643,6 +725,7 @@ async fn recovery_seal_marks_budget_exhausted_rows_failed() {
         workflow_id: fresh.to_string(),
         run_id: None,
         name: "narration".to_string(),
+        producer_task_id: None,
         instance_id: None,
         max_attempts: 3,
         depends_on_ids: vec![],
@@ -686,6 +769,7 @@ async fn task_ready_notifications_carry_workflow_id() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "scene_proposal".to_string(),
+            producer_task_id: None,
             instance_id: None,
             max_attempts: 3,
             depends_on_ids: vec![],
@@ -700,6 +784,7 @@ async fn task_ready_notifications_carry_workflow_id() {
     repo.enqueue_fanout(
         workflow_id,
         root.run_id,
+        Some(root.task_id),
         "commit_scene",
         &[(None, json!({}))],
         &[root.task_id],
@@ -726,6 +811,7 @@ async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i
         workflow_id: workflow_id.into(),
         run_id,
         name: name.into(),
+        producer_task_id: None,
         instance_id: None,
         max_attempts: 5,
         depends_on_ids: vec![],
@@ -799,6 +885,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         workflow_id: workflow_id.into(),
         run_id: Some(7),
         name: "dependent".into(),
+        producer_task_id: None,
         instance_id: None,
         max_attempts: 3,
         depends_on_ids: vec![root.task_id],
@@ -992,6 +1079,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
     let rows = repo.list_all(workflow_id).await.unwrap();
     assert_eq!(rows.len(), 4, "two source tasks and exactly two JOIN tasks");
     for join in rows.iter().filter(|task| task.task_type == "join") {
+        assert!([Some(left.task_id), Some(right.task_id)].contains(&join.producer_task_id));
         assert_eq!(
             join.input,
             json!({"left": left.task_id, "right": right.task_id})

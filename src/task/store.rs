@@ -138,6 +138,8 @@ pub trait TaskStore: Sync {
     /// 后继实例按 [`FanoutInstances::from`] 转换；单实例按同一 workflow、run、节点名
     /// 汇入已有 pending / running 任务，依赖 ID 取去重并集。JOIN 输入通过
     /// [`merge_join_input`] 累积，普通任务保留首个输入。
+    /// 新任务的 producer_task_id 为源任务 ID；多实例按 workflow、run、创建者、节点名、
+    /// 实例序号去重。单实例汇合不按创建者隔离，合并后保留首个创建者。
     /// 前驱成功、依赖累积、JOIN 输入合并与后继创建必须在同一事务提交，且并发首次
     /// 汇入不能创建重复单实例。新建单实例 JOIN 如已有静态前驱永久 failed，应直接标记 failed。
     fn settle_success<'a>(
@@ -152,6 +154,7 @@ pub trait TaskStore: Sync {
     /// `successors` 非空时标记 `superseded`，失败后继不依赖源任务；为空时标记 `failed`，
     /// 并将同一工作流、同一 run 内直接依赖该任务 ID 或节点名的已有 pending 任务标记失败。
     /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
+    /// 失败后继仍以源任务 ID 记录 producer_task_id，使用与成功后继相同的多实例去重规则。
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn settle_failure<'a>(
         &'a self,

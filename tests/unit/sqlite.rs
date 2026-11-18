@@ -60,6 +60,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert_eq!(other.task_id, 1, "task IDs are scoped to each workflow");
     assert_eq!(other.run_id, Some(other.task_id));
     assert_eq!(first.name, "root");
+    assert_eq!(first.producer_task_id, None);
     assert_eq!(first.input, input.input);
     assert_eq!(first.status, TaskStatus::Pending);
     assert_eq!(first.task_type, "normal");
@@ -112,12 +113,14 @@ async fn claims_require_all_dependencies_including_missing_ids() {
     let mut child = new_task("deps", "child");
     child.run_id = root.run_id;
     child.instance_id = Some(2);
+    child.producer_task_id = Some(root.task_id);
     child.max_attempts = 5;
     child.depends_on_ids = vec![root.task_id];
     child.depends_on_names = vec!["root".into()];
     let child = repo.enqueue(&child).await.unwrap();
     assert_eq!(child.run_id, root.run_id);
     assert_eq!(child.instance_id, Some(2));
+    assert_eq!(child.producer_task_id, Some(root.task_id));
     assert_eq!(child.max_attempts, 5);
     assert_eq!(child.depends_on_ids, [root.task_id]);
     assert_eq!(child.depends_on_names, ["root"]);
@@ -208,12 +211,13 @@ async fn released_and_expired_leases_retry_until_the_budget_is_exhausted() {
 }
 
 #[tokio::test]
-async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
+async fn join_merges_across_producers_and_waits_for_all_predecessors() {
     let (_, repo) = memory_repo().await;
     let images = repo
         .enqueue_fanout(
             "join",
             Some(1),
+            None,
             "image",
             &[(Some(0), json!("a")), (Some(1), json!("b"))],
             &[],
@@ -223,20 +227,7 @@ async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
         )
         .await
         .unwrap();
-    let join = repo
-        .enqueue_fanout(
-            "join",
-            Some(1),
-            "collect",
-            &[(None, json!({}))],
-            &[],
-            "join",
-            &["image".into(), "text".into()],
-            3,
-        )
-        .await
-        .unwrap()
-        .remove(0);
+    let store = SqliteTaskStore::new(repo.clone());
     let mut wrong_run = new_task("join", "text");
     wrong_run.run_id = Some(2);
     let wrong_run = repo.enqueue(&wrong_run).await.unwrap();
@@ -251,7 +242,7 @@ async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
     assert_eq!(
         claimed.len(),
         2,
-        "the JOIN is blocked before predecessors finish"
+        "both image instances execute independently"
     );
     assert!(claimed.iter().all(|t| t.name == "image"));
     assert_eq!(
@@ -259,14 +250,49 @@ async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
         images.iter().map(|task| task.task_id).collect::<Vec<_>>()
     );
 
-    repo.succeed(&claimed[0], &json!({})).await.unwrap();
+    let contribution = |input| FanoutPlan {
+        dst: "collect",
+        task_type: "join",
+        inputs: vec![input],
+        depends_on_names: vec!["image".into(), "text".into()],
+    };
+    store
+        .settle_success(
+            &claimed[0],
+            &json!("a"),
+            &[contribution(json!({"image": "a"}))],
+        )
+        .await
+        .unwrap();
+    let join = repo
+        .list_all("join")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.name == "collect")
+        .unwrap();
+    assert_eq!(join.producer_task_id, Some(claimed[0].task_id));
     assert!(
         repo.claim_many("join", "worker", 10)
             .await
             .unwrap()
             .is_empty()
     );
-    repo.succeed(&claimed[1], &json!({})).await.unwrap();
+    store
+        .settle_success(
+            &claimed[1],
+            &json!("b"),
+            &[contribution(json!({"image": "b"}))],
+        )
+        .await
+        .unwrap();
+    let merged = get(&repo, &join).await;
+    assert_eq!(merged.producer_task_id, Some(claimed[0].task_id));
+    assert_eq!(merged.input, json!({"image": ["a", "b"]}));
+    assert_eq!(
+        merged.depends_on_ids,
+        [claimed[0].task_id, claimed[1].task_id]
+    );
     assert!(
         repo.claim_many("join", "worker", 10)
             .await
@@ -284,10 +310,35 @@ async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
         .unwrap()
         .remove(0);
     assert_eq!(text_claim.task_id, text.task_id);
-    repo.succeed(&text_claim, &json!({})).await.unwrap();
+    store
+        .settle_success(
+            &text_claim,
+            &json!("text"),
+            &[contribution(json!({"text": "text"}))],
+        )
+        .await
+        .unwrap();
     let claimed = repo.claim_many("join", "worker", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, join.task_id);
+    assert_eq!(claimed[0].instance_id, None);
+    assert_eq!(
+        claimed[0].input,
+        json!({"image": ["a", "b"], "text": "text"})
+    );
+    assert_eq!(
+        claimed[0].depends_on_ids,
+        [images[0].task_id, images[1].task_id, text.task_id]
+    );
+    assert_eq!(
+        repo.list_all("join")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|task| task.name == "collect")
+            .count(),
+        1,
+    );
 }
 
 #[tokio::test]
@@ -299,6 +350,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             .enqueue_fanout(
                 "fanin",
                 run_id,
+                Some(11),
                 "collect",
                 &[(None, json!({"image": "first"}))],
                 &[11],
@@ -313,6 +365,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             .enqueue_fanout(
                 "fanin",
                 run_id,
+                Some(12),
                 "collect",
                 &[(None, json!({"image": ["second", "third"]}))],
                 &[11, 12],
@@ -324,6 +377,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             .unwrap()
             .remove(0);
         assert_eq!(merged.task_id, first.task_id);
+        assert_eq!(merged.producer_task_id, Some(11));
         assert_eq!(merged.run_id, run_id);
         assert_eq!(merged.depends_on_ids, [11, 12]);
         assert_eq!(merged.input, json!({"image": ["first", "second", "third"]}));
@@ -336,6 +390,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .enqueue_fanout(
             "fanin",
             None,
+            Some(1),
             "normal",
             &[(None, json!({"first": true}))],
             &[1],
@@ -350,6 +405,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .enqueue_fanout(
             "fanin",
             None,
+            Some(2),
             "normal",
             &[(None, json!({"second": true}))],
             &[2, 1],
@@ -361,6 +417,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .unwrap()
         .remove(0);
     assert_eq!(merged.task_id, first.task_id);
+    assert_eq!(merged.producer_task_id, Some(1));
     assert_eq!(
         merged.input, first.input,
         "normal nodes keep their typed initial input"
@@ -369,34 +426,61 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
 }
 
 #[tokio::test]
-async fn map_enqueue_is_idempotent_even_after_settlement_and_with_null_run_ids() {
+async fn map_enqueue_deduplicates_per_producer_even_after_settlement() {
     let (_, repo) = memory_repo().await;
-    let instances = [
-        (Some(0), json!({"value": 0})),
-        (Some(1), json!({"value": 1})),
-    ];
     for run_id in [None, Some(-1), Some(0), Some(1)] {
-        let inserted = repo
-            .enqueue_fanout("map", run_id, "image", &instances, &[], "normal", &[], 3)
-            .await
-            .unwrap();
-        assert_eq!(inserted.len(), 2);
-        let claim = repo
-            .claim_many("map", "worker", 10)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|task| task.task_id == inserted[0].task_id)
-            .unwrap();
-        repo.succeed(&claim, &json!({})).await.unwrap();
-        let duplicate = repo
-            .enqueue_fanout("map", run_id, "image", &instances, &[], "normal", &[], 3)
-            .await
-            .unwrap();
-        assert!(duplicate.is_empty());
-        assert_eq!(get(&repo, &inserted[0]).await.status, TaskStatus::Succeeded);
+        for producer_task_id in [None, Some(10), Some(11)] {
+            let instances = [
+                (Some(0), json!({"producer": producer_task_id, "value": 0})),
+                (Some(1), json!({"producer": producer_task_id, "value": 1})),
+            ];
+            let inserted = repo
+                .enqueue_fanout(
+                    "map",
+                    run_id,
+                    producer_task_id,
+                    "image",
+                    &instances,
+                    &[],
+                    "normal",
+                    &[],
+                    3,
+                )
+                .await
+                .unwrap();
+            assert_eq!(inserted.len(), 2);
+            for (task, (instance_id, input)) in inserted.iter().zip(&instances) {
+                assert_eq!(task.producer_task_id, producer_task_id);
+                assert_eq!(task.instance_id, *instance_id);
+                assert_eq!(&task.input, input);
+            }
+            let claim = repo
+                .claim_many("map", "worker", 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|task| task.task_id == inserted[0].task_id)
+                .unwrap();
+            repo.succeed(&claim, &json!({})).await.unwrap();
+            let duplicate = repo
+                .enqueue_fanout(
+                    "map",
+                    run_id,
+                    producer_task_id,
+                    "image",
+                    &instances,
+                    &[],
+                    "normal",
+                    &[],
+                    3,
+                )
+                .await
+                .unwrap();
+            assert!(duplicate.is_empty());
+            assert_eq!(get(&repo, &inserted[0]).await.status, TaskStatus::Succeeded);
+        }
     }
-    assert_eq!(repo.list_all("map").await.unwrap().len(), 8);
+    assert_eq!(repo.list_all("map").await.unwrap().len(), 24);
 }
 
 #[tokio::test]
@@ -452,6 +536,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     );
     for child in children {
         assert_eq!(child.run_id, Some(9));
+        assert_eq!(child.producer_task_id, Some(task.task_id));
         assert_eq!(child.depends_on_ids, [task.task_id]);
         assert_eq!(child.max_attempts, 7);
     }
@@ -496,6 +581,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
         .remove(0);
     assert_eq!(recovery.name, "recovery");
     assert_eq!(recovery.instance_id, None);
+    assert_eq!(recovery.producer_task_id, Some(task.task_id));
     assert_eq!(recovery.run_id, Some(4));
     assert!(recovery.depends_on_ids.is_empty());
     store.settle_failure(&recovery, message, &[]).await.unwrap();
@@ -524,6 +610,7 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
     let successors = store.claim_many("same_name", "worker", 1).await.unwrap();
     assert_eq!(successors.len(), 1);
     assert_ne!(successors[0].task_id, source.task_id);
+    assert_eq!(successors[0].producer_task_id, Some(source.task_id));
     assert_eq!(successors[0].input, json!({"retry": true}));
     assert!(successors[0].depends_on_ids.is_empty());
 }
@@ -575,6 +662,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .enqueue_fanout(
             "cascade",
             root.run_id,
+            None,
             "join",
             &[(None, json!({}))],
             &[],
@@ -589,6 +677,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .enqueue_fanout(
             "cascade",
             Some(0),
+            None,
             "join",
             &[(None, json!({}))],
             &[],
@@ -648,6 +737,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .enqueue_fanout(
             "cascade",
             root.run_id,
+            None,
             "late_join",
             &[(None, json!({}))],
             &[],
@@ -686,6 +776,7 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
                 repo.enqueue_fanout(
                     "cascade_runs",
                     run_id,
+                    None,
                     "join",
                     &[(None, json!({}))],
                     &[],
@@ -982,6 +1073,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
                 repo.enqueue_fanout(
                     "concurrent_fanin",
                     None,
+                    Some(n),
                     "collect",
                     &[(None, json!({"worker": n}))],
                     &[n],
