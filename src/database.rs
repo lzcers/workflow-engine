@@ -112,23 +112,14 @@ impl Database {
         }
     }
 
-    /// 按连接时选定的后端创建工作流级存储，与当前数据库共享连接池。
+    /// 按连接时选定的后端创建可供多个工作流共享的存储，与当前数据库共享连接池。
     /// 由 Engine 内部调用，不重新连接或初始化表。
-    pub(crate) fn task_store(
-        &self,
-        workflow_id: &str,
-    ) -> Arc<dyn TaskStore<Error = StorageError> + Send> {
+    pub(crate) fn task_store(&self) -> Arc<dyn TaskStore<Error = StorageError> + Send> {
         match self {
             #[cfg(feature = "pg")]
-            Self::Postgres(pool) => Arc::new(PgTaskStore::new(
-                PgTaskRepo::new(pool.clone()),
-                workflow_id.to_owned(),
-            )),
+            Self::Postgres(pool) => Arc::new(PgTaskStore::new(PgTaskRepo::new(pool.clone()))),
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => Arc::new(SqliteTaskStore::new(
-                SqliteTaskRepo::new(pool.clone()),
-                workflow_id.to_owned(),
-            )),
+            Self::Sqlite(pool) => Arc::new(SqliteTaskStore::new(SqliteTaskRepo::new(pool.clone()))),
         }
     }
 

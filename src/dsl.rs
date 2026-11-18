@@ -1,8 +1,8 @@
 //! 声明式图 DSL：通过 [`workflow!`] 宏把 `nodes` + `edges` 描述展开为 [`super::graph::Graph`]
 //! 构建链，并做**编译期**静态校验。
 //!
-//! 节点名用标识符而非字符串，注册时从实例推导 [`crate::NodeKey`] 的类型。
-//! 边通过类型化标识调用检查版构造函数（[`super::map_checked`] 等），编译期强制：
+//! 节点名用标识符而非字符串，注册时从实例推导 [`crate::node::NodeKey`] 的类型。
+//! 边通过类型化标识调用检查版构造函数（[`crate::edge::map_checked`] 等），编译期强制：
 //! - 转换函数入参 == 上游节点 `Out`、出参 == 下游节点 `In`（失败边为上游 `In` + 错误 → 下游 `In`）；
 //! - `when(cond)` / `when_error(cond)` 透传边强制上游输出/输入类型 == 下游输入类型；
 //! - 未在 `nodes` 块注册的节点名是编译错误。
@@ -39,7 +39,7 @@
 /// - `nodes`：`name => instance` 注册构造完成的节点，所有构建表达式只求值一次。
 ///   可用 `#[title = expr]` / `#[description = expr]` 附加图描述，各最多出现一次。
 /// - `edges`：`src -> dst map/on_error/when(cond) map <expr>`，表达式为建边纯函数；
-///   边经类型检查版构造函数（[`super::map_checked`] 等）装配，编译期校验类型接线。
+///   边经类型检查版构造函数（[`crate::edge::map_checked`] 等）装配，编译期校验类型接线。
 ///
 /// 省略类型声明仍会拒绝输入输出不匹配的透传边：
 /// ```compile_fail
@@ -175,7 +175,7 @@ macro_rules! workflow {
     // 成功转换边：SRC -> DST |> fn（map_checked：转换入参 == SRC 的 Out，出参 == DST 的 In）
     (@edges $b:expr; $src:ident -> $dst:ident |> $transform:expr, $($rest:tt)*) => {
         $crate::dsl::workflow!(@edges
-            $b.edge($crate::map_checked(
+            $b.edge($crate::edge::map_checked(
                 $src, $dst, $transform
             ))
             ; $($rest)*
@@ -185,7 +185,7 @@ macro_rules! workflow {
     // 失败边：SRC -> DST on_error fn（on_error_checked：入参 == SRC 的 In + 错误，出参 == DST 的 In）
     (@edges $b:expr; $src:ident -> $dst:ident on_error $transform:expr, $($rest:tt)*) => {
         $crate::dsl::workflow!(@edges
-            $b.error_edge($crate::on_error_checked(
+            $b.error_edge($crate::edge::on_error_checked(
                 $src, $dst, $transform
             ))
             ; $($rest)*
@@ -196,7 +196,7 @@ macro_rules! workflow {
     (@edges $b:expr; $src:ident -> $dst:ident when_error($cond:expr) |> $transform:expr, $($rest:tt)*) => {
         $crate::dsl::workflow!(@edges
             $b.error_edge(
-                $crate::when_error_checked($src, $dst.name(), $cond)
+                $crate::edge::when_error_checked($src, $dst.name(), $cond)
                     .map_checked($dst, $transform)
             )
             ; $($rest)*
@@ -207,7 +207,7 @@ macro_rules! workflow {
     (@edges $b:expr; $src:ident -> $dst:ident when_error($cond:expr), $($rest:tt)*) => {
         $crate::dsl::workflow!(@edges
             $b.error_edge(
-                $crate::when_error_checked($src, $dst.name(), $cond)
+                $crate::edge::when_error_checked($src, $dst.name(), $cond)
                     .passthrough_checked($dst)
             )
             ; $($rest)*
@@ -218,7 +218,7 @@ macro_rules! workflow {
     (@edges $b:expr; $src:ident -> $dst:ident when($cond:expr) |> $transform:expr, $($rest:tt)*) => {
         $crate::dsl::workflow!(@edges
             $b.edge(
-                $crate::when_checked($src, $dst.name(), $cond)
+                $crate::edge::when_checked($src, $dst.name(), $cond)
                     .map_checked($dst, $transform)
             )
             ; $($rest)*
@@ -229,7 +229,7 @@ macro_rules! workflow {
     (@edges $b:expr; $src:ident -> $dst:ident when($cond:expr), $($rest:tt)*) => {
         $crate::dsl::workflow!(@edges
             $b.edge(
-                $crate::when_checked($src, $dst.name(), $cond)
+                $crate::edge::when_checked($src, $dst.name(), $cond)
                     .passthrough_checked($dst)
             )
             ; $($rest)*
@@ -239,7 +239,7 @@ macro_rules! workflow {
     // 成功透传边：SRC -> DST（无条件，编译期强制 SRC 的 Out == DST 的 In）
     (@edges $b:expr; $src:ident -> $dst:ident, $($rest:tt)*) => {
         $crate::dsl::workflow!(@edges
-            $b.edge($crate::passthrough_checked(
+            $b.edge($crate::edge::passthrough_checked(
                 $src, $dst
             ))
             ; $($rest)*

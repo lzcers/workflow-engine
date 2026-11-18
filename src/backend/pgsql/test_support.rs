@@ -1,13 +1,10 @@
 //! 测试用 pgsql 设施：隔离 schema + 引擎 schema 迁移。
 //!
 //! 测试库经环境变量 `WORKFLOW_ENGINE_TEST_DATABASE_URL`（回退 `DATABASE_URL`）连接；
-//! 未配置时测试跳过（返回 `None`）。进程级串行锁 + 独立 schema，互不串扰。
+//! 未配置时测试跳过（返回 `None`）。独立 schema 隔离，并允许同一测试使用多个数据库连接。
 //! [`connect_test`] 会执行引擎自有迁移（[`super::schema::migrate`]）。
 
-use std::sync::{Arc, OnceLock};
-
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use tokio::sync::Mutex;
 
 /// 测试库连接：隔离 schema（已执行引擎迁移）。
 pub struct TestDb {
@@ -25,14 +22,8 @@ impl TestDb {
     }
 }
 
-/// 连接测试库并执行引擎迁移（隔离 schema + 进程级串行锁）；无测试库环境变量时返回 `None`。
+/// 连接测试库并执行引擎迁移（隔离 schema + 多连接池）；无测试库环境变量时返回 `None`。
 pub async fn connect_test() -> Option<TestDb> {
-    static TEST_DATABASE_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
-    let _guard = TEST_DATABASE_LOCK
-        .get_or_init(|| Arc::new(Mutex::new(())))
-        .clone()
-        .lock_owned()
-        .await;
     let Ok(database_url) = std::env::var("WORKFLOW_ENGINE_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
     else {
@@ -51,12 +42,16 @@ pub async fn connect_test() -> Option<TestDb> {
     admin_pool.close().await;
 
     let pg_pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(4)
         .after_connect(move |conn, _meta| {
             let schema_name = schema_name.clone();
             Box::pin(async move {
                 sqlx::query(&format!(r#"SET search_path TO "{schema_name}""#))
-                    .execute(conn)
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("SELECT set_config('application_name', $1, false)")
+                    .bind(&schema_name)
+                    .execute(&mut *conn)
                     .await?;
                 Ok(())
             })

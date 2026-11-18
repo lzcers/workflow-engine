@@ -1,12 +1,12 @@
 //! 通用工作流引擎：与业务解耦的节点 trait + 图引擎。
 //!
-//! - [`node`]：强类型 [`Node`] trait 与类型擦除（[`AnyNode`]）。
+//! - [`node`]：强类型 [`Node`] trait 与类型擦除（[`node::AnyNode`]）。
 //! - [`edge`]：边模型（触发时机、守卫、扇出）与擦除辅助。
 //! - [`graph`]：图引擎（[`Graph`]），负责节点注册、边规划、执行与静态校验。
 //! - [`task`]：任务内容 [`Task`]、记录 [`TaskRecord`] 与持久化契约 [`TaskStore`]。
 //! - [`scheduler`]：通用调度器（[`Scheduler`]），认领任务、结算并规划后继。
-//! - `engine`（`pg` / `sqlite` feature）：单图控制平面（`Engine`），创建调度器、
-//!   提交任务并返回 `RunHandle`。
+//! - `engine`（`pg` / `sqlite` feature）：可复用的引擎入口（`Engine`），初始化存储并创建工作流。
+//! - `workflow`（`pg` / `sqlite` feature）：单图实例（`Workflow`），持有调度器，通过 `run` / `stop` 启停；提交任务返回 `RunHandle`。
 //! - [`backend::pgsql`]（`pg` feature）：PostgreSQL 通用实现（`PgTaskRepo` / `PgTaskStore` /
 //!   任务就绪通知与恢复查询）。默认关闭，引擎核心保持零数据库依赖。
 //! - [`backend::sqlite`]（`sqlite` feature）：SQLite 通用实现（`SqliteTaskRepo` /
@@ -36,15 +36,14 @@ pub mod graph;
 pub mod node;
 pub mod scheduler;
 pub mod task;
-
-pub use edge::{
-    AnyFailureEdge, AnySuccessEdge, EdgeError, ErrorWhenBuilder, FailureEdge, FailureEdgeImpl,
-    SuccessEdge, WhenBuilder, map, map_checked, on_error, on_error_checked, passthrough_checked,
-    when, when_checked, when_error, when_error_checked,
-};
 #[cfg(any(feature = "pg", feature = "sqlite"))]
-pub use engine::{Engine, EngineError, RunHandle};
-pub use graph::{EdgeDescription, EdgeKind, Graph, GraphDescription, NodeDescription};
-pub use node::{AnyNode, JoinNode, Node, NodeContext, NodeError, NodeKey};
+pub mod workflow;
+
+#[cfg(any(feature = "pg", feature = "sqlite"))]
+pub use engine::{Engine, EngineError};
+pub use graph::Graph;
+pub use node::{JoinNode, Node, NodeContext, NodeError};
 pub use scheduler::Scheduler;
-pub use task::{FanoutInstances, FanoutPlan, Task, TaskRecord, TaskStatus, TaskStore};
+pub use task::{Task, TaskRecord, TaskStatus, TaskStore};
+#[cfg(any(feature = "pg", feature = "sqlite"))]
+pub use workflow::{RunHandle, Workflow};

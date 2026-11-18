@@ -8,10 +8,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use super::rows::TaskRow;
-use crate::{FanoutInstances, StorageError, Task, TaskRecord, TaskStatus};
-
-/// 认领租约时长（running 超时后回收为可认领）。
-const LEASE_SECONDS: i64 = 300;
+use crate::task::{FanoutInstances, store::LEASE_DURATION};
+use crate::{StorageError, Task, TaskRecord, TaskStatus};
 
 /// 任务行级重试预算耗尽时的封存错误信息（`attempt >= max_attempts` 不再被认领）。
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";
@@ -92,7 +90,103 @@ pub async fn allocate_task_id(
     Ok(task_id)
 }
 
-/// 事务内入队后继实例：单实例扇入合并（`FOR UPDATE` 去重）/ 多实例独立成行
+/// 同一次运行的结算与汇合使用同一事务锁，包含尚不存在的 JOIN 行。
+/// 必须在任务行锁与 ID 计数器锁之前获取；节点业务执行不持有此锁。
+async fn lock_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    run_id: Option<i64>,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        r#"
+        SELECT pg_advisory_xact_lock(hashtextextended(
+            jsonb_build_array('tasks'::regclass::oid, $1::text, $2::bigint)::text, 0
+        ))
+        "#,
+    )
+    .bind(workflow_id)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn claim_lost(task: &TaskRecord) -> StorageError {
+    StorageError::ClaimLost {
+        workflow_id: task.workflow_id.clone(),
+        task_id: task.task_id,
+    }
+}
+
+/// 先等行锁，再在后续写语句中检查数据库当前时间，避免等锁期间租约已过期。
+async fn lock_task(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: &TaskRecord,
+) -> Result<TaskRow, StorageError> {
+    sqlx::query_as::<_, TaskRow>(&format!(
+        "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = $1 AND task_id = $2 FOR UPDATE"
+    ))
+    .bind(&task.workflow_id)
+    .bind(task.task_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| claim_lost(task))
+}
+
+/// 读取业务回填后的运行身份，再按统一顺序获取运行锁和任务锁。
+async fn lock_settlement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: &TaskRecord,
+) -> Result<(), StorageError> {
+    let run_id = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT run_id FROM tasks WHERE workflow_id = $1 AND task_id = $2",
+    )
+    .bind(&task.workflow_id)
+    .bind(task.task_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| claim_lost(task))?;
+    lock_run(tx, &task.workflow_id, run_id).await?;
+    let current = lock_task(tx, task).await?;
+    if current.run_id != run_id {
+        return Err(claim_lost(task));
+    }
+    Ok(())
+}
+
+/// 仅当前有效认领可以提交终态。持有行锁后再检查租约，返回最新身份供后继使用。
+async fn settle_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: &TaskRecord,
+    status: TaskStatus,
+    output: Option<&Value>,
+    error: Option<&str>,
+) -> Result<TaskRecord, StorageError> {
+    let row = sqlx::query_as::<_, TaskRow>(&format!(
+        r#"
+        UPDATE tasks
+        SET status = $5, output_json = $6, error = $7,
+            lease_until = NULL, updated_at = clock_timestamp()
+        WHERE workflow_id = $1 AND task_id = $2
+          AND claimed_by = $3 AND attempt = $4
+          AND status = 'running' AND lease_until > clock_timestamp()
+        RETURNING {ROW_COLS}
+        "#
+    ))
+    .bind(&task.workflow_id)
+    .bind(task.task_id)
+    .bind(&task.claimed_by)
+    .bind(task.attempt)
+    .bind(status.as_str())
+    .bind(output)
+    .bind(error)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| claim_lost(task))?;
+    Ok(row.into())
+}
+
+/// 事务内入队后继实例：调用方先获取运行锁，单实例用行锁合并，多实例独立成行
 /// （同键经 `ON CONFLICT DO NOTHING` 去重），返回各行记录。供
 /// [`PgTaskRepo::enqueue_fanout`] 与原子结算方法共用，**不自行开事务/提交**。
 #[allow(clippy::too_many_arguments)]
@@ -365,6 +459,41 @@ impl PgTaskRepo {
         Ok(row.into())
     }
 
+    /// 原子创建独立运行，以入口任务的 task_id 作为同一工作流内唯一的 run_id。
+    /// 入口任务与运行身份在同一事务提交，其他 worker 不会看到未分组的入口任务。
+    pub async fn create_run(
+        &self,
+        workflow_id: &str,
+        entry: &str,
+        input: &Value,
+        max_attempts: i32,
+    ) -> Result<TaskRecord, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let mut row = Self::insert_task(
+            &mut tx,
+            &Task {
+                workflow_id: workflow_id.to_owned(),
+                run_id: None,
+                name: entry.to_owned(),
+                instance_id: None,
+                max_attempts,
+                depends_on_ids: Vec::new(),
+                depends_on_names: Vec::new(),
+                input: input.clone(),
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE tasks SET run_id = task_id WHERE workflow_id = $1 AND task_id = $2")
+            .bind(workflow_id)
+            .bind(row.task_id)
+            .execute(&mut *tx)
+            .await?;
+        row.run_id = Some(row.task_id);
+        notify_tasks_ready(&mut tx, workflow_id).await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
     /// 入队一个任务：原子分配工作流级 task_id 并插入 pending 行，随事务提交任务就绪通知。
     pub async fn enqueue(&self, task: &Task) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin().await?;
@@ -379,8 +508,8 @@ impl PgTaskRepo {
     /// `instances` 为 `(instance_id, input)` 列表：
     /// - `instance_id = None`：**单实例**（扇入合并）。若 `(workflow_id, run_id, name, NULL)`
     ///   已有 pending/running 实例则做扇入合并（把 `depends_on_ids` 并集追加进现存任务的
-    ///   `depends_on_ids`，避免对同一后继重复入队），用 `FOR UPDATE` 锁定命中行保证并发安全；
-    ///   否则新建。
+    ///   `depends_on_ids`，避免对同一后继重复入队）。运行级事务锁覆盖“查无记录再创建”的窗口，
+    ///   已有记录通过行锁合并。
     /// - `instance_id = Some(i)`：**多实例**（map 边扇出的第 i 个实例），独立成行、互不合并；
     ///   去重由唯一键 `uq_tasks_fanout_instance` 兜底（同键重入队经
     ///   `ON CONFLICT DO NOTHING` 跳过，覆盖「结算事务已提交但响应丢失」的重执行场景）。
@@ -401,7 +530,12 @@ impl PgTaskRepo {
         depends_on_names: &[String],
         max_attempts: i32,
     ) -> Result<Vec<TaskRecord>, StorageError> {
-        let mut tx = self.pool.begin().await?;
+        // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
+        lock_run(&mut tx, workflow_id, run_id).await?;
         let rows = enqueue_fanout_in_tx(
             &mut tx,
             workflow_id,
@@ -418,50 +552,30 @@ impl PgTaskRepo {
         Ok(rows)
     }
 
-    /// 原子化成功结算：`succeed` + 全部后继入队**同一事务**，返回回填后的任务行。
-    ///
-    /// 一次提交内完成「任务置 succeeded + 全部后继入队」：进程中途崩溃时二者要么都在、
-    /// 要么都不在，杜绝「任务已成功但后继从未入队」的静默停摆。`RETURNING` 顺带拿回最新行
-    /// （含节点 `execute` 内业务回填的 `run_id`），后继 `run_id` 据此落库，
-    /// 替代「提交后二次回读」。
+    /// 当前认领成功结算与后继入队在同一事务提交，后继继承最新的 run_id。
     pub async fn succeed_and_enqueue(
         &self,
-        workflow_id: &str,
-        task_id: i64,
+        task: &TaskRecord,
         output: &Value,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
     ) -> Result<TaskRecord, StorageError> {
-        let mut tx = self.pool.begin().await?;
-        let return_cols = format!("RETURNING {ROW_COLS}");
-        let settled: TaskRow = sqlx::query_as(&format!(
-            r#"
-            UPDATE tasks
-            SET status = 'succeeded', output_json = $3::jsonb, error = NULL,
-                lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1 AND task_id = $2
-            {return_cols}
-            "#
-        ))
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(output)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StorageError::MissingTask {
-            workflow_id: workflow_id.to_string(),
-            task_id,
-        })?;
-
-        // 成功后继依赖源任务（`depends_on_ids = [settled.task_id]`）。
+        // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
+        lock_settlement(&mut tx, task).await?;
+        let settled =
+            settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
         for f in fanouts {
             enqueue_fanout_in_tx(
                 &mut tx,
-                workflow_id,
+                &task.workflow_id,
                 settled.run_id,
                 &f.name,
                 &f.instances,
-                &[settled.task_id],
+                &[task.task_id],
                 &f.task_type,
                 &f.depends_on_names,
                 max_attempts,
@@ -469,28 +583,34 @@ impl PgTaskRepo {
             .await?;
         }
         tx.commit().await?;
-        Ok(settled.into())
+        Ok(settled)
     }
 
-    /// 原子失败结算：有后继时标记 `superseded` 并入队；无后继时标记 `failed` 并级联
-    /// 同一 workflow、同一 run 内依赖源任务的已有 pending 任务。
-    /// 失败后继不依赖源任务（`depends_on_ids = []`）。
-    #[allow(clippy::too_many_arguments)]
+    /// 当前认领先结算，再原子生成失败后继或级联失败；过期执行者没有写权限。
     pub async fn fail_and_enqueue(
         &self,
-        workflow_id: &str,
-        task_id: i64,
-        run_id: Option<i64>,
+        task: &TaskRecord,
         error: &str,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
     ) -> Result<(), StorageError> {
-        let mut tx = self.pool.begin().await?;
+        // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
+        lock_settlement(&mut tx, task).await?;
+        let status = if fanouts.is_empty() {
+            TaskStatus::Failed
+        } else {
+            TaskStatus::Superseded
+        };
+        let settled = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
         for f in fanouts {
             enqueue_fanout_in_tx(
                 &mut tx,
-                workflow_id,
-                run_id,
+                &task.workflow_id,
+                settled.run_id,
                 &f.name,
                 &f.instances,
                 &[],
@@ -500,29 +620,11 @@ impl PgTaskRepo {
             )
             .await?;
         }
-        let status = if fanouts.is_empty() {
-            TaskStatus::Failed
-        } else {
-            TaskStatus::Superseded
-        };
-        sqlx::query(
-            r#"
-            UPDATE tasks
-            SET status = $3, error = $4, lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1 AND task_id = $2
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(status.as_str())
-        .bind(error)
-        .execute(&mut *tx)
-        .await?;
         if fanouts.is_empty() {
             sqlx::query(
                 r#"
                 UPDATE tasks AS dependent
-                SET status = 'failed', error = $3, lease_until = NULL, updated_at = NOW()
+                SET status = 'failed', error = $3, lease_until = NULL, updated_at = clock_timestamp()
                 FROM tasks AS source
                 WHERE source.workflow_id = $1 AND source.task_id = $2
                   AND dependent.workflow_id = source.workflow_id
@@ -532,57 +634,90 @@ impl PgTaskRepo {
                        OR source.name = ANY(dependent.depends_on_names))
                 "#,
             )
-            .bind(workflow_id)
-            .bind(task_id)
-            .bind(format!("predecessor task {task_id} failed"))
-            .execute(&mut *tx)
-            .await?;
+            .bind(&task.workflow_id)
+            .bind(task.task_id)
+            .bind(format!("predecessor task {} failed", task.task_id))
+            .execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
     }
 
-    /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务在下一轮认领即可
-    /// 重入，不必等待租约过期。同一事务内发送任务就绪通知，调度器被立即唤醒重认领。
-    pub async fn release_claim(&self, workflow_id: &str, task_id: i64) -> Result<(), StorageError> {
+    /// 为仍有效的当前认领续租，不改变认领代次；过期租约不能复活。
+    pub async fn renew_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        lock_task(&mut tx, task).await?;
+        let result = sqlx::query(
             r#"
             UPDATE tasks
-            SET lease_until = NULL, updated_at = NOW()
+            SET lease_until = clock_timestamp() + make_interval(secs => $5),
+                updated_at = clock_timestamp()
             WHERE workflow_id = $1 AND task_id = $2
+              AND claimed_by = $3 AND attempt = $4
+              AND status = 'running' AND lease_until > clock_timestamp()
             "#,
         )
-        .bind(workflow_id)
-        .bind(task_id)
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
+        .bind(LEASE_DURATION.as_secs() as f64)
         .execute(&mut *tx)
         .await?;
-        notify_tasks_ready(&mut tx, workflow_id).await?;
+        if result.rows_affected() == 0 {
+            return Err(claim_lost(task));
+        }
         tx.commit().await?;
         Ok(())
     }
 
-    /// 释放某个工作流**全部**在跑任务的租约：worker 被逐出（重启）后调用。
-    ///
-    /// `claim_many` 把 `lease_until IS NULL` 的 running 行同样视为可认领，因此释放后这些任务
-    /// 立即回到可认领状态，不必等租约到期（默认 300s）；被中断的那一次认领已经消耗过一次
-    /// attempt，重试照常计数，预算耗尽的任务由认领闸门封存为 failed。
-    /// 返回被释放的任务数。
-    pub async fn release_claims(&self, workflow_id: &str) -> Result<u64, StorageError> {
+    /// 仅释放当前有效认领；旧 worker 不能释放新 owner 的租约。
+    pub async fn release_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
+        lock_task(&mut tx, task).await?;
         let result = sqlx::query(
             r#"
-            UPDATE tasks
-            SET lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1 AND status = 'running' AND lease_until IS NOT NULL
+            UPDATE tasks SET lease_until = NULL, updated_at = clock_timestamp()
+            WHERE workflow_id = $1 AND task_id = $2
+              AND claimed_by = $3 AND attempt = $4
+              AND status = 'running' AND lease_until > clock_timestamp()
+            "#,
+        )
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(claim_lost(task));
+        }
+        notify_tasks_ready(&mut tx, &task.workflow_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 只可在指定 worker 已停止后使用，释放它在当前工作流的认领，不影响其他 worker。
+    pub async fn release_claims(
+        &self,
+        workflow_id: &str,
+        worker_id: &str,
+    ) -> Result<u64, StorageError> {
+        Ok(sqlx::query(
+            r#"
+            UPDATE tasks SET lease_until = NULL, updated_at = clock_timestamp()
+            WHERE workflow_id = $1 AND claimed_by = $2
+              AND status = 'running' AND lease_until IS NOT NULL
             "#,
         )
         .bind(workflow_id)
+        .bind(worker_id)
         .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+        .await?
+        .rows_affected())
     }
 
-    /// 认领一批可执行任务：pending 或已过期的 running 均视为可认领；同一批内互相无依赖
+    /// 从指定工作流认领一批可执行任务：pending 或已过期的 running 均视为可认领；同一批内互相无依赖
     /// （`NOT EXISTS` 依赖闸门过滤掉依赖未成功的任务）。
     /// 用 `FOR UPDATE SKIP LOCKED` 保证多 worker 不冲突，`LIMIT $n` 限制单批认领数量。
     ///
@@ -599,10 +734,13 @@ impl PgTaskRepo {
         worker: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut tx = self.pool.begin().await?;
 
         // 可执行任务的通用闸门（不含 attempt 预算过滤）见 [`EXECUTABLE_WHERE`]；
-        // 此处补上 session 过滤，seal / claim 两个 UPDATE 共用同一条闸门。
+        // 此处补上工作流过滤，seal / claim 两个 UPDATE 共用同一条闸门。
 
         // 1) 封存：可执行但重试预算已耗尽（attempt >= max_attempts）的任务 → 置为 failed，
         //    避免它们因预算满而不再被认领、却永远停留在 pending/running 造成悬挂。
@@ -640,7 +778,7 @@ impl PgTaskRepo {
             UPDATE tasks
             SET status = 'running',
                 claimed_by = $2,
-                lease_until = NOW() + make_interval(secs => $3),
+                lease_until = clock_timestamp() + make_interval(secs => $3),
                 attempt = attempt + 1,
                 updated_at = NOW()
             WHERE workflow_id = $1
@@ -648,15 +786,16 @@ impl PgTaskRepo {
             RETURNING {ROW_COLS}
             "#
         );
-        let rows = sqlx::query_as::<_, TaskRow>(&sql)
+        let mut rows = sqlx::query_as::<_, TaskRow>(&sql)
             .bind(workflow_id)
             .bind(worker)
-            .bind(LEASE_SECONDS)
-            .bind(limit as i64)
+            .bind(LEASE_DURATION.as_secs() as f64)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .fetch_all(&mut *tx)
             .await?;
 
         tx.commit().await?;
+        rows.sort_unstable_by_key(|row| row.task_id);
         Ok(rows.into_iter().map(TaskRecord::from).collect())
     }
 
@@ -727,98 +866,37 @@ impl PgTaskRepo {
         Ok(row.map(TaskRow::into))
     }
 
-    /// 结算为成功：写产物并回读回填后的任务行（含节点 `execute` 内业务回填的 `run_id`），
-    /// 供调度器把后继挂在正确分组键上。任务行不存在时报 [`StorageError::MissingTask`]。
+    /// 将当前有效认领标记成功，不生成后继。
     pub async fn succeed(
         &self,
-        workflow_id: &str,
-        task_id: i64,
+        task: &TaskRecord,
         output: &Value,
     ) -> Result<TaskRecord, StorageError> {
-        let return_cols = format!("RETURNING {ROW_COLS}");
-        let row: Option<TaskRow> = sqlx::query_as(&format!(
-            r#"
-            UPDATE tasks
-            SET status = 'succeeded', output_json = $3::jsonb, error = NULL,
-                lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1 AND task_id = $2
-            {return_cols}
-            "#
-        ))
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(output)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(TaskRecord::from).ok_or(StorageError::MissingTask {
-            workflow_id: workflow_id.to_string(),
-            task_id,
-        })
+        self.succeed_and_enqueue(task, output, &[], 3).await
     }
 
-    /// 结算为失败：记录错误并释放租约（可由回收逻辑改为可重试）。
-    pub async fn fail(
+    pub async fn fail(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
+        self.set_terminal(task, TaskStatus::Failed, error).await
+    }
+
+    pub async fn supersede(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
+        self.set_terminal(task, TaskStatus::Superseded, error).await
+    }
+
+    pub async fn skip(&self, task: &TaskRecord, reason: &str) -> Result<(), StorageError> {
+        self.set_terminal(task, TaskStatus::Skipped, reason).await
+    }
+
+    async fn set_terminal(
         &self,
-        workflow_id: &str,
-        task_id: i64,
+        task: &TaskRecord,
+        status: TaskStatus,
         error: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
-            r#"
-            UPDATE tasks
-            SET status = 'failed', error = $3, lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1 AND task_id = $2
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// 结算为被后继重试取代：记录原因，但不对外暴露为失败。
-    pub async fn supersede(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-        error: &str,
-    ) -> Result<(), StorageError> {
-        sqlx::query(
-            r#"
-            UPDATE tasks
-            SET status = 'superseded', error = $3, lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1 AND task_id = $2
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// 结算为跳过（消费方语义：如决定不生成某产物）。
-    pub async fn skip(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-        reason: &str,
-    ) -> Result<(), StorageError> {
-        sqlx::query(
-            r#"
-            UPDATE tasks
-            SET status = 'skipped', error = $3, lease_until = NULL, updated_at = NOW()
-            WHERE workflow_id = $1 AND task_id = $2
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        lock_settlement(&mut tx, task).await?;
+        settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -833,7 +911,8 @@ mod tests {
     use super::super::test_support::connect_test;
     use super::BUDGET_EXHAUSTED_ERR;
     use super::{PgTaskRepo, TASK_READY_CHANNEL, merge_join_input};
-    use crate::{FanoutInstances, Task, TaskRecord, TaskStatus};
+    use crate::task::FanoutInstances;
+    use crate::{StorageError, Task, TaskRecord, TaskStatus};
 
     /// 收取一条**本工作流**的任务就绪通知（2s 超时）：通知通道是集群级共享的，
     /// 并发测试可能互相收到对方的 payload（生产监听器同样按 payload 分发），
@@ -862,25 +941,27 @@ mod tests {
         };
         let repo = PgTaskRepo::new(database.pool().clone());
         let workflow_id = "succeed_and_enqueue_atomic";
+        repo.enqueue(&Task {
+            workflow_id: workflow_id.to_string(),
+            run_id: None,
+            name: "image_prompt".to_string(),
+            instance_id: None,
+            max_attempts: 3,
+            depends_on_ids: vec![],
+            depends_on_names: vec![],
+            input: json!({"prompts": ["a", "b"]}),
+        })
+        .await
+        .unwrap();
         let source = repo
-            .enqueue(&Task {
-                workflow_id: workflow_id.to_string(),
-                run_id: None,
-                name: "image_prompt".to_string(),
-                instance_id: None,
-                max_attempts: 3,
-                depends_on_ids: vec![],
-                depends_on_names: vec![],
-                input: json!({"prompts": ["a", "b"]}),
-            })
+            .claim_many(workflow_id, "worker", 5)
             .await
-            .unwrap();
-        repo.claim_many(workflow_id, "worker", 5).await.unwrap();
+            .unwrap()
+            .remove(0);
 
         let settled = repo
             .succeed_and_enqueue(
-                workflow_id,
-                source.task_id,
+                &source,
                 &json!({"prompts": ["a", "b"]}),
                 &[
                     FanoutInstances {
@@ -984,23 +1065,25 @@ mod tests {
         let repo = PgTaskRepo::new(database.pool().clone());
         let workflow_id = "fail_and_enqueue_atomic";
         // 有后继：superseded + 后继入队（depends_on_ids 为空）。
+        repo.enqueue(&Task {
+            workflow_id: workflow_id.to_string(),
+            run_id: None,
+            name: "commit_scene".to_string(),
+            instance_id: None,
+            max_attempts: 3,
+            depends_on_ids: vec![],
+            depends_on_names: vec![],
+            input: json!({"proposal": {}}),
+        })
+        .await
+        .unwrap();
         let retried = repo
-            .enqueue(&Task {
-                workflow_id: workflow_id.to_string(),
-                run_id: None,
-                name: "commit_scene".to_string(),
-                instance_id: None,
-                max_attempts: 3,
-                depends_on_ids: vec![],
-                depends_on_names: vec![],
-                input: json!({"proposal": {}}),
-            })
+            .claim_many(workflow_id, "worker", 1)
             .await
-            .unwrap();
+            .unwrap()
+            .remove(0);
         repo.fail_and_enqueue(
-            workflow_id,
-            retried.task_id,
-            None,
+            &retried,
             "validation failed",
             &[FanoutInstances {
                 name: "scene_proposal".to_string(),
@@ -1042,6 +1125,13 @@ mod tests {
             })
             .await
             .unwrap();
+        let failed = repo
+            .claim_many(workflow_id, "worker", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == failed.task_id)
+            .unwrap();
         let mut dependents = Vec::new();
         for (name, run_id, by_name) in [
             ("audio_dependent", None, false),
@@ -1081,36 +1171,29 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            repo.fail_and_enqueue(
-                workflow_id,
-                failed.task_id,
-                None,
-                "budget exhausted",
-                &[],
-                3,
-            )
-            .await
-            .is_err()
+            repo.fail_and_enqueue(&failed, "budget exhausted", &[], 3,)
+                .await
+                .is_err()
         );
         for task in std::iter::once(&failed).chain(&dependents) {
             let unchanged = repo.get(workflow_id, task.task_id).await.unwrap().unwrap();
-            assert_eq!(unchanged.status, TaskStatus::Pending);
+            assert_eq!(
+                unchanged.status,
+                if task.task_id == failed.task_id {
+                    TaskStatus::Running
+                } else {
+                    TaskStatus::Pending
+                }
+            );
         }
         sqlx::query("ALTER TABLE tasks DROP CONSTRAINT reject_cascade")
             .execute(database.pool())
             .await
             .unwrap();
 
-        repo.fail_and_enqueue(
-            workflow_id,
-            failed.task_id,
-            None,
-            "budget exhausted",
-            &[],
-            3,
-        )
-        .await
-        .unwrap();
+        repo.fail_and_enqueue(&failed, "budget exhausted", &[], 3)
+            .await
+            .unwrap();
         let settled = repo
             .get(workflow_id, failed.task_id)
             .await
@@ -1158,7 +1241,7 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].lease_until.is_some());
 
-        repo.release_claim(workflow_id, task.task_id).await.unwrap();
+        repo.release_claim(&claimed[0]).await.unwrap();
 
         // 租约已释放：立即重认领成功，attempt 递增。
         let reclaimed = repo.claim_many(workflow_id, "worker", 5).await.unwrap();
@@ -1205,7 +1288,12 @@ mod tests {
             1
         );
 
-        assert_eq!(repo.release_claims("release_claims_all").await.unwrap(), 1);
+        assert_eq!(
+            repo.release_claims("release_claims_all", "worker")
+                .await
+                .unwrap(),
+            1
+        );
         let reclaimed = repo
             .claim_many("release_claims_all", "worker", 5)
             .await
@@ -1272,16 +1360,20 @@ mod tests {
 
         // 已全部成功：无 pending/running → 不命中。
         let done = "exec_sess_done";
-        let finished = insert_task(&repo, done, "narration", vec![]).await;
-        repo.succeed(done, finished.task_id, &json!({}))
-            .await
-            .unwrap();
+        insert_task(&repo, done, "narration", vec![]).await;
+        let finished = repo.claim_many(done, "worker", 1).await.unwrap().remove(0);
+        repo.succeed(&finished, &json!({})).await.unwrap();
 
         // 预算耗尽：attempt >= max_attempts（认领三次后不再被认领）→ 不命中。
         let exhausted = "exec_sess_exhausted";
         insert_task(&repo, exhausted, "narration", vec![]).await;
         for _ in 0..3 {
-            repo.claim_many(exhausted, "worker", 5).await.unwrap();
+            let claim = repo
+                .claim_many(exhausted, "worker", 5)
+                .await
+                .unwrap()
+                .remove(0);
+            repo.release_claim(&claim).await.unwrap();
         }
 
         let mut sessions = repo.executable_workflow_ids().await.unwrap();
@@ -1469,9 +1561,355 @@ mod tests {
         assert_eq!(recv_ready(&mut listener, workflow_id).await, workflow_id);
 
         // 3) 释放租约（原子结算回滚后的立即重入）。
-        repo.claim_many(workflow_id, "worker", 5).await.unwrap();
-        repo.release_claim(workflow_id, root.task_id).await.unwrap();
+        let claimed = repo
+            .claim_many(workflow_id, "worker", 5)
+            .await
+            .unwrap()
+            .remove(0);
+        repo.release_claim(&claimed).await.unwrap();
         assert_eq!(recv_ready(&mut listener, workflow_id).await, workflow_id);
+    }
+
+    async fn seed(
+        repo: &PgTaskRepo,
+        workflow_id: &str,
+        name: &str,
+        run_id: Option<i64>,
+    ) -> TaskRecord {
+        repo.enqueue(&Task {
+            workflow_id: workflow_id.into(),
+            run_id,
+            name: name.into(),
+            instance_id: None,
+            max_attempts: 5,
+            depends_on_ids: vec![],
+            depends_on_names: vec![],
+            input: json!({}),
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn reject_stale_writes(repo: &PgTaskRepo, task: &TaskRecord) {
+        let fanouts = [FanoutInstances {
+            name: "must-not-exist".into(),
+            task_type: "normal".into(),
+            instances: vec![(None, json!({}))],
+            depends_on_names: vec![],
+        }];
+        assert!(matches!(
+            repo.renew_claim(task).await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.release_claim(task).await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.succeed_and_enqueue(task, &json!("stale"), &fanouts, 3)
+                .await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.fail_and_enqueue(task, "stale", &fanouts, 3).await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.fail_and_enqueue(task, "stale", &[], 3).await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.succeed(task, &json!("stale")).await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.fail(task, "stale").await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.supersede(task, "stale").await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        assert!(matches!(
+            repo.skip(task, "stale").await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
+        let Some(database) = connect_test().await else {
+            return;
+        };
+        let repo = PgTaskRepo::new(database.pool().clone());
+        let workflow_id = "claim-fencing";
+        let root = seed(&repo, workflow_id, "root", Some(7)).await;
+        let old = repo
+            .claim_many(workflow_id, "worker-a", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let mut dependent = Task {
+            workflow_id: workflow_id.into(),
+            run_id: Some(7),
+            name: "dependent".into(),
+            instance_id: None,
+            max_attempts: 3,
+            depends_on_ids: vec![root.task_id],
+            depends_on_names: vec![],
+            input: json!({}),
+        };
+        repo.enqueue(&dependent).await.unwrap();
+        sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1 AND task_id = $2")
+            .bind(workflow_id).bind(old.task_id).execute(database.pool()).await.unwrap();
+        reject_stale_writes(&repo, &old).await;
+        let current = repo
+            .claim_many(workflow_id, "worker-b", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(current.attempt, old.attempt + 1);
+        reject_stale_writes(&repo, &old).await;
+        // Even a matching owner cannot reuse the preceding claim generation.
+        let mut wrong_attempt = current.clone();
+        wrong_attempt.attempt = old.attempt;
+        reject_stale_writes(&repo, &wrong_attempt).await;
+        let mut wrong_owner = current.clone();
+        wrong_owner.claimed_by = Some("worker-a".into());
+        reject_stale_writes(&repo, &wrong_owner).await;
+        let rows = repo.list_all(workflow_id).await.unwrap();
+        assert_eq!(rows.len(), 2, "stale settlement cannot create successors");
+        assert_eq!(
+            rows[1].status,
+            TaskStatus::Pending,
+            "stale failure cannot cascade"
+        );
+        let unchanged = repo
+            .get(workflow_id, current.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.claimed_by, current.claimed_by);
+        assert_eq!(unchanged.attempt, current.attempt);
+        assert_eq!(unchanged.lease_until, current.lease_until);
+        sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() + interval '30 seconds' WHERE workflow_id = $1 AND task_id = $2")
+            .bind(workflow_id).bind(current.task_id).execute(database.pool()).await.unwrap();
+        repo.renew_claim(&current).await.unwrap();
+        let renewed = repo
+            .get(workflow_id, current.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.attempt, current.attempt);
+        assert!(renewed.lease_until.unwrap() > chrono::Utc::now() + chrono::Duration::seconds(200));
+        repo.succeed(&current, &json!("current")).await.unwrap();
+        reject_stale_writes(&repo, &current).await;
+        let settled = repo
+            .get(workflow_id, current.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.output, Some(json!("current")));
+        // Bulk cleanup is restricted to the stopped worker, including within one workflow.
+        dependent.name = "another".into();
+        dependent.depends_on_ids.clear();
+        repo.enqueue(&dependent).await.unwrap();
+        let a = repo
+            .claim_many(workflow_id, "worker-a", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let b = repo
+            .claim_many(workflow_id, "worker-b", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            repo.release_claims(workflow_id, "worker-a").await.unwrap(),
+            1
+        );
+        assert!(matches!(
+            repo.renew_claim(&a).await,
+            Err(StorageError::ClaimLost { .. })
+        ));
+        repo.renew_claim(&b).await.unwrap();
+    }
+
+    async fn wait_for_lock_waiters(pool: &sqlx::PgPool, expected: i64) {
+        let application: String = sqlx::query_scalar("SELECT current_setting('application_name')")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'"
+                ).bind(&application).fetch_one(pool).await.unwrap();
+                if waiting >= expected { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("workers must reach their concurrent lock waits");
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order() {
+        let Some(database) = connect_test().await else {
+            return;
+        };
+        let repo = PgTaskRepo::new(database.pool().clone());
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        // Different first schemas must still lock the same physical tasks table;
+        // a connection's default isolation must not keep a pre-lock JOIN snapshot.
+        let alternate_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |connection, _| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    sqlx::query(&format!(r#"SET search_path TO pg_catalog, "{schema}""#))
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SELECT set_config('application_name', $1, false)")
+                        .bind(&schema)
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET default_transaction_isolation TO 'repeatable read'")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(database.database_url())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT current_schema()")
+                .fetch_one(&alternate_pool)
+                .await
+                .unwrap(),
+            "pg_catalog"
+        );
+        let workflow_id = "concurrent-join";
+        seed(&repo, workflow_id, "left", Some(42)).await;
+        seed(&repo, workflow_id, "right", Some(42)).await;
+        let left = repo
+            .claim_many(workflow_id, "worker-a", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let right = repo
+            .claim_many(workflow_id, "worker-b", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        // Freeze ID allocation: both producers reach the missing-JOIN window concurrently.
+        let mut blocker = database.pool().begin().await.unwrap();
+        sqlx::query("SELECT next_task_id FROM task_counters WHERE workflow_id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let mut workers = tokio::task::JoinSet::new();
+        for (source, targets, repo) in [
+            (left.clone(), ["join-a", "join-b"], repo.clone()),
+            (
+                right.clone(),
+                ["join-b", "join-a"],
+                PgTaskRepo::new(alternate_pool.clone()),
+            ),
+        ] {
+            workers.spawn(async move {
+                let fanouts: Vec<_> = targets
+                    .into_iter()
+                    .map(|name| FanoutInstances {
+                        name: name.into(),
+                        task_type: "join".into(),
+                        instances: vec![(None, json!({ source.name.clone(): source.task_id }))],
+                        depends_on_names: vec!["left".into(), "right".into()],
+                    })
+                    .collect();
+                repo.succeed_and_enqueue(&source, &json!(source.task_id), &fanouts, 3)
+                    .await
+            });
+        }
+        wait_for_lock_waiters(database.pool(), 2).await;
+        blocker.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = workers.join_next().await {
+                result.unwrap().unwrap();
+            }
+        })
+        .await
+        .expect("opposite successor order must not deadlock");
+        let rows = repo.list_all(workflow_id).await.unwrap();
+        assert_eq!(rows.len(), 4, "two source tasks and exactly two JOIN tasks");
+        for join in rows.iter().filter(|task| task.task_type == "join") {
+            assert_eq!(
+                join.input,
+                json!({"left": left.task_id, "right": right.task_id})
+            );
+            let mut dependencies = join.depends_on_ids.clone();
+            dependencies.sort_unstable();
+            assert_eq!(dependencies, [left.task_id, right.task_id]);
+        }
+        assert_eq!(
+            repo.claim_many(workflow_id, "join-worker", 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        alternate_pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
+        let Some(database) = connect_test().await else {
+            return;
+        };
+        let repo = PgTaskRepo::new(database.pool().clone());
+        for operation in 0..4 {
+            let workflow_id = format!("lease-lock-wait-{operation}");
+            seed(&repo, &workflow_id, "root", None).await;
+            let claim = repo
+                .claim_many(&workflow_id, "worker", 1)
+                .await
+                .unwrap()
+                .remove(0);
+            sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() + interval '300 milliseconds' WHERE workflow_id = $1")
+                .bind(&workflow_id).execute(database.pool()).await.unwrap();
+            let mut blocker = database.pool().begin().await.unwrap();
+            sqlx::query("SELECT task_id FROM tasks WHERE workflow_id = $1 FOR UPDATE")
+                .bind(&workflow_id)
+                .execute(&mut *blocker)
+                .await
+                .unwrap();
+            let worker_repo = repo.clone();
+            let worker = tokio::spawn(async move {
+                match operation {
+                    0 => worker_repo.renew_claim(&claim).await,
+                    1 => worker_repo.release_claim(&claim).await,
+                    2 => worker_repo.succeed(&claim, &json!({})).await.map(|_| ()),
+                    _ => {
+                        worker_repo
+                            .fail_and_enqueue(&claim, "expired", &[], 3)
+                            .await
+                    }
+                }
+            });
+            wait_for_lock_waiters(database.pool(), 1).await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            blocker.commit().await.unwrap();
+            assert!(matches!(
+                worker.await.unwrap(),
+                Err(StorageError::ClaimLost { .. })
+            ));
+            let rows = repo.list_all(&workflow_id).await.unwrap();
+            assert_eq!(rows[0].status, TaskStatus::Running);
+            assert!(rows[0].output.is_none());
+        }
     }
 
     #[test]

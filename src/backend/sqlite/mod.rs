@@ -1,7 +1,7 @@
 //! SQLite 通用工作流后端，由 `sqlite` feature 启用。
 //!
 //! [`migrate`] 建立引擎自有表，随后用 [`SqliteTaskRepo`] 入队、查询任务，
-//! 用绑定工作流的 [`SqliteTaskStore`] 驱动 [`crate::Scheduler`]。
+//! 用可共享的 [`SqliteTaskStore`] 驱动 [`crate::Scheduler`]，调度器按图身份认领任务。
 //! 数组与 JSON 输入输出存为 JSON 文本，时间存为 UTC 文本。
 //! 写事务通过 `BEGIN IMMEDIATE` 串行化，保证并发认领和扇入合并的原子性。
 //!

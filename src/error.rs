@@ -4,8 +4,8 @@
 pub enum StorageError {
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("task {workflow_id}:{task_id} missing after settle")]
-    MissingTask { workflow_id: String, task_id: i64 },
+    #[error("claim for task {workflow_id}:{task_id} is no longer valid")]
+    ClaimLost { workflow_id: String, task_id: i64 },
     #[error("unsupported database URL scheme; expected postgres, postgresql, or sqlite")]
     UnsupportedScheme,
     #[error("database backend {backend} is not enabled")]

@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
 use super::{SqliteTaskRepo, SqliteTaskStore, migrate};
-use crate::{FanoutPlan, StorageError, Task, TaskRecord, TaskStatus, TaskStore};
+use crate::task::FanoutPlan;
+use crate::{StorageError, Task, TaskRecord, TaskStatus, TaskStore};
 
 async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
     let pool = SqlitePoolOptions::new()
@@ -75,10 +76,12 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert!(repo.get("missing", 1).await.unwrap().is_none());
 
     let output = json!([null, {"result": "完成"}]);
-    let settled = repo
-        .succeed("workflow", first.task_id, &output)
+    let claimed = repo
+        .claim_many("workflow", "worker", 1)
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
+    let settled = repo.succeed(&claimed, &output).await.unwrap();
     assert_eq!(settled.status, TaskStatus::Succeeded);
     assert_eq!(get(&repo, &first).await.output, Some(output));
 
@@ -131,9 +134,7 @@ async fn claims_require_all_dependencies_including_missing_ids() {
     );
     assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
 
-    repo.succeed("deps", root.task_id, &json!(null))
-        .await
-        .unwrap();
+    repo.succeed(&claimed[0], &json!(null)).await.unwrap();
     assert_eq!(repo.executable_workflow_ids().await.unwrap(), ["deps"]);
     let claimed = repo.claim_many("deps", "worker-b", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
@@ -147,7 +148,7 @@ async fn released_and_expired_leases_retry_until_the_budget_is_exhausted() {
     let task = repo.enqueue(&new_task("retry", "root")).await.unwrap();
     let first = repo.claim_many("retry", "first", 1).await.unwrap();
     assert_eq!(first[0].attempt, 1);
-    repo.release_claim("retry", task.task_id).await.unwrap();
+    repo.release_claim(&first[0]).await.unwrap();
     let second = repo.claim_many("retry", "second", 1).await.unwrap();
     assert_eq!(second[0].attempt, 2);
 
@@ -173,7 +174,7 @@ async fn released_and_expired_leases_retry_until_the_budget_is_exhausted() {
     );
     assert_eq!(get(&repo, &task).await.status, TaskStatus::Running);
 
-    repo.release_claim("retry", task.task_id).await.unwrap();
+    repo.release_claim(&third[0]).await.unwrap();
     assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
     assert_eq!(repo.seal_budget_exhausted().await.unwrap(), 1);
     let exhausted = get(&repo, &task).await;
@@ -227,29 +228,33 @@ async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
     let mut wrong_run = new_task("join", "text");
     wrong_run.run_id = Some(2);
     let wrong_run = repo.enqueue(&wrong_run).await.unwrap();
-    repo.succeed("join", wrong_run.task_id, &json!({}))
-        .await
-        .unwrap();
-    let claimed = repo.claim_many("join", "worker", 10).await.unwrap();
+    let mut claimed = repo.claim_many("join", "worker", 10).await.unwrap();
+    let wrong_claim = claimed.remove(
+        claimed
+            .iter()
+            .position(|task| task.task_id == wrong_run.task_id)
+            .unwrap(),
+    );
+    repo.succeed(&wrong_claim, &json!({})).await.unwrap();
     assert_eq!(
         claimed.len(),
         2,
         "the JOIN is blocked before predecessors finish"
     );
     assert!(claimed.iter().all(|t| t.name == "image"));
+    assert_eq!(
+        claimed.iter().map(|task| task.task_id).collect::<Vec<_>>(),
+        images.iter().map(|task| task.task_id).collect::<Vec<_>>()
+    );
 
-    repo.succeed("join", images[0].task_id, &json!({}))
-        .await
-        .unwrap();
+    repo.succeed(&claimed[0], &json!({})).await.unwrap();
     assert!(
         repo.claim_many("join", "worker", 10)
             .await
             .unwrap()
             .is_empty()
     );
-    repo.succeed("join", images[1].task_id, &json!({}))
-        .await
-        .unwrap();
+    repo.succeed(&claimed[1], &json!({})).await.unwrap();
     assert!(
         repo.claim_many("join", "worker", 10)
             .await
@@ -261,9 +266,13 @@ async fn join_waits_for_every_named_predecessor_and_all_its_instances() {
     let mut text = new_task("join", "text");
     text.run_id = Some(1);
     let text = repo.enqueue(&text).await.unwrap();
-    repo.succeed("join", text.task_id, &json!({}))
+    let text_claim = repo
+        .claim_many("join", "worker", 10)
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0);
+    assert_eq!(text_claim.task_id, text.task_id);
+    repo.succeed(&text_claim, &json!({})).await.unwrap();
     let claimed = repo.claim_many("join", "worker", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, join.task_id);
@@ -360,9 +369,14 @@ async fn map_enqueue_is_idempotent_even_after_settlement_and_with_null_run_ids()
             .await
             .unwrap();
         assert_eq!(inserted.len(), 2);
-        repo.succeed("map", inserted[0].task_id, &json!({}))
+        let claim = repo
+            .claim_many("map", "worker", 10)
             .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == inserted[0].task_id)
             .unwrap();
+        repo.succeed(&claim, &json!({})).await.unwrap();
         let duplicate = repo
             .enqueue_fanout("map", run_id, "image", &instances, &[], "normal", &[], 3)
             .await
@@ -380,8 +394,12 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         .enqueue(&new_task("atomic_success", "root"))
         .await
         .unwrap();
-    let store = SqliteTaskStore::new(repo.clone(), "atomic_success".into()).with_max_attempts(7);
-    let claimed = store.claim_many(1).await.unwrap().remove(0);
+    let store = SqliteTaskStore::new(repo.clone()).with_max_attempts(7);
+    let claimed = store
+        .claim_many("atomic_success", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
     let valid = plan("child", "normal", vec![json!("a"), json!("b")]);
     let invalid = plan("invalid", "unsupported", vec![json!({})]);
     assert!(
@@ -408,7 +426,10 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     assert_eq!(settled.run_id, Some(9));
     assert_eq!(settled.status, TaskStatus::Succeeded);
     assert!(settled.lease_until.is_none());
-    let children = store.claim_many(10).await.unwrap();
+    let children = store
+        .claim_many("atomic_success", "worker", 10)
+        .await
+        .unwrap();
     assert_eq!(children.len(), 2);
     assert_eq!(
         children
@@ -430,8 +451,12 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     let mut input = new_task("atomic_failure", "root");
     input.run_id = Some(4);
     let task = repo.enqueue(&input).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone(), "atomic_failure".into());
-    let claimed = store.claim_many(1).await.unwrap().remove(0);
+    let store = SqliteTaskStore::new(repo.clone());
+    let claimed = store
+        .claim_many("atomic_failure", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
     let recovery = plan("recovery", "normal", vec![json!({"retry": true})]);
     let invalid = plan("invalid", "unsupported", vec![json!({})]);
     let message = "execution failed";
@@ -445,7 +470,11 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert_eq!(repo.list_all("atomic_failure").await.unwrap().len(), 1);
 
     store.release_claim(&claimed).await.unwrap();
-    let reclaimed = store.claim_many(1).await.unwrap().remove(0);
+    let reclaimed = store
+        .claim_many("atomic_failure", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
     assert_eq!(reclaimed.attempt, 2);
     store
         .settle_failure(&reclaimed, message, &[recovery])
@@ -455,7 +484,11 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert_eq!(settled.status, TaskStatus::Superseded);
     assert_eq!(settled.error.as_deref(), Some("execution failed"));
     assert!(settled.lease_until.is_none());
-    let recovery = store.claim_many(10).await.unwrap().remove(0);
+    let recovery = store
+        .claim_many("atomic_failure", "worker", 10)
+        .await
+        .unwrap()
+        .remove(0);
     assert_eq!(recovery.name, "recovery");
     assert_eq!(recovery.instance_id, None);
     assert_eq!(recovery.run_id, Some(4));
@@ -468,8 +501,12 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
 async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
     let (_, repo) = memory_repo().await;
     repo.enqueue(&new_task("same_name", "retry")).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone(), "same_name".into());
-    let source = store.claim_many(1).await.unwrap().remove(0);
+    let store = SqliteTaskStore::new(repo.clone());
+    let source = store
+        .claim_many("same_name", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
     store
         .settle_failure(
             &source,
@@ -479,7 +516,7 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
         .await
         .unwrap();
     assert_eq!(get(&repo, &source).await.status, TaskStatus::Superseded);
-    let successors = store.claim_many(1).await.unwrap();
+    let successors = store.claim_many("same_name", "worker", 1).await.unwrap();
     assert_eq!(successors.len(), 1);
     assert_ne!(successors[0].task_id, source.task_id);
     assert_eq!(successors[0].input, json!({"retry": true}));
@@ -491,12 +528,20 @@ async fn release_all_claims_and_store_operations_stay_in_their_workflow() {
     let (_, repo) = memory_repo().await;
     let ours = repo.enqueue(&new_task("ours", "root")).await.unwrap();
     let theirs = repo.enqueue(&new_task("theirs", "root")).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone(), "ours".into());
-    assert_eq!(store.claim_many(10).await.unwrap().len(), 1);
+    let store = SqliteTaskStore::new(repo.clone());
+    assert_eq!(
+        store.claim_many("ours", "worker", 10).await.unwrap().len(),
+        1
+    );
     assert_eq!(get(&repo, &theirs).await.status, TaskStatus::Pending);
     repo.claim_many("theirs", "other-worker", 1).await.unwrap();
-    assert_eq!(repo.release_claims("ours").await.unwrap(), 1);
-    assert_eq!(store.claim_many(10).await.unwrap()[0].attempt, 2);
+    assert_eq!(repo.release_claims("ours", "worker").await.unwrap(), 1);
+    let reclaimed = store
+        .claim_many("ours", "worker", 10)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(reclaimed.attempt, 2);
     assert!(
         repo.claim_many("theirs", "third-worker", 1)
             .await
@@ -505,7 +550,7 @@ async fn release_all_claims_and_store_operations_stay_in_their_workflow() {
     );
 
     store
-        .settle_success(&ours, &json!("ours"), &[])
+        .settle_success(&reclaimed, &json!("ours"), &[])
         .await
         .unwrap();
     assert_eq!(get(&repo, &ours).await.status, TaskStatus::Succeeded);
@@ -549,8 +594,12 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .unwrap()
         .remove(0);
     let unrelated = repo.enqueue(&new_task("other", "root")).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone(), "cascade".into());
-    let root = store.claim_many(1).await.unwrap().remove(0);
+    let store = SqliteTaskStore::new(repo.clone());
+    let root = store
+        .claim_many("cascade", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
     let message = "permanent failure";
 
     // A failed cascade must also roll back the source's terminal state and lease.
@@ -651,15 +700,21 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
 
         let mut completed = new_task("cascade_runs", "completed");
         completed.run_id = source_run;
-        completed.depends_on_ids = vec![root.task_id];
         let completed = repo.enqueue(&completed).await.unwrap();
-        repo.succeed("cascade_runs", completed.task_id, &json!("done"))
-            .await
+        let claims = repo.claim_many("cascade_runs", "worker", 10).await.unwrap();
+        let root_claim = claims
+            .iter()
+            .find(|task| task.task_id == root.task_id)
             .unwrap();
+        let completed_claim = claims
+            .iter()
+            .find(|task| task.task_id == completed.task_id)
+            .unwrap();
+        repo.succeed(completed_claim, &json!("done")).await.unwrap();
 
-        let store = SqliteTaskStore::new(repo.clone(), "cascade_runs".into());
+        let store = SqliteTaskStore::new(repo.clone());
         store
-            .settle_failure(&root, "permanent failure", &[])
+            .settle_failure(root_claim, "permanent failure", &[])
             .await
             .unwrap();
 
@@ -690,10 +745,169 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
 #[tokio::test]
 async fn settling_a_missing_task_returns_a_typed_error() {
     let (_, repo) = memory_repo().await;
+    repo.enqueue(&new_task("missing", "root")).await.unwrap();
+    let mut claimed = repo
+        .claim_many("missing", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    claimed.task_id = 123;
     assert!(matches!(
-        repo.succeed("missing", 123, &json!({})).await,
-        Err(StorageError::MissingTask { workflow_id, task_id: 123 }) if workflow_id == "missing"
+        repo.succeed(&claimed, &json!({})).await,
+        Err(StorageError::ClaimLost { workflow_id, task_id: 123 }) if workflow_id == "missing"
     ));
+}
+
+#[tokio::test]
+async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
+    let (pool, repo) = memory_repo().await;
+    let root = repo.enqueue(&new_task("fencing", "root")).await.unwrap();
+    let mut child = new_task("fencing", "child");
+    child.depends_on_ids = vec![root.task_id];
+    let child = repo.enqueue(&child).await.unwrap();
+    let first = repo
+        .claim_many("fencing", "worker-a", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    sqlx::query("UPDATE tasks SET lease_until = '2000-01-01T00:00:00Z' WHERE workflow_id = 'fencing' AND task_id = ?")
+        .bind(root.task_id).execute(&pool).await.unwrap();
+    let second = repo
+        .claim_many("fencing", "worker-b", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(second.attempt, first.attempt + 1);
+    let before = serde_json::to_value(&second).unwrap();
+    let store = SqliteTaskStore::new(repo.clone());
+    let fanout = plan("forbidden", "normal", vec![json!("stale")]);
+    for result in [
+        repo.renew_claim(&first).await,
+        repo.release_claim(&first).await,
+        store
+            .settle_success(&first, &json!("stale"), std::slice::from_ref(&fanout))
+            .await,
+        store
+            .settle_failure(&first, "stale", std::slice::from_ref(&fanout))
+            .await,
+        store.settle_failure(&first, "stale", &[]).await,
+        repo.succeed(&first, &json!("stale")).await.map(|_| ()),
+        repo.fail(&first, "stale").await,
+        repo.supersede(&first, "stale").await,
+        repo.skip(&first, "stale").await,
+    ] {
+        assert!(matches!(result, Err(StorageError::ClaimLost { .. })));
+    }
+    // Both the owner and the attempt are checked independently.
+    let mut wrong_attempt = second.clone();
+    wrong_attempt.attempt = first.attempt;
+    assert!(matches!(
+        repo.release_claim(&wrong_attempt).await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+    let mut wrong_owner = second.clone();
+    wrong_owner.claimed_by = first.claimed_by.clone();
+    assert!(matches!(
+        repo.renew_claim(&wrong_owner).await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+    assert_eq!(
+        serde_json::to_value(get(&repo, &second).await).unwrap(),
+        before
+    );
+    assert_eq!(repo.list_all("fencing").await.unwrap().len(), 2);
+    assert_eq!(get(&repo, &child).await.status, TaskStatus::Pending);
+    store
+        .settle_success(&second, &json!("current"), &[])
+        .await
+        .unwrap();
+    assert_eq!(get(&repo, &second).await.output, Some(json!("current")));
+    assert!(matches!(
+        repo.renew_claim(&second).await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+}
+
+#[tokio::test]
+async fn renewal_extends_only_a_live_claim_without_consuming_an_attempt() {
+    let (pool, repo) = memory_repo().await;
+    repo.enqueue(&new_task("renewal", "root")).await.unwrap();
+    let claim = repo
+        .claim_many("renewal", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    sqlx::query("UPDATE tasks SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 seconds') WHERE workflow_id = 'renewal'")
+        .execute(&pool).await.unwrap();
+    let shortened = get(&repo, &claim).await;
+    repo.renew_claim(&claim).await.unwrap();
+    let renewed = get(&repo, &claim).await;
+    assert_eq!(renewed.attempt, claim.attempt);
+    assert_eq!(renewed.claimed_by, claim.claimed_by);
+    assert_eq!(renewed.status, TaskStatus::Running);
+    assert!(
+        renewed.lease_until.unwrap()
+            > shortened.lease_until.unwrap() + chrono::Duration::seconds(250)
+    );
+    assert!(
+        repo.claim_many("renewal", "other-worker", 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    sqlx::query(
+        "UPDATE tasks SET lease_until = '2000-01-01T00:00:00Z' WHERE workflow_id = 'renewal'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for result in [
+        repo.renew_claim(&claim).await,
+        repo.release_claim(&claim).await,
+        repo.succeed(&claim, &json!("expired")).await.map(|_| ()),
+        repo.fail_and_enqueue(&claim, "expired", &[], 3).await,
+    ] {
+        assert!(
+            matches!(result, Err(StorageError::ClaimLost { .. })),
+            "expiry alone invalidates a claim even without takeover"
+        );
+    }
+    let expired = get(&repo, &claim).await;
+    assert_eq!(expired.attempt, claim.attempt);
+    assert_eq!(expired.status, TaskStatus::Running);
+    assert!(expired.output.is_none());
+}
+
+#[tokio::test]
+async fn releasing_a_stopped_worker_does_not_release_another_workers_claims() {
+    let (_, repo) = memory_repo().await;
+    repo.enqueue(&new_task("worker-release", "first"))
+        .await
+        .unwrap();
+    repo.enqueue(&new_task("worker-release", "second"))
+        .await
+        .unwrap();
+    let first = repo
+        .claim_many("worker-release", "a", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let second = repo
+        .claim_many("worker-release", "b", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(repo.release_claims("worker-release", "a").await.unwrap(), 1);
+    assert!(matches!(
+        repo.renew_claim(&first).await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+    repo.renew_claim(&second).await.unwrap();
+    let reclaimed = repo.claim_many("worker-release", "c", 10).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].task_id, first.task_id);
+    assert_eq!(get(&repo, &second).await.claimed_by.as_deref(), Some("b"));
 }
 
 struct DatabaseFile(PathBuf);
@@ -766,7 +980,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     );
     let task_id = tasks[0].task_id;
     repo_a
-        .succeed("concurrent", task_id, &json!({"saved": true}))
+        .succeed(&tasks[0], &json!({"saved": true}))
         .await
         .unwrap();
 
@@ -828,7 +1042,11 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     let saved = repo.get("concurrent", task_id).await.unwrap().unwrap();
     assert_eq!(saved.status, TaskStatus::Succeeded);
     assert_eq!(saved.output, Some(json!({"saved": true})));
-    assert_eq!(repo.release_claims("concurrent").await.unwrap(), 39);
+    let mut released = 0;
+    for worker in ["a", "b", "c", "d"] {
+        released += repo.release_claims("concurrent", worker).await.unwrap();
+    }
+    assert_eq!(released, 39);
     assert_eq!(
         repo.claim_many("concurrent", "reopened", 40)
             .await

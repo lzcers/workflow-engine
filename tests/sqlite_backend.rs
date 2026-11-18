@@ -5,9 +5,10 @@ use std::{sync::Arc, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePoolOptions;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use workflow_engine::{
-    Database, JoinNode, Node, NodeContext, NodeError, Scheduler, Task, TaskRecord, TaskStatus,
+    Database, Engine, EngineError, Graph, JoinNode, Node, NodeContext, NodeError, Scheduler, Task,
+    TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
     dsl,
 };
@@ -15,12 +16,14 @@ use workflow_engine::{
 #[derive(Default)]
 struct Context {
     task: Option<TaskRecord>,
+    completed: Option<mpsc::UnboundedSender<(TaskRecord, Value)>>,
 }
 
 impl NodeContext for Context {
     async fn fork(&self, task: &TaskRecord) -> Self {
         Self {
             task: Some(task.clone()),
+            completed: self.completed.clone(),
         }
     }
 }
@@ -39,6 +42,14 @@ impl Node<Context> for AddOne {
         assert_eq!(task.input, json!(input));
         assert_eq!(task.status, TaskStatus::Running);
         Ok(input + 1)
+    }
+
+    async fn on_success(ctx: &mut Context, output: &Value) {
+        if let Some(completed) = &ctx.completed {
+            completed
+                .send((ctx.task.as_ref().unwrap().clone(), output.clone()))
+                .unwrap();
+        }
     }
 }
 
@@ -99,34 +110,43 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     .unwrap();
 
     let root = repo
-        .enqueue(&Task {
-            workflow_id: "dsl-workflow".into(),
-            run_id: Some(7),
-            name: "start".into(),
-            instance_id: None,
-            max_attempts: 3,
-            depends_on_ids: vec![],
-            depends_on_names: vec![],
-            input: json!(0),
-        })
+        .create_run("dsl-workflow", "start", &json!(0), 3)
         .await
         .unwrap();
-    let store = SqliteTaskStore::new(repo.clone(), root.workflow_id.clone()).with_max_attempts(5);
-    let mut scheduler = Scheduler::new(
-        Arc::new(graph),
-        Arc::new(store),
-        Duration::from_millis(2),
-        Some(Duration::from_millis(10)),
-    )
-    .with_max_concurrency(3);
+    let other_root = repo
+        .create_run("dsl-workflow", "start", &json!(100), 3)
+        .await
+        .unwrap();
+    assert_eq!(root.run_id, Some(root.task_id));
+    assert_eq!(other_root.run_id, Some(other_root.task_id));
+    assert_ne!(root.run_id, other_root.run_id);
+    let store = SqliteTaskStore::new(repo.clone()).with_max_attempts(5);
+    let scheduler = Scheduler::new(Arc::new(graph), Arc::new(store), Duration::from_millis(2))
+        .with_max_concurrency(3);
     tokio::time::timeout(
         Duration::from_secs(5),
-        scheduler.run(std::future::pending()),
+        scheduler.run(async {
+            loop {
+                let tasks = repo.list_all("dsl-workflow").await.unwrap();
+                if tasks.len() == 12
+                    && tasks
+                        .iter()
+                        .all(|task| task.status == TaskStatus::Succeeded)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }),
     )
     .await
-    .expect("workflow finishes and scheduler exits after becoming idle");
+    .expect("both runs finish before shutdown");
 
-    let tasks = repo.list_all(&root.workflow_id).await.unwrap();
+    let all_tasks = repo.list_all(&root.workflow_id).await.unwrap();
+    let tasks: Vec<_> = all_tasks
+        .iter()
+        .filter(|task| task.run_id == root.run_id)
+        .collect();
     assert_eq!(
         tasks.len(),
         6,
@@ -180,6 +200,24 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(total.depends_on_ids, [join.task_id]);
     assert_eq!(total.input, join.input);
     assert_eq!(total.output, Some(json!(16)));
+
+    let other_tasks: Vec<_> = all_tasks
+        .iter()
+        .filter(|task| task.run_id == other_root.run_id)
+        .collect();
+    assert_eq!(other_tasks.len(), 6);
+    for task in &other_tasks {
+        assert!(
+            task.depends_on_ids
+                .iter()
+                .all(|id| { other_tasks.iter().any(|other| other.task_id == *id) })
+        );
+    }
+    let other_total = other_tasks
+        .iter()
+        .find(|task| task.name == "total")
+        .unwrap();
+    assert_eq!(other_total.output, Some(json!(316)));
     assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
     database.close().await;
     assert!(shared_database.check().await.is_err());
@@ -187,7 +225,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
 
 struct SignalNode {
     started: Arc<Notify>,
-    block: bool,
+    release: Option<Arc<Notify>>,
 }
 
 impl Node<Context> for SignalNode {
@@ -196,8 +234,8 @@ impl Node<Context> for SignalNode {
 
     async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
         self.started.notify_one();
-        if self.block {
-            std::future::pending::<()>().await;
+        if let Some(release) = &self.release {
+            release.notified().await;
         }
         Ok(input)
     }
@@ -234,26 +272,26 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
 
     let slow_started = Arc::new(Notify::new());
     let fast_started = Arc::new(Notify::new());
+    let release_slow = Arc::new(Notify::new());
     let graph = dsl::workflow! {
         workflow_id: "scheduler-wake";
         title: "调度唤醒";
         context: Context::default();
         nodes {
-            slow => SignalNode { started: slow_started.clone(), block: true },
-            fast => SignalNode { started: fast_started.clone(), block: false },
+            slow => SignalNode { started: slow_started.clone(), release: Some(release_slow.clone()) },
+            fast => SignalNode { started: fast_started.clone(), release: None },
         }
         edges {}
     }
     .unwrap();
     let wake = Arc::new(Notify::new());
-    let mut scheduler = Scheduler::new(
+    let scheduler = Scheduler::new(
         Arc::new(graph),
-        Arc::new(SqliteTaskStore::new(repo.clone(), task.workflow_id.clone())),
+        Arc::new(SqliteTaskStore::new(repo.clone())),
         Duration::from_secs(60),
-        None,
     )
     .with_max_concurrency(2)
-    .with_wake(Some(wake.clone()));
+    .with_wake(wake.clone());
 
     // 清空建库和入队产生的归还事件。单连接池保证此后仅观察调度器的认领事务。
     let connection = db.acquire().await.unwrap();
@@ -283,10 +321,11 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     wake.notify_one();
     let started = tokio::time::timeout(Duration::from_secs(5), fast_started.notified()).await;
 
+    release_slow.notify_one();
     shutdown_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), worker)
         .await
-        .expect("shutdown cancels the blocked node")
+        .expect("shutdown waits for both nodes to finish")
         .unwrap();
     assert!(
         started.is_ok(),
@@ -295,44 +334,284 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     assert_eq!(
         Arc::strong_count(&slow_started),
         1,
-        "blocked node was dropped"
+        "completed node was dropped"
+    );
+    assert!(
+        repo.list_all("scheduler-wake")
+            .await
+            .unwrap()
+            .iter()
+            .all(|task| task.status == TaskStatus::Succeeded)
     );
     db.close().await;
 }
 
 #[tokio::test]
-async fn scheduler_exits_at_idle_timeout_before_the_next_poll() {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    migrate(&db).await.unwrap();
-    let graph = dsl::workflow! {
-        workflow_id: "scheduler-idle";
-        title: "空闲回收";
-        context: Context::default();
-        nodes { start => AddOne }
-        edges {}
+async fn workflows_with_different_contexts_start_and_stop_independently() {
+    struct OtherContext(Context);
+
+    impl NodeContext for OtherContext {
+        async fn fork(&self, task: &TaskRecord) -> Self {
+            Self(self.0.fork(task).await)
+        }
     }
-    .unwrap();
-    let idle_timeout = Duration::from_millis(20);
-    let mut scheduler = Scheduler::new(
-        Arc::new(graph),
-        Arc::new(SqliteTaskStore::new(
-            SqliteTaskRepo::new(db.clone()),
-            "scheduler-idle".into(),
-        )),
-        Duration::from_secs(60),
-        Some(idle_timeout),
-    );
-    let started = tokio::time::Instant::now();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        scheduler.run(std::future::pending()),
+
+    impl Node<OtherContext> for AddOne {
+        type In = i32;
+        type Out = i32;
+
+        async fn execute(&self, ctx: &mut OtherContext, input: i32) -> Result<i32, NodeError> {
+            <Self as Node<Context>>::execute(self, &mut ctx.0, input).await
+        }
+
+        async fn on_success(ctx: &mut OtherContext, output: &Value) {
+            <Self as Node<Context>>::on_success(&mut ctx.0, output).await;
+        }
+    }
+
+    let engine = Engine::new("sqlite::memory:").await.unwrap();
+    let (completed, mut results) = mpsc::unbounded_channel();
+    let first_graph = Graph::builder(
+        "first",
+        "First",
+        Context {
+            completed: Some(completed.clone()),
+            ..Context::default()
+        },
     )
+    .node("start", AddOne)
+    .node("alternate", AddOne)
+    .build()
+    .unwrap();
+    let second_graph = Graph::builder(
+        "second",
+        "Second",
+        OtherContext(Context {
+            completed: Some(completed),
+            ..Context::default()
+        }),
+    )
+    .node("start", AddOne)
+    .build()
+    .unwrap();
+    let first = engine.make(first_graph);
+    let second = engine.make(second_graph);
+    drop(engine);
+    let first_run = first.submit("start", 10).await.unwrap();
+    let another_run = first.submit("alternate", 20).await.unwrap();
+    let second_run = second.submit("start", 30).await.unwrap();
+    assert_eq!(first_run.workflow_id, "first");
+    assert_eq!(second_run.workflow_id, "second");
+    assert_eq!(first_run.run_id, first_run.task_id);
+    assert_eq!(second_run.run_id, second_run.task_id);
+    assert_ne!(first_run.run_id, another_run.run_id);
+    assert_eq!(first_run.task_id, 1);
+    assert_eq!(second_run.task_id, 1);
+    assert!(matches!(
+        first.submit("missing", 0).await,
+        Err(EngineError::UnknownNode(name)) if name == "missing"
+    ));
+    assert!(matches!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), first.run())
+        .await
+        .expect("run starts the scheduler and returns immediately")
+        .unwrap();
+    let mut outputs = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let (task, output) = results.recv().await.unwrap();
+            outputs.push((
+                task.workflow_id,
+                task.run_id.unwrap(),
+                task.name,
+                output.as_i64().unwrap(),
+            ));
+        }
+        outputs
+    })
     .await
-    .expect("idle deadline must not wait for the 60-second poll");
-    assert!(started.elapsed() >= idle_timeout);
-    db.close().await;
+    .expect("one Workflow run drives both of its submitted runs");
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        [
+            ("first".into(), first_run.run_id, "start".into(), 11),
+            ("first".into(), another_run.run_id, "alternate".into(), 21),
+        ]
+    );
+    assert!(matches!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        first.run().await,
+        Err(EngineError::AlreadyRunning)
+    ));
+
+    second.run().await.unwrap();
+    let (task, output) = tokio::time::timeout(Duration::from_secs(5), results.recv())
+        .await
+        .expect("the second workflow starts only after its own run call")
+        .unwrap();
+    assert_eq!(task.workflow_id, "second");
+    assert_eq!(task.run_id, Some(second_run.run_id));
+    assert_eq!(output, json!(31));
+
+    first.stop().await.unwrap();
+    let paused_run = first.submit("alternate", 40).await.unwrap();
+    let running_run = second.submit("start", 50).await.unwrap();
+    let (task, output) = tokio::time::timeout(Duration::from_secs(5), results.recv())
+        .await
+        .expect("stopping the first workflow does not stop the second")
+        .unwrap();
+    assert_eq!(task.workflow_id, "second");
+    assert_eq!(task.run_id, Some(running_run.run_id));
+    assert_eq!(output, json!(51));
+    assert!(matches!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    first.run().await.unwrap();
+    let (task, output) = tokio::time::timeout(Duration::from_secs(5), results.recv())
+        .await
+        .expect("restart executes the run submitted while stopped")
+        .unwrap();
+    assert_eq!(task.workflow_id, "first");
+    assert_eq!(task.run_id, Some(paused_run.run_id));
+    assert_eq!(task.name, "alternate");
+    assert_eq!(output, json!(41));
+    first.stop().await.unwrap();
+    first.stop().await.unwrap();
+    second.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn workflow_shares_slots_across_runs_and_drains_in_flight_tasks_before_stopping() {
+    struct Block {
+        started: mpsc::UnboundedSender<i32>,
+        release: Arc<Semaphore>,
+    }
+
+    impl Node<Context> for Block {
+        type In = i32;
+        type Out = i32;
+
+        async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
+            self.started.send(input).unwrap();
+            self.release.acquire().await.unwrap().forget();
+            Ok(input)
+        }
+
+        async fn on_success(ctx: &mut Context, output: &Value) {
+            ctx.completed
+                .as_ref()
+                .unwrap()
+                .send((ctx.task.as_ref().unwrap().clone(), output.clone()))
+                .unwrap();
+        }
+    }
+
+    let engine = Engine::new("sqlite::memory:").await.unwrap();
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let (completed, mut completions) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let graph = Graph::builder(
+        "shared-slots",
+        "Shared slots",
+        Context {
+            completed: Some(completed),
+            ..Context::default()
+        },
+    )
+    .node(
+        "start",
+        Block {
+            started,
+            release: release.clone(),
+        },
+    )
+    .build()
+    .unwrap();
+    let workflow = engine.make(graph);
+    for input in 0..12 {
+        workflow.submit("start", input).await.unwrap();
+    }
+    workflow.run().await.unwrap();
+    let mut inputs = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut inputs = Vec::new();
+        for _ in 0..8 {
+            inputs.push(starts.recv().await.unwrap());
+        }
+        inputs
+    })
+    .await
+    .expect("all runs share the workflow's eight execution slots");
+    let ninth = tokio::time::timeout(Duration::from_millis(100), starts.recv()).await;
+    assert!(ninth.is_err(), "the ninth run must wait for a shared slot");
+    release.add_permits(1);
+    inputs.push(
+        tokio::time::timeout(Duration::from_secs(5), starts.recv())
+            .await
+            .expect("completion frees a slot for the next run")
+            .unwrap(),
+    );
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), workflow.stop())
+            .await
+            .is_err(),
+        "stop must wait for all eight in-flight nodes"
+    );
+    assert!(
+        matches!(workflow.run().await, Err(EngineError::AlreadyRunning)),
+        "cancelling the stop waiter must retain the draining worker"
+    );
+    release.add_permits(8);
+    tokio::time::timeout(Duration::from_secs(5), workflow.stop())
+        .await
+        .expect("a second stop waits for the original in-flight tasks to settle")
+        .unwrap();
+    let mut completed_runs = Vec::new();
+    for _ in 0..9 {
+        let (task, _) = completions
+            .try_recv()
+            .expect("task settled before stop returned");
+        completed_runs.push(task.run_id.unwrap());
+    }
+    assert!(matches!(
+        starts.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        completions.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    workflow.submit("start", 99).await.unwrap();
+    assert!(matches!(
+        starts.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    release.add_permits(4);
+    workflow.run().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..4 {
+            inputs.push(starts.recv().await.unwrap());
+            let (task, _) = completions.recv().await.unwrap();
+            completed_runs.push(task.run_id.unwrap());
+        }
+    })
+    .await
+    .expect("restart executes the remaining runs and the new submission");
+    workflow.stop().await.unwrap();
+    inputs.sort_unstable();
+    assert_eq!(inputs, (0..12).chain([99]).collect::<Vec<_>>());
+    completed_runs.sort_unstable();
+    completed_runs.dedup();
+    assert_eq!(completed_runs.len(), 13);
 }

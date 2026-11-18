@@ -1,28 +1,27 @@
 //! [`PgTaskStore`]：通用引擎 [`crate::TaskStore`] 的 pgsql 实现。
 //!
-//! 工作流级构造（绑定 `workflow_id` 作用域与 [`PgTaskRepo`]），收编通用引擎的
-//! [`crate::FanoutPlan`] → [`crate::FanoutInstances`] 折叠，不感知任何业务字段。
+//! 通过 [`PgTaskRepo`] 供多个工作流共享，收编通用引擎的
+//! [`crate::task::FanoutPlan`] → [`crate::task::FanoutInstances`] 折叠，不感知任何业务字段。
 
 use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::repo::PgTaskRepo;
-use crate::{FanoutInstances, FanoutPlan, StorageError, Task, TaskRecord, TaskStore};
+use crate::task::{FanoutInstances, FanoutPlan};
+use crate::{StorageError, Task, TaskRecord, TaskStore};
 
-/// 工作流级任务存储：绑定 `workflow_id + PgTaskRepo`，把 [`TaskStore`] 落到 `tasks` 表。
+/// 共享任务存储：通过 `PgTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
 #[derive(Clone)]
 pub struct PgTaskStore {
     repo: PgTaskRepo,
-    workflow_id: String,
     max_attempts: i32,
 }
 
 impl PgTaskStore {
-    /// 绑定工作流作用域与仓储；新任务默认 `max_attempts = 3`。
-    pub fn new(repo: PgTaskRepo, workflow_id: String) -> Self {
+    /// 绑定仓储；新任务默认 `max_attempts = 3`。
+    pub fn new(repo: PgTaskRepo) -> Self {
         Self {
             repo,
-            workflow_id,
             max_attempts: 3,
         }
     }
@@ -62,15 +61,33 @@ fn to_fanout_instances(f: &FanoutPlan) -> FanoutInstances {
 impl TaskStore for PgTaskStore {
     type Error = StorageError;
 
+    fn create_run<'a>(
+        &'a self,
+        workflow_id: &'a str,
+        entry: &'a str,
+        input: &'a Value,
+    ) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
+        Box::pin(
+            self.repo
+                .create_run(workflow_id, entry, input, self.max_attempts),
+        )
+    }
+
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
         Box::pin(self.repo.enqueue(task))
     }
 
     fn claim_many<'a>(
         &'a self,
+        workflow_id: &'a str,
+        worker_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(self.repo.claim_many(&self.workflow_id, "worker", limit))
+        Box::pin(self.repo.claim_many(workflow_id, worker_id, limit))
+    }
+
+    fn renew_claim<'a>(&'a self, task: &'a TaskRecord) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(self.repo.renew_claim(task))
     }
 
     /// 原子成功结算：写入输出并入队全部成功后继，后继使用任务最新的分组键。
@@ -84,13 +101,7 @@ impl TaskStore for PgTaskStore {
             let fanouts: Vec<FanoutInstances> =
                 successors.iter().map(to_fanout_instances).collect();
             self.repo
-                .succeed_and_enqueue(
-                    &self.workflow_id,
-                    task.task_id,
-                    output,
-                    &fanouts,
-                    self.max_attempts,
-                )
+                .succeed_and_enqueue(task, output, &fanouts, self.max_attempts)
                 .await
                 .map(|_| ())
         })
@@ -107,14 +118,7 @@ impl TaskStore for PgTaskStore {
             let fanouts: Vec<FanoutInstances> =
                 successors.iter().map(to_fanout_instances).collect();
             self.repo
-                .fail_and_enqueue(
-                    &self.workflow_id,
-                    task.task_id,
-                    task.run_id,
-                    message,
-                    &fanouts,
-                    self.max_attempts,
-                )
+                .fail_and_enqueue(task, message, &fanouts, self.max_attempts)
                 .await
         })
     }
@@ -124,6 +128,6 @@ impl TaskStore for PgTaskStore {
         &'a self,
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.repo.release_claim(&self.workflow_id, task.task_id))
+        Box::pin(self.repo.release_claim(task))
     }
 }

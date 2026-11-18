@@ -8,9 +8,10 @@ use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
-use crate::{FanoutInstances, StorageError, Task, TaskRecord, TaskStatus};
+use crate::task::FanoutInstances;
+use crate::{StorageError, Task, TaskRecord, TaskStatus};
 
-const LEASE_SECONDS: i64 = 300;
+use crate::task::store::LEASE_DURATION;
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";
 
 /// Columns suitable for application queries against the same task table.
@@ -42,6 +43,13 @@ pub async fn allocate_task_id(
     .bind(workflow_id)
     .fetch_one(&mut **tx)
     .await?)
+}
+
+fn claim_lost(task: &TaskRecord) -> StorageError {
+    StorageError::ClaimLost {
+        workflow_id: task.workflow_id.clone(),
+        task_id: task.task_id,
+    }
 }
 
 fn merge_join_input(acc: &mut Value, contribution: &Value) {
@@ -279,6 +287,40 @@ impl SqliteTaskRepo {
         Ok(row.into())
     }
 
+    /// Create an independent run, using its root task ID as the workflow-local run ID.
+    /// The root and its run ID become visible together when the transaction commits.
+    pub async fn create_run(
+        &self,
+        workflow_id: &str,
+        entry: &str,
+        input: &Value,
+        max_attempts: i32,
+    ) -> Result<TaskRecord, StorageError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut row = Self::insert_task(
+            &mut tx,
+            &Task {
+                workflow_id: workflow_id.to_owned(),
+                run_id: None,
+                name: entry.to_owned(),
+                instance_id: None,
+                max_attempts,
+                depends_on_ids: Vec::new(),
+                depends_on_names: Vec::new(),
+                input: input.clone(),
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE tasks SET run_id = task_id WHERE workflow_id = ?1 AND task_id = ?2")
+            .bind(workflow_id)
+            .bind(row.task_id)
+            .execute(&mut *tx)
+            .await?;
+        row.run_id = Some(row.task_id);
+        tx.commit().await?;
+        Ok(row)
+    }
+
     pub async fn enqueue(&self, task: &Task) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = Self::insert_task(&mut tx, task).await?;
@@ -317,12 +359,11 @@ impl SqliteTaskRepo {
         Ok(rows)
     }
 
-    /// Settle successfully and enqueue every successor in the same commit.
-    /// Successors inherit the settled task's current `run_id`, including business updates.
+    /// Settle only the current, unexpired claim and enqueue successors in the same commit.
+    /// Successors inherit the current database run_id, including business updates.
     pub async fn succeed_and_enqueue(
         &self,
-        workflow_id: &str,
-        task_id: i64,
+        task: &TaskRecord,
         output: &Value,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
@@ -334,22 +375,23 @@ impl SqliteTaskRepo {
             SET status = 'succeeded', output_json = ?3, error = NULL, lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
+              AND status = 'running' AND claimed_by = ?4 AND attempt = ?5
+              AND julianday(lease_until) > julianday('now')
             RETURNING {ROW_COLS}
             "#
         ))
-        .bind(workflow_id)
-        .bind(task_id)
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
         .bind(output)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| StorageError::MissingTask {
-            workflow_id: workflow_id.to_owned(),
-            task_id,
-        })?;
+        .ok_or_else(|| claim_lost(task))?;
         for fanout in fanouts {
             enqueue_fanout_in_tx(
                 &mut tx,
-                workflow_id,
+                &task.workflow_id,
                 settled.run_id,
                 &fanout.name,
                 &fanout.instances,
@@ -364,14 +406,10 @@ impl SqliteTaskRepo {
         Ok(settled.into())
     }
 
-    /// Atomically settle and enqueue failure successors, or fail pending dependents
-    /// in the same run when there are no successors.
-    #[allow(clippy::too_many_arguments)]
+    /// Fence the source claim before generating failure successors or cascading failures.
     pub async fn fail_and_enqueue(
         &self,
-        workflow_id: &str,
-        task_id: i64,
-        run_id: Option<i64>,
+        task: &TaskRecord,
         error: &str,
         fanouts: &[FanoutInstances],
         max_attempts: i32,
@@ -379,35 +417,35 @@ impl SqliteTaskRepo {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // Settle first so a failure self-edge creates a fresh pending task instead
         // of merging its retry input into the still-running source task.
-        let result = sqlx::query(
+        let settled = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
             UPDATE tasks
             SET status = ?3, error = ?4, lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(task_id)
+              AND status = 'running' AND claimed_by = ?5 AND attempt = ?6
+              AND julianday(lease_until) > julianday('now')
+            RETURNING {ROW_COLS}
+            "#
+        ))
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
         .bind(if fanouts.is_empty() {
             TaskStatus::Failed.as_str()
         } else {
             TaskStatus::Superseded.as_str()
         })
         .bind(error)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(StorageError::MissingTask {
-                workflow_id: workflow_id.to_owned(),
-                task_id,
-            });
-        }
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| claim_lost(task))?;
         for fanout in fanouts {
             enqueue_fanout_in_tx(
                 &mut tx,
-                workflow_id,
-                run_id,
+                &task.workflow_id,
+                settled.run_id,
                 &fanout.name,
                 &fanout.instances,
                 &[],
@@ -434,9 +472,9 @@ impl SqliteTaskRepo {
                   )
                 "#,
             )
-            .bind(workflow_id)
-            .bind(task_id)
-            .bind(format!("predecessor task {task_id} failed"))
+            .bind(&task.workflow_id)
+            .bind(task.task_id)
+            .bind(format!("predecessor task {} failed", task.task_id))
             .execute(&mut *tx)
             .await?;
         }
@@ -444,38 +482,77 @@ impl SqliteTaskRepo {
         Ok(())
     }
 
-    /// Release a lease so the next scan can immediately reclaim the task.
-    pub async fn release_claim(&self, workflow_id: &str, task_id: i64) -> Result<(), StorageError> {
-        sqlx::query(
+    /// Release only this still-valid claim so another worker may reclaim the task.
+    pub async fn release_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
+        let result = sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
+              AND status = 'running' AND claimed_by = ?3 AND attempt = ?4
+              AND julianday(lease_until) > julianday('now')
             "#,
         )
-        .bind(workflow_id)
-        .bind(task_id)
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(claim_lost(task));
+        }
         Ok(())
     }
 
-    /// Release all running leases in one workflow without resetting retry counts.
-    pub async fn release_claims(&self, workflow_id: &str) -> Result<u64, StorageError> {
+    /// Extend the current claim without consuming another attempt. Expired claims cannot renew.
+    pub async fn renew_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?5 || ' seconds'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE workflow_id = ?1 AND task_id = ?2
+              AND status = 'running' AND claimed_by = ?3 AND attempt = ?4
+              AND julianday(lease_until) > julianday('now')
+            "#,
+        )
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
+        .bind(LEASE_DURATION.as_secs() as i64)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(claim_lost(task));
+        }
+        Ok(())
+    }
+
+    /// Release leases belonging to a stopped worker in this workflow.
+    /// Stop and await that worker first; its old claim snapshots become invalid.
+    pub async fn release_claims(
+        &self,
+        workflow_id: &str,
+        worker_id: &str,
+    ) -> Result<u64, StorageError> {
         Ok(sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND status = 'running' AND lease_until IS NOT NULL
+            WHERE workflow_id = ?1 AND claimed_by = ?2
+              AND status = 'running' AND lease_until IS NOT NULL
             "#,
         )
         .bind(workflow_id)
+        .bind(worker_id)
         .execute(&self.pool)
         .await?
         .rows_affected())
     }
 
-    /// Claim a bounded batch, including expired running tasks. The write transaction
+    /// Claim a bounded batch in one workflow, including expired running tasks. The write transaction
     /// serializes competing workers; each successful claim consumes one attempt.
     pub async fn claim_many(
         &self,
@@ -483,6 +560,9 @@ impl SqliteTaskRepo {
         worker: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(&format!(
             r#"
@@ -517,7 +597,7 @@ impl SqliteTaskRepo {
         ))
         .bind(workflow_id)
         .bind(worker)
-        .bind(LEASE_SECONDS)
+        .bind(LEASE_DURATION.as_secs() as i64)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&mut *tx)
         .await?;
@@ -581,83 +661,57 @@ impl SqliteTaskRepo {
         Ok(row.map(TaskRecord::from))
     }
 
+    /// Complete the current claim without creating successors.
     pub async fn succeed(
         &self,
-        workflow_id: &str,
-        task_id: i64,
+        task: &TaskRecord,
         output: &Value,
     ) -> Result<TaskRecord, StorageError> {
-        let row = sqlx::query_as::<_, TaskRow>(&format!(
-            r#"
-            UPDATE tasks
-            SET status = 'succeeded', output_json = ?3, error = NULL, lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND task_id = ?2
-            RETURNING {ROW_COLS}
-            "#
-        ))
-        .bind(workflow_id)
-        .bind(task_id)
-        .bind(output)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(TaskRecord::from)
-            .ok_or_else(|| StorageError::MissingTask {
-                workflow_id: workflow_id.to_owned(),
-                task_id,
-            })
-    }
-
-    pub async fn fail(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-        error: &str,
-    ) -> Result<(), StorageError> {
-        self.set_terminal(workflow_id, task_id, TaskStatus::Failed.as_str(), error)
+        self.succeed_and_enqueue(task, output, &[], task.max_attempts)
             .await
     }
 
-    pub async fn supersede(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-        error: &str,
-    ) -> Result<(), StorageError> {
-        self.set_terminal(workflow_id, task_id, TaskStatus::Superseded.as_str(), error)
+    pub async fn fail(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
+        self.set_terminal(task, TaskStatus::Failed.as_str(), error)
             .await
     }
 
-    pub async fn skip(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-        reason: &str,
-    ) -> Result<(), StorageError> {
-        self.set_terminal(workflow_id, task_id, TaskStatus::Skipped.as_str(), reason)
+    pub async fn supersede(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
+        self.set_terminal(task, TaskStatus::Superseded.as_str(), error)
+            .await
+    }
+
+    pub async fn skip(&self, task: &TaskRecord, reason: &str) -> Result<(), StorageError> {
+        self.set_terminal(task, TaskStatus::Skipped.as_str(), reason)
             .await
     }
 
     async fn set_terminal(
         &self,
-        workflow_id: &str,
-        task_id: i64,
+        task: &TaskRecord,
         status: &str,
         error: &str,
     ) -> Result<(), StorageError> {
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE tasks SET status = ?3, error = ?4, lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
+              AND status = 'running' AND claimed_by = ?5 AND attempt = ?6
+              AND julianday(lease_until) > julianday('now')
             "#,
         )
-        .bind(workflow_id)
-        .bind(task_id)
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
         .bind(status)
         .bind(error)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(claim_lost(task));
+        }
         Ok(())
     }
 }
