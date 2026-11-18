@@ -21,8 +21,8 @@ const WINDOW_EXPIRED_ERR: &str = "task execution window expired; retry budget ex
 
 /// 任务行 SELECT / RETURNING 列（顺序与表结构一致）。`pub`：消费方的业务查询
 /// 与同一张表交互时复用同一列序。
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_id, name, status, \
-     claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_ids, name, status, \
+     claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
      input_json, output_json, error, created_at, updated_at";
 
 /// 任务就绪通知通道：任务变为可认领时（入队 / 扇出 / 释放租约）在**同一事务**内
@@ -163,17 +163,16 @@ async fn settle_in_tx(
     Ok(row.into())
 }
 
-/// 事务内入队后继：普通任务逐条创建，JOIN 按运行和节点名累积依赖与输入。
+/// 事务内入队后继：普通任务逐条创建，JOIN 按运行和节点名累积来源与输入。
 /// 调用方先获取运行锁，覆盖 JOIN 首次创建的窗口；本方法不自行开事务或提交。
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
     run_id: Option<i64>,
-    parent_task_id: Option<i64>,
+    parent_task_ids: &[i64],
     name: &str,
     inputs: &[Value],
-    depends_on_ids: &[i64],
     task_type: &str,
     depends_on_names: &[String],
     max_attempts: i32,
@@ -200,10 +199,10 @@ async fn enqueue_fanout_in_tx(
         };
 
         let row = if let Some(existing) = existing {
-            let mut dependencies = existing.depends_on_ids;
-            for &dependency in depends_on_ids {
-                if !dependencies.contains(&dependency) {
-                    dependencies.push(dependency);
+            let mut parents = existing.parent_task_ids;
+            for &parent in parent_task_ids {
+                if !parents.contains(&parent) {
+                    parents.push(parent);
                 }
             }
             let mut merged_input = existing.input_json;
@@ -211,14 +210,14 @@ async fn enqueue_fanout_in_tx(
             sqlx::query_as::<_, TaskRow>(&format!(
                 r#"
                 UPDATE tasks
-                SET depends_on_ids = $3, input_json = $4::jsonb, updated_at = NOW()
+                SET parent_task_ids = $3, input_json = $4::jsonb, updated_at = NOW()
                 WHERE workflow_id = $1 AND task_id = $2
                 RETURNING {ROW_COLS}
                 "#
             ))
             .bind(workflow_id)
             .bind(existing.task_id)
-            .bind(&dependencies)
+            .bind(&parents)
             .bind(merged_input)
             .fetch_one(&mut **tx)
             .await?
@@ -247,9 +246,9 @@ async fn enqueue_fanout_in_tx(
                 r#"
                 INSERT INTO tasks
                     (workflow_id, task_id, run_id, name, status,
-                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names,
-                     input_json, parent_task_id)
-                VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10::jsonb, $11)
+                     attempt, max_attempts, task_type, parent_task_ids, depends_on_names,
+                     input_json)
+                VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10::jsonb)
                 RETURNING {ROW_COLS}
                 "#
             ))
@@ -264,10 +263,9 @@ async fn enqueue_fanout_in_tx(
             })
             .bind(max_attempts)
             .bind(task_type)
-            .bind(depends_on_ids)
+            .bind(parent_task_ids)
             .bind(depends_on_names)
             .bind(input)
-            .bind(parent_task_id)
             .fetch_one(&mut **tx)
             .await?
         };
@@ -286,23 +284,12 @@ pub struct PgTaskRepo {
 /// 实现 [`crate::task::TaskStore::claim_many`] 的可执行契约，`wt` 为 `tasks` 别名。
 ///
 /// 由认领（[`PgTaskRepo::claim_many`]）与恢复扫描（[`PgTaskRepo::executable_workflow_ids`]）
-/// 共用：pending/running、无租约或租约已过期、直接依赖全部存在且成功、JOIN 静态前驱等齐。
-/// 遍历依赖 ID 而非已有任务行，确保缺失依赖也会阻塞。
+/// 共用：pending/running、无租约或租约已过期、JOIN 静态前驱等齐。
 /// 调用方需自行补 `wt.workflow_id = $1`（认领按工作流）或省略（恢复扫描跨工作流）。
 /// 预算耗尽行也须认领，以便调度器通过统一失败流程结算。
 const EXECUTABLE_WHERE: &str = r#"
     wt.status IN ('pending', 'running')
     AND (wt.lease_until IS NULL OR wt.lease_until <= NOW())
-    AND NOT EXISTS (
-        SELECT 1
-        FROM unnest(wt.depends_on_ids) AS dependency(task_id)
-        WHERE NOT EXISTS (
-            SELECT 1 FROM tasks dep
-            WHERE dep.workflow_id = wt.workflow_id
-              AND dep.task_id = dependency.task_id
-              AND dep.status = 'succeeded'
-        )
-    )
     AND (
         wt.task_type <> 'join'
         OR NOT EXISTS (
@@ -352,14 +339,14 @@ impl PgTaskRepo {
             INSERT INTO tasks
                 (
                     workflow_id, task_id, run_id, name, status,
-                    claimed_by, lease_until, attempt, max_attempts, depends_on_ids, depends_on_names,
-                    input_json, output_json, error, created_at, updated_at, parent_task_id, task_type
+                    claimed_by, lease_until, attempt, max_attempts, parent_task_ids, depends_on_names,
+                    input_json, output_json, error, created_at, updated_at, task_type
                 )
             VALUES
                 (
                     $1, $2, $3, $4, 'pending',
                     NULL, NULL, 0, $5, $6, $7,
-                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9, $10
+                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9
                 )
             RETURNING {ROW_COLS}
             "#
@@ -370,10 +357,9 @@ impl PgTaskRepo {
             .bind(task.run_id.unwrap_or(task_id))
             .bind(&task.name)
             .bind(task.max_attempts)
-            .bind(&task.depends_on_ids)
+            .bind(&task.parent_task_ids)
             .bind(&task.depends_on_names)
             .bind(&task.input)
-            .bind(task.parent_task_id)
             .bind(&task.task_type)
             .fetch_one(&mut **tx)
             .await?;
@@ -391,17 +377,16 @@ impl PgTaskRepo {
     }
 
     /// 在同一事务中逐条入队输入；仅 JOIN 按运行和节点名汇合。
-    /// JOIN 保留首次创建时的 parent_task_id，累积执行依赖和输入。
+    /// JOIN 累积 parent_task_ids 和输入。
     /// 运行级事务锁覆盖首次创建窗口，已有 JOIN 通过行锁合并。
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_fanout(
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
-        parent_task_id: Option<i64>,
+        parent_task_ids: &[i64],
         name: &str,
         inputs: &[Value],
-        depends_on_ids: &[i64],
         task_type: &str,
         depends_on_names: &[String],
         max_attempts: i32,
@@ -416,10 +401,9 @@ impl PgTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
-            parent_task_id,
+            parent_task_ids,
             name,
             inputs,
-            depends_on_ids,
             task_type,
             depends_on_names,
             max_attempts,
@@ -450,10 +434,9 @@ impl PgTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
-                Some(task.task_id),
+                &[task.task_id],
                 f.dst,
                 &f.inputs,
-                &[task.task_id],
                 f.task_type,
                 &f.depends_on_names,
                 max_attempts,
@@ -489,10 +472,9 @@ impl PgTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
-                Some(task.task_id),
+                &[task.task_id],
                 f.dst,
                 &f.inputs,
-                &[],
                 f.task_type,
                 &f.depends_on_names,
                 max_attempts,
@@ -509,8 +491,8 @@ impl PgTaskRepo {
                   AND dependent.workflow_id = source.workflow_id
                   AND dependent.run_id IS NOT DISTINCT FROM source.run_id
                   AND dependent.status = 'pending'
-                  AND (source.task_id = ANY(dependent.depends_on_ids)
-                       OR source.name = ANY(dependent.depends_on_names))
+                  AND dependent.task_type = 'join'
+                  AND source.name = ANY(dependent.depends_on_names)
                 "#,
             )
             .bind(&task.workflow_id)

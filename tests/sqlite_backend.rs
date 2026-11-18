@@ -113,7 +113,7 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
                 task.run_id.unwrap(),
                 task.name,
                 task.task_type,
-                task.parent_task_id,
+                task.parent_task_ids,
                 task.input.as_i64().unwrap(),
                 output.as_i64().unwrap(),
             ));
@@ -124,21 +124,21 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
     .expect("each event executes its entry and successor, alongside a manual submission");
     observed.sort();
     let mut expected = vec![
-        (first.run_id, "tick".into(), "event".into(), None, 10, 20),
+        (first.run_id, "tick".into(), "event".into(), vec![], 10, 20),
         (
             first.run_id,
             "process".into(),
             "normal".into(),
-            Some(first.task_id),
+            vec![first.task_id],
             20,
             21,
         ),
-        (second.run_id, "tick".into(), "event".into(), None, 20, 30),
+        (second.run_id, "tick".into(), "event".into(), vec![], 20, 30),
         (
             second.run_id,
             "process".into(),
             "normal".into(),
-            Some(second.task_id),
+            vec![second.task_id],
             30,
             31,
         ),
@@ -146,7 +146,7 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
             manual.run_id,
             "process".into(),
             "normal".into(),
-            None,
+            vec![],
             30,
             31,
         ),

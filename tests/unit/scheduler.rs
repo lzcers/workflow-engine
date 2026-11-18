@@ -205,8 +205,7 @@ async fn expired_full_slot_recovers_through_failure_edge_without_executing_again
     assert_eq!(tasks[0].attempt, 2);
     assert_eq!(tasks[1].status, TaskStatus::Succeeded);
     assert_eq!(tasks[1].output, Some(json!(42)));
-    assert_eq!(tasks[1].parent_task_id, Some(claim.task_id));
-    assert!(tasks[1].depends_on_ids.is_empty());
+    assert_eq!(tasks[1].parent_task_ids, [claim.task_id]);
     pool.close().await;
 }
 

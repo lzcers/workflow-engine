@@ -119,7 +119,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .await
         .unwrap();
     assert_eq!(root.run_id, Some(root.task_id));
-    assert_eq!(root.parent_task_id, None);
+    assert!(root.parent_task_ids.is_empty());
     assert_eq!(other_root.run_id, Some(other_root.task_id));
     assert_ne!(root.run_id, other_root.run_id);
     let store = SqliteTaskStore::new(repo.clone()).with_max_attempts(5);
@@ -171,17 +171,15 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     workers.sort_unstable_by_key(|task| task.task_id);
     assert_eq!(workers.len(), 2);
     for (worker, input, output) in [(workers[0], 1, 2), (workers[1], 11, 12)] {
-        assert_eq!(worker.parent_task_id, Some(root.task_id));
         assert_eq!(worker.input, json!(input));
         assert_eq!(worker.output, Some(json!(output)));
-        assert_eq!(worker.depends_on_ids, [root.task_id]);
+        assert_eq!(worker.parent_task_ids, [root.task_id]);
     }
 
     let summary = tasks.iter().find(|task| task.name == "summary").unwrap();
     assert_eq!(summary.input, json!(1));
     assert_eq!(summary.output, Some(json!(2)));
-    assert_eq!(summary.depends_on_ids, [root.task_id]);
-    assert_eq!(summary.parent_task_id, Some(root.task_id));
+    assert_eq!(summary.parent_task_ids, [root.task_id]);
 
     assert_eq!(
         tasks.iter().filter(|task| task.name == "collect").count(),
@@ -192,12 +190,11 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     let mut predecessors = join.depends_on_names.clone();
     predecessors.sort();
     assert_eq!(predecessors, ["summary", "worker"]);
-    let mut dependency_ids = join.depends_on_ids.clone();
-    dependency_ids.sort_unstable();
+    let mut parent_ids = join.parent_task_ids.clone();
+    parent_ids.sort_unstable();
     let mut expected_ids = vec![workers[0].task_id, workers[1].task_id, summary.task_id];
     expected_ids.sort_unstable();
-    assert_eq!(dependency_ids, expected_ids);
-    assert!(expected_ids.contains(&join.parent_task_id.unwrap()));
+    assert_eq!(parent_ids, expected_ids);
     let mut collected: Collected = serde_json::from_value(join.input.clone()).unwrap();
     collected.worker.sort_unstable();
     assert_eq!(collected.worker, [2, 12]);
@@ -205,8 +202,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(join.output.as_ref(), Some(&join.input));
 
     let total = tasks.iter().find(|task| task.name == "total").unwrap();
-    assert_eq!(total.depends_on_ids, [join.task_id]);
-    assert_eq!(total.parent_task_id, Some(join.task_id));
+    assert_eq!(total.parent_task_ids, [join.task_id]);
     assert_eq!(total.input, join.input);
     assert_eq!(total.output, Some(json!(16)));
 
@@ -217,7 +213,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(other_tasks.len(), 6);
     for task in &other_tasks {
         assert!(
-            task.depends_on_ids
+            task.parent_task_ids
                 .iter()
                 .all(|id| { other_tasks.iter().any(|other| other.task_id == *id) })
         );
@@ -293,11 +289,11 @@ async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
     assert_eq!(tasks.iter().filter(|task| task.name == "b").count(), 4);
     assert_eq!(tasks.iter().filter(|task| task.name == "c").count(), 4);
     for (parent, parent_input) in [(parents[0], 1), (parents[1], 11)] {
-        assert_eq!(parent.parent_task_id, Some(root.task_id));
+        assert_eq!(parent.parent_task_ids, [root.task_id]);
         assert_eq!(parent.input, json!(parent_input));
         let mut children: Vec<_> = tasks
             .iter()
-            .filter(|task| task.name == "b" && task.parent_task_id == Some(parent.task_id))
+            .filter(|task| task.name == "b" && task.parent_task_ids == [parent.task_id])
             .collect();
         children.sort_unstable_by_key(|task| task.task_id);
         assert_eq!(children.len(), 2, "each A must produce its own two B tasks");
@@ -305,15 +301,15 @@ async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
             (children[0], parent_input + 1),
             (children[1], parent_input + 101),
         ] {
-            assert_eq!(child.depends_on_ids, [parent.task_id]);
+            assert_eq!(child.parent_task_ids, [parent.task_id]);
             assert_eq!(child.input, json!(input));
             assert_eq!(child.output, Some(json!(input + 1)));
             let successors: Vec<_> = tasks
                 .iter()
-                .filter(|task| task.name == "c" && task.parent_task_id == Some(child.task_id))
+                .filter(|task| task.name == "c" && task.parent_task_ids == [child.task_id])
                 .collect();
             assert_eq!(successors.len(), 1);
-            assert_eq!(successors[0].depends_on_ids, [child.task_id]);
+            assert_eq!(successors[0].parent_task_ids, [child.task_id]);
             assert_eq!(successors[0].input, json!(input + 1));
             assert_eq!(successors[0].output, Some(json!(input + 2)));
         }
@@ -360,10 +356,9 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         task_type: "normal".into(),
         workflow_id: "scheduler-wake".into(),
         run_id: None,
-        parent_task_id: None,
+        parent_task_ids: vec![],
         name: "slow".into(),
         max_attempts: 3,
-        depends_on_ids: vec![],
         depends_on_names: vec![],
         input: json!(0),
     };

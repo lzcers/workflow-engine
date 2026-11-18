@@ -59,8 +59,9 @@ pub struct TaskRecord {
     /// 分组键（代际分组）：同组任务共享 JOIN 汇合与等齐前驱的判定域
     /// 业务侧可承载血缘语义。
     pub run_id: Option<i64>,
-    /// 首次创建该任务的父任务 ID；入口为 None。JOIN 保留首个父任务，全部执行依赖见 depends_on_ids。
-    pub parent_task_id: Option<i64>,
+    /// 来源任务 ID 集合；入口为空，普通后继记录源任务，JOIN 累积并去重所有贡献者。
+    /// 失败后继同样记录来源；此字段不要求来源任务成功。
+    pub parent_task_ids: Vec<i64>,
     pub name: String,
     pub status: TaskStatus,
     /// 最近一次认领的执行器身份；Scheduler 每次启动生成新的 UUID。
@@ -73,8 +74,6 @@ pub struct TaskRecord {
     pub max_attempts: i32,
     /// 节点声明的任务类型（`normal`/`join`/`event`）；仅 JOIN 额外检查静态前驱。
     pub task_type: String,
-    /// 血缘/溯源链路：父任务 id 集合（空集 = 无依赖）。
-    pub depends_on_ids: Vec<i64>,
     /// 静态前驱节点名全集（通用血缘；仅 `task_type = 'join'` 用作等齐前驱的认领闸门）。
     pub depends_on_names: Vec<String>,
     /// 任务输入因 name 而异，暂保留为通用 JSON。
@@ -92,29 +91,27 @@ pub struct Task {
     pub workflow_id: String,
     /// Some(id) 加入指定运行；None 在入队时以新任务的 task_id 创建独立运行。
     pub run_id: Option<i64>,
-    /// 父任务 ID；独立入口为 None，不替代执行依赖 depends_on_ids。
-    pub parent_task_id: Option<i64>,
+    /// 来源任务 ID 集合；独立入口为空，不作为认领时的成功条件。
+    pub parent_task_ids: Vec<i64>,
     pub name: String,
     /// 节点声明的任务类型（`normal`/`join`/`event`），入队时原样保存。
     pub task_type: String,
     pub max_attempts: i32,
-    pub depends_on_ids: Vec<i64>,
     /// JOIN 静态前驱节点名全集（普通节点默认空集）。
     pub depends_on_names: Vec<String>,
     pub input: Value,
 }
 
 impl Task {
-    /// 创建普通类型、无依赖的独立运行入口；入队前可设置节点类型、运行、父任务、依赖和尝试预算。
+    /// 创建普通类型的独立运行入口；入队前可设置节点类型、运行、来源、静态前驱和尝试预算。
     pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             workflow_id: workflow_id.into(),
             run_id: None,
-            parent_task_id: None,
+            parent_task_ids: Vec::new(),
             name: name.into(),
             task_type: "normal".to_owned(),
             max_attempts: 3,
-            depends_on_ids: Vec::new(),
             depends_on_names: Vec::new(),
             input,
         }

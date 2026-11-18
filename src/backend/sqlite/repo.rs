@@ -15,8 +15,8 @@ use crate::{Task, TaskRecord, TaskStatus};
 use crate::task::store::{LEASE_DURATION, merge_join_input};
 
 /// Columns suitable for application queries against the same task table.
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_id, name, status, \
-    claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_ids, name, status, \
+    claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
     input_json, output_json, error, created_at, updated_at";
 
 /// Workflow task repository. Clones share the same connection pool.
@@ -52,20 +52,11 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
     }
 }
 
-/// Implements the dependency/lease gate in [`crate::task::TaskStore::claim_many`]
-/// for both claim and recovery. Iterating dependency IDs also blocks missing tasks.
+/// Implements the JOIN predecessor/lease gate in [`crate::task::TaskStore::claim_many`]
+/// for both claim and recovery. Parent IDs record provenance, not execution dependencies.
 const EXECUTABLE_WHERE: &str = r#"
     wt.status IN ('pending', 'running')
     AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))
-    AND NOT EXISTS (
-        SELECT 1 FROM json_each(wt.depends_on_ids) AS dependency
-        WHERE NOT EXISTS (
-            SELECT 1 FROM tasks dep
-            WHERE dep.workflow_id = wt.workflow_id
-              AND dep.task_id = dependency.value
-              AND dep.status = 'succeeded'
-        )
-    )
     AND (
         wt.task_type <> 'join'
         OR NOT EXISTS (
@@ -96,10 +87,9 @@ async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
-    parent_task_id: Option<i64>,
+    parent_task_ids: &[i64],
     name: &str,
     inputs: &[Value],
-    depends_on_ids: &[i64],
     task_type: &str,
     depends_on_names: &[String],
     max_attempts: i32,
@@ -125,10 +115,10 @@ async fn enqueue_fanout_in_tx(
         };
 
         let row = if let Some(existing) = existing {
-            let mut dependencies = existing.depends_on_ids;
-            for &dependency in depends_on_ids {
-                if !dependencies.contains(&dependency) {
-                    dependencies.push(dependency);
+            let mut parents = existing.parent_task_ids;
+            for &parent_id in parent_task_ids {
+                if !parents.contains(&parent_id) {
+                    parents.push(parent_id);
                 }
             }
             let mut merged_input = existing.input_json;
@@ -136,7 +126,7 @@ async fn enqueue_fanout_in_tx(
             sqlx::query_as::<_, TaskRow>(&format!(
                 r#"
                 UPDATE tasks
-                SET depends_on_ids = ?3, input_json = ?4,
+                SET parent_task_ids = ?3, input_json = ?4,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE workflow_id = ?1 AND task_id = ?2
                 RETURNING {ROW_COLS}
@@ -144,7 +134,7 @@ async fn enqueue_fanout_in_tx(
             ))
             .bind(workflow_id)
             .bind(existing.task_id)
-            .bind(Json(&dependencies))
+            .bind(Json(&parents))
             .bind(merged_input)
             .fetch_one(&mut **tx)
             .await?
@@ -173,9 +163,8 @@ async fn enqueue_fanout_in_tx(
                 r#"
                 INSERT INTO tasks
                     (workflow_id, task_id, run_id, name, status,
-                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
-                     parent_task_id)
-                VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)
+                     attempt, max_attempts, task_type, parent_task_ids, depends_on_names, input_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10)
                 RETURNING {ROW_COLS}
                 "#
             ))
@@ -190,10 +179,9 @@ async fn enqueue_fanout_in_tx(
             })
             .bind(max_attempts)
             .bind(task_type)
-            .bind(Json(depends_on_ids))
+            .bind(Json(parent_task_ids))
             .bind(Json(depends_on_names))
             .bind(input)
-            .bind(parent_task_id)
             .fetch_one(&mut **tx)
             .await?
         };
@@ -219,9 +207,8 @@ impl SqliteTaskRepo {
             r#"
             INSERT INTO tasks
                 (workflow_id, task_id, run_id, name, status,
-                 attempt, max_attempts, depends_on_ids, depends_on_names, input_json,
-                 parent_task_id, task_type)
-            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10)
+                 attempt, max_attempts, parent_task_ids, depends_on_names, input_json, task_type)
+            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)
             RETURNING {ROW_COLS}
             "#
         ))
@@ -230,10 +217,9 @@ impl SqliteTaskRepo {
         .bind(task.run_id.unwrap_or(task_id))
         .bind(&task.name)
         .bind(task.max_attempts)
-        .bind(Json(&task.depends_on_ids))
+        .bind(Json(&task.parent_task_ids))
         .bind(Json(&task.depends_on_names))
         .bind(&task.input)
-        .bind(task.parent_task_id)
         .bind(&task.task_type)
         .fetch_one(&mut **tx)
         .await?;
@@ -249,16 +235,15 @@ impl SqliteTaskRepo {
     }
 
     /// Enqueue inputs atomically. Ordinary inputs each create a task; JOIN inputs
-    /// merge dependencies and input across parents, preserving the initial parent.
+    /// merge parent IDs and input across all contributors.
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_fanout(
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
-        parent_task_id: Option<i64>,
+        parent_task_ids: &[i64],
         name: &str,
         inputs: &[Value],
-        depends_on_ids: &[i64],
         task_type: &str,
         depends_on_names: &[String],
         max_attempts: i32,
@@ -268,10 +253,9 @@ impl SqliteTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
-            parent_task_id,
+            parent_task_ids,
             name,
             inputs,
-            depends_on_ids,
             task_type,
             depends_on_names,
             max_attempts,
@@ -316,10 +300,9 @@ impl SqliteTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
-                Some(task.task_id),
+                &[task.task_id],
                 fanout.dst,
                 &fanout.inputs,
-                &[settled.task_id],
                 fanout.task_type,
                 &fanout.depends_on_names,
                 max_attempts,
@@ -370,10 +353,9 @@ impl SqliteTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
-                Some(task.task_id),
+                &[task.task_id],
                 fanout.dst,
                 &fanout.inputs,
-                &[],
                 fanout.task_type,
                 &fanout.depends_on_names,
                 max_attempts,
@@ -391,9 +373,8 @@ impl SqliteTaskRepo {
                       SELECT 1 FROM tasks source
                       WHERE source.workflow_id = tasks.workflow_id AND source.task_id = ?2
                         AND source.run_id IS tasks.run_id
-                        AND (source.task_id IN (SELECT value FROM json_each(tasks.depends_on_ids))
-                             OR (tasks.task_type = 'join'
-                                 AND source.name IN (SELECT value FROM json_each(tasks.depends_on_names))))
+                        AND tasks.task_type = 'join'
+                        AND source.name IN (SELECT value FROM json_each(tasks.depends_on_names))
                   )
                 "#,
             )

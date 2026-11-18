@@ -60,7 +60,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert_eq!(other.task_id, 1, "task IDs are scoped to each workflow");
     assert_eq!(other.run_id, Some(other.task_id));
     assert_eq!(first.name, "root");
-    assert_eq!(first.parent_task_id, None);
+    assert!(first.parent_task_ids.is_empty());
     assert_eq!(first.input, input.input);
     assert_eq!(first.status, TaskStatus::Pending);
     assert_eq!(first.task_type, "normal");
@@ -107,24 +107,24 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
 }
 
 #[tokio::test]
-async fn claims_require_all_dependencies_including_missing_ids() {
+async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
     let (_, repo) = memory_repo().await;
     let root = repo.enqueue(&new_task("deps", "root")).await.unwrap();
     let mut child = new_task("deps", "child");
     child.run_id = root.run_id;
-    child.parent_task_id = Some(root.task_id);
     child.max_attempts = 5;
-    child.depends_on_ids = vec![root.task_id];
+    child.task_type = "join".into();
+    child.parent_task_ids = vec![root.task_id];
     child.depends_on_names = vec!["root".into()];
     let child = repo.enqueue(&child).await.unwrap();
     assert_eq!(child.run_id, root.run_id);
-    assert_eq!(child.parent_task_id, Some(root.task_id));
     assert_eq!(child.max_attempts, 5);
-    assert_eq!(child.depends_on_ids, [root.task_id]);
+    assert_eq!(child.parent_task_ids, [root.task_id]);
     assert_eq!(child.depends_on_names, ["root"]);
     let mut missing = new_task("deps", "missing_dependency");
     missing.run_id = root.run_id;
-    missing.depends_on_ids = vec![999];
+    missing.task_type = "join".into();
+    missing.depends_on_names = vec!["absent".into()];
     let missing = repo.enqueue(&missing).await.unwrap();
 
     assert!(
@@ -161,7 +161,9 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
     let task = repo.enqueue(&new_task("retry", "root")).await.unwrap();
     let mut child = new_task("retry", "child");
     child.run_id = task.run_id;
-    child.depends_on_ids = vec![task.task_id];
+    child.task_type = "join".into();
+    child.depends_on_names = vec!["root".into()];
+    child.parent_task_ids = vec![task.task_id];
     let child = repo.enqueue(&child).await.unwrap();
     let first = repo.claim_many("retry", "first", 1).await.unwrap();
     assert_eq!(first[0].attempt, 1);
@@ -273,10 +275,9 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         .enqueue_fanout(
             "join",
             Some(1),
-            None,
+            &[],
             "image",
             &[json!("a"), json!("b")],
-            &[],
             "normal",
             &[],
             3,
@@ -327,7 +328,6 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         .into_iter()
         .find(|task| task.name == "collect")
         .unwrap();
-    assert_eq!(join.parent_task_id, Some(claimed[0].task_id));
     assert!(
         repo.claim_many("join", "worker", 10)
             .await
@@ -343,10 +343,9 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         .await
         .unwrap();
     let merged = get(&repo, &join).await;
-    assert_eq!(merged.parent_task_id, Some(claimed[0].task_id));
     assert_eq!(merged.input, json!({"image": ["a", "b"]}));
     assert_eq!(
-        merged.depends_on_ids,
+        merged.parent_task_ids,
         [claimed[0].task_id, claimed[1].task_id]
     );
     assert!(
@@ -382,7 +381,7 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         json!({"image": ["a", "b"], "text": "text"})
     );
     assert_eq!(
-        claimed[0].depends_on_ids,
+        claimed[0].parent_task_ids,
         [images[0].task_id, images[1].task_id, text.task_id]
     );
     assert_eq!(
@@ -405,10 +404,9 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             .enqueue_fanout(
                 "fanin",
                 run_id,
-                Some(11),
+                &[11],
                 "collect",
                 &[json!({"image": "first"})],
-                &[11],
                 "join",
                 &["image".into()],
                 3,
@@ -420,10 +418,9 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             .enqueue_fanout(
                 "fanin",
                 run_id,
-                Some(12),
+                &[11, 12],
                 "collect",
                 &[json!({"image": "second"}), json!({"image": ["third"]})],
-                &[11, 12],
                 "join",
                 &["image".into()],
                 3,
@@ -433,9 +430,8 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             .pop()
             .unwrap();
         assert_eq!(merged.task_id, first.task_id);
-        assert_eq!(merged.parent_task_id, Some(11));
         assert_eq!(merged.run_id, run_id);
-        assert_eq!(merged.depends_on_ids, [11, 12]);
+        assert_eq!(merged.parent_task_ids, [11, 12]);
         assert_eq!(merged.input, json!({"image": ["first", "second", "third"]}));
         ids.push(merged.task_id);
     }
@@ -446,10 +442,9 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .enqueue_fanout(
             "fanin",
             None,
-            Some(1),
+            &[1],
             "normal",
             &[json!({"first": true})],
-            &[1],
             "normal",
             &[],
             3,
@@ -461,10 +456,9 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .enqueue_fanout(
             "fanin",
             None,
-            Some(2),
+            &[2, 1],
             "normal",
             &[json!({"second": true})],
-            &[2, 1],
             "normal",
             &[],
             3,
@@ -473,12 +467,10 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .unwrap()
         .remove(0);
     assert_ne!(second.task_id, first.task_id);
-    assert_eq!(first.parent_task_id, Some(1));
-    assert_eq!(second.parent_task_id, Some(2));
     assert_eq!(first.input, json!({"first": true}));
     assert_eq!(second.input, json!({"second": true}));
-    assert_eq!(first.depends_on_ids, [1]);
-    assert_eq!(second.depends_on_ids, [2, 1]);
+    assert_eq!(first.parent_task_ids, [1]);
+    assert_eq!(second.parent_task_ids, [2, 1]);
 }
 
 #[tokio::test]
@@ -543,8 +535,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     );
     for child in children {
         assert_eq!(child.run_id, Some(9));
-        assert_eq!(child.parent_task_id, Some(task.task_id));
-        assert_eq!(child.depends_on_ids, [task.task_id]);
+        assert_eq!(child.parent_task_ids, [task.task_id]);
         assert_eq!(child.max_attempts, 7);
     }
 }
@@ -607,9 +598,8 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
         .unwrap()
         .remove(0);
     assert_eq!(recovery.name, "recovery");
-    assert_eq!(recovery.parent_task_id, Some(task.task_id));
     assert_eq!(recovery.run_id, Some(4));
-    assert!(recovery.depends_on_ids.is_empty());
+    assert_eq!(recovery.parent_task_ids, [task.task_id]);
     store.settle_failure(&recovery, message, &[]).await.unwrap();
     assert_eq!(get(&repo, &recovery).await.status, TaskStatus::Failed);
 }
@@ -636,9 +626,8 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
     let successors = store.claim_many("same_name", "worker", 1).await.unwrap();
     assert_eq!(successors.len(), 1);
     assert_ne!(successors[0].task_id, source.task_id);
-    assert_eq!(successors[0].parent_task_id, Some(source.task_id));
     assert_eq!(successors[0].input, json!({"retry": true}));
-    assert!(successors[0].depends_on_ids.is_empty());
+    assert_eq!(successors[0].parent_task_ids, [source.task_id]);
 }
 
 #[tokio::test]
@@ -682,16 +671,15 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     let root = repo.enqueue(&new_task("cascade", "root")).await.unwrap();
     let mut child = new_task("cascade", "child");
     child.run_id = root.run_id;
-    child.depends_on_ids = vec![root.task_id];
+    child.parent_task_ids = vec![root.task_id];
     let child = repo.enqueue(&child).await.unwrap();
     let join = repo
         .enqueue_fanout(
             "cascade",
             root.run_id,
-            None,
+            &[],
             "join",
             &[json!({})],
-            &[],
             "join",
             &["root".into()],
             3,
@@ -703,10 +691,9 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .enqueue_fanout(
             "cascade",
             Some(0),
-            None,
+            &[],
             "join",
             &[json!({})],
-            &[],
             "join",
             &["root".into()],
             3,
@@ -727,7 +714,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     sqlx::query(
         r#"
         CREATE TRIGGER reject_cascade BEFORE UPDATE OF status ON tasks
-        WHEN NEW.workflow_id = 'cascade' AND OLD.name = 'child' AND NEW.status = 'failed'
+        WHEN NEW.workflow_id = 'cascade' AND OLD.name = 'join' AND NEW.status = 'failed'
         BEGIN
             SELECT RAISE(ABORT, 'injected cascade failure');
         END
@@ -750,7 +737,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
 
     store.settle_failure(&root, message, &[]).await.unwrap();
     assert_eq!(get(&repo, &root).await.status, TaskStatus::Failed);
-    assert_eq!(get(&repo, &child).await.status, TaskStatus::Failed);
+    assert_eq!(get(&repo, &child).await.status, TaskStatus::Pending);
     assert_eq!(get(&repo, &join).await.status, TaskStatus::Failed);
     assert_eq!(
         get(&repo, &other_run).await.status,
@@ -763,10 +750,9 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .enqueue_fanout(
             "cascade",
             root.run_id,
-            None,
+            &[],
             "late_join",
             &[json!({})],
-            &[],
             "join",
             &["root".into()],
             3,
@@ -775,16 +761,13 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .unwrap()
         .remove(0);
     assert_eq!(late.status, TaskStatus::Failed);
-    assert!(
-        repo.claim_many("cascade", "worker", 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let claims = repo.claim_many("cascade", "worker", 10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].task_id, child.task_id);
 }
 
 #[tokio::test]
-async fn cascade_matches_runs_for_named_and_direct_dependencies() {
+async fn cascade_matches_runs_only_for_join_predecessors() {
     let runs = [Some(1), Some(2), Some(3), Some(0)];
     for source_run in runs {
         let (_, repo) = memory_repo().await;
@@ -796,16 +779,15 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
         for run_id in runs {
             let mut child = new_task("cascade_runs", "child");
             child.run_id = run_id;
-            child.depends_on_ids = vec![root.task_id];
+            child.parent_task_ids = vec![root.task_id];
             targets.push(repo.enqueue(&child).await.unwrap());
             targets.push(
                 repo.enqueue_fanout(
                     "cascade_runs",
                     run_id,
-                    None,
+                    &[],
                     "join",
                     &[json!({})],
-                    &[],
                     "join",
                     &["root".into()],
                     3,
@@ -818,7 +800,7 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
 
         let mut other_workflow = new_task("other", "child");
         other_workflow.run_id = source_run;
-        other_workflow.depends_on_ids = vec![root.task_id];
+        other_workflow.parent_task_ids = vec![root.task_id];
         let other_workflow = repo.enqueue(&other_workflow).await.unwrap();
 
         let mut completed = new_task("cascade_runs", "completed");
@@ -842,7 +824,9 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
             .unwrap();
 
         for target in targets {
-            let expected = if target.run_id == source_run {
+            let expected = if target.task_type != "join" {
+                TaskStatus::Running
+            } else if target.run_id == source_run {
                 TaskStatus::Failed
             } else {
                 TaskStatus::Pending
@@ -871,7 +855,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
     let root = repo.enqueue(&new_task("fencing", "root")).await.unwrap();
     let mut child = new_task("fencing", "child");
     child.run_id = root.run_id;
-    child.depends_on_ids = vec![root.task_id];
+    child.parent_task_ids = vec![root.task_id];
     let child = repo.enqueue(&child).await.unwrap();
     let first = repo
         .claim_many("fencing", "worker-a", 1)
@@ -1086,10 +1070,9 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
                 repo.enqueue_fanout(
                     "concurrent_fanin",
                     None,
-                    Some(n),
+                    &[n],
                     "collect",
                     &[json!({"worker": n})],
-                    &[n],
                     "join",
                     &["worker".into()],
                     3,
@@ -1109,7 +1092,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     assert_eq!(merged.len(), 1);
     assert_eq!(
         merged[0]
-            .depends_on_ids
+            .parent_task_ids
             .iter()
             .copied()
             .collect::<HashSet<_>>(),

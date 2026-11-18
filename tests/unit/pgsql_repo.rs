@@ -48,9 +48,8 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
 
     let child = Task {
         run_id: first.run_id,
-        parent_task_id: Some(first.task_id),
         max_attempts: 7,
-        depends_on_ids: vec![first.task_id],
+        parent_task_ids: vec![first.task_id],
         depends_on_names: vec![first.name.clone()],
         ..Task::new(workflow_id, "child", json!({"input": 2}))
     };
@@ -63,9 +62,8 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     assert_eq!(stored.run_id, first.run_id);
     assert_eq!(stored.name, child.name);
     assert_eq!(stored.task_type, "normal");
-    assert_eq!(stored.parent_task_id, child.parent_task_id);
     assert_eq!(stored.max_attempts, child.max_attempts);
-    assert_eq!(stored.depends_on_ids, child.depends_on_ids);
+    assert_eq!(stored.parent_task_ids, child.parent_task_ids);
     assert_eq!(stored.depends_on_names, child.depends_on_names);
     assert_eq!(stored.input, child.input);
     assert_eq!(stored.status, TaskStatus::Pending);
@@ -73,7 +71,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
 }
 
 /// 原子成功结算：succeed + 全部后继（单条及批量输入）在同一事务内落库，
-/// 后继继承源任务 run_id、depends_on_ids 指向源任务。
+/// 后继继承源任务 run_id、parent_task_ids 记录源任务。
 #[tokio::test]
 async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     let Some(database) = connect_test().await else {
@@ -86,9 +84,8 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
         workflow_id: workflow_id.to_string(),
         run_id: None,
         name: "image_prompt".to_string(),
-        parent_task_id: None,
         max_attempts: 3,
-        depends_on_ids: vec![],
+        parent_task_ids: vec![],
         depends_on_names: vec![],
         input: json!({"prompts": ["a", "b"]}),
     })
@@ -129,20 +126,18 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     assert!(settled.lease_until.is_none());
     reject_stale_writes(&repo, &source).await;
 
-    // 三个后继全部落库，依赖均指向源任务。
+    // 三个后继全部落库，来源均指向源任务。
     let rows = repo.list_all(workflow_id).await.unwrap();
     assert_eq!(rows.len(), 4);
     assert_eq!(source.run_id, Some(source.task_id));
     assert!(rows.iter().all(|task| task.run_id == source.run_id));
     let finalize: Vec<_> = rows.iter().filter(|t| t.name == "finalize_node").collect();
     assert_eq!(finalize.len(), 1);
-    assert_eq!(finalize[0].parent_task_id, Some(source.task_id));
-    assert_eq!(finalize[0].depends_on_ids, vec![source.task_id]);
+    assert_eq!(finalize[0].parent_task_ids, vec![source.task_id]);
     let generates: Vec<_> = rows.iter().filter(|t| t.name == "image_generate").collect();
     assert_eq!(generates.len(), 2);
     for g in &generates {
-        assert_eq!(g.parent_task_id, Some(source.task_id));
-        assert_eq!(g.depends_on_ids, vec![source.task_id]);
+        assert_eq!(g.parent_task_ids, vec![source.task_id]);
     }
 }
 
@@ -155,19 +150,18 @@ async fn normal_fanout_creates_each_input_independently() {
     let repo = PgTaskRepo::new(database.pool().clone());
     let workflow_id = "normal-fanout";
     for run_id in [None, Some(42)] {
-        for parent_task_id in [None, Some(7), Some(8)] {
+        for parent_task_ids in [vec![], vec![7], vec![8]] {
             let inputs = [
-                json!({"parent": parent_task_id, "item": "a"}),
-                json!({"parent": parent_task_id, "item": "b"}),
+                json!({"parents": parent_task_ids, "item": "a"}),
+                json!({"parents": parent_task_ids, "item": "b"}),
             ];
             let first = repo
                 .enqueue_fanout(
                     workflow_id,
                     run_id,
-                    parent_task_id,
+                    &parent_task_ids,
                     "image_generate",
                     &inputs,
-                    &[],
                     "normal",
                     &[],
                     3,
@@ -177,17 +171,16 @@ async fn normal_fanout_creates_each_input_independently() {
             assert_eq!(first.len(), 2);
             for (row, input) in first.iter().zip(&inputs) {
                 assert_eq!(row.run_id, run_id);
-                assert_eq!(row.parent_task_id, parent_task_id);
+                assert_eq!(row.parent_task_ids, parent_task_ids);
                 assert_eq!(&row.input, input);
             }
             let repeated = repo
                 .enqueue_fanout(
                     workflow_id,
                     run_id,
-                    parent_task_id,
+                    &parent_task_ids,
                     "image_generate",
                     &inputs,
-                    &[],
                     "normal",
                     &[],
                     3,
@@ -248,9 +241,8 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
         "different parents must contribute to the same JOIN"
     );
     let join = joins[0];
-    assert_eq!(join.parent_task_id, Some(sources[0].task_id));
     assert_eq!(
-        join.depends_on_ids,
+        join.parent_task_ids,
         [sources[0].task_id, sources[1].task_id]
     );
     assert_eq!(
@@ -269,7 +261,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
 }
 
 /// 原子失败结算：有后继 → `superseded` 且后继入队（不依赖源任务）；
-/// 无后继 → `failed` 并级联已有依赖，级联失败时源任务终态一起回滚。
+/// 无后继 → `failed` 并级联等待该前驱的 JOIN，级联失败时源任务终态一起回滚。
 #[tokio::test]
 async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     let Some(database) = connect_test().await else {
@@ -277,15 +269,14 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     };
     let repo = PgTaskRepo::new(database.pool().clone());
     let workflow_id = "fail_and_enqueue_atomic";
-    // 有后继：superseded + 后继入队（depends_on_ids 为空）。
+    // 有后继：superseded + 后继入队，并保留源任务。
     repo.enqueue(&Task {
         task_type: "normal".into(),
         workflow_id: workflow_id.to_string(),
         run_id: None,
         name: "commit_scene".to_string(),
-        parent_task_id: None,
         max_attempts: 3,
-        depends_on_ids: vec![],
+        parent_task_ids: vec![],
         depends_on_names: vec![],
         input: json!({"proposal": {}}),
     })
@@ -323,8 +314,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         .into_iter()
         .find(|t| t.name == "scene_proposal" && t.task_id != retried.task_id)
         .unwrap();
-    assert!(successor.depends_on_ids.is_empty());
-    assert_eq!(successor.parent_task_id, Some(retried.task_id));
+    assert_eq!(successor.parent_task_ids, [retried.task_id]);
 
     // 无后继：failed。
     let failed = repo
@@ -333,9 +323,8 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "audio_generate".to_string(),
-            parent_task_id: None,
             max_attempts: 3,
-            depends_on_ids: vec![],
+            parent_task_ids: vec![],
             depends_on_names: vec![],
             input: json!({}),
         })
@@ -349,29 +338,24 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         .find(|task| task.task_id == failed.task_id)
         .unwrap();
     let mut dependents = Vec::new();
-    for (name, run_id, by_name) in [
+    for (name, run_id, is_join) in [
         ("audio_dependent", failed.run_id, false),
         ("audio_join", failed.run_id, true),
         ("other_run", retried.run_id, true),
     ] {
         let dependent = repo
             .enqueue(&Task {
-                task_type: "normal".into(),
+                task_type: if is_join { "join" } else { "normal" }.into(),
                 workflow_id: workflow_id.to_string(),
                 run_id,
                 name: name.to_string(),
-                parent_task_id: None,
                 max_attempts: 3,
-                depends_on_ids: if by_name {
+                parent_task_ids: if is_join {
                     vec![]
                 } else {
                     vec![failed.task_id]
                 },
-                depends_on_names: if by_name {
-                    vec![failed.name.clone()]
-                } else {
-                    vec![]
-                },
+                depends_on_names: vec![failed.name.clone()],
                 input: json!({}),
             })
             .await
@@ -423,7 +407,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
             .await
             .unwrap()
             .unwrap();
-        let expected = if dependent.run_id == failed.run_id {
+        let expected = if dependent.task_type == "join" && dependent.run_id == failed.run_id {
             TaskStatus::Failed
         } else {
             TaskStatus::Pending
@@ -445,9 +429,8 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "narration".to_string(),
-            parent_task_id: None,
             max_attempts: 3,
-            depends_on_ids: vec![],
+            parent_task_ids: vec![],
             depends_on_names: vec![],
             input: json!({}),
         })
@@ -501,145 +484,48 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
     assert!(untouched.lease_until.is_some());
 }
 
-#[tokio::test]
-async fn claims_require_all_dependencies_including_missing_ids() {
-    let Some(database) = connect_test().await else {
-        return;
-    };
-    let repo = PgTaskRepo::new(database.pool().clone());
-    let inputs = [json!(null), json!(null)];
-    // 另一个工作流的同 ID 成功记录不能满足本工作流的依赖。
-    let other = repo
-        .enqueue_fanout(
-            "other_dependencies",
-            None,
-            None,
-            "source",
-            &[json!(null), json!(null), json!(null)],
-            &[],
-            "normal",
-            &[],
-            3,
-        )
-        .await
-        .unwrap();
-    for claim in repo
-        .claim_many("other_dependencies", "worker", 10)
-        .await
-        .unwrap()
-    {
-        repo.succeed(&claim, &json!(null)).await.unwrap();
-    }
-    let dependency_ids = vec![other[1].task_id, other[2].task_id];
-    let workflow_id = "missing_dependencies";
-    let child = repo
-        .enqueue(&Task {
-            task_type: "normal".into(),
-            workflow_id: workflow_id.to_string(),
-            run_id: None,
-            name: "child".to_string(),
-            parent_task_id: None,
-            max_attempts: 3,
-            depends_on_ids: dependency_ids.clone(),
-            depends_on_names: vec![],
-            input: json!(null),
-        })
-        .await
-        .unwrap();
-    assert!(
-        repo.claim_many(workflow_id, "worker", 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
-
-    let sources = repo
-        .enqueue_fanout(
-            workflow_id,
-            child.run_id,
-            None,
-            "source",
-            &inputs,
-            &[],
-            "normal",
-            &[],
-            3,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        sources.iter().map(|task| task.task_id).collect::<Vec<_>>(),
-        dependency_ids
-    );
-    let claims = repo.claim_many(workflow_id, "worker", 10).await.unwrap();
-    assert_eq!(claims.len(), 2);
-    repo.succeed(&claims[0], &json!(null)).await.unwrap();
-    assert!(
-        repo.claim_many(workflow_id, "worker", 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
-
-    repo.succeed(&claims[1], &json!(null)).await.unwrap();
-    assert_eq!(repo.executable_workflow_ids().await.unwrap(), [workflow_id]);
-    let claims = repo.claim_many(workflow_id, "worker", 10).await.unwrap();
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].task_id, child.task_id);
-}
-
 /// 恢复扫描只返回「存在可认领任务」的工作流（与 `claim_many` 同款闸门）：
-/// 待执行和待最终失败结算的工作流均命中；被依赖阻塞或已全部成功的工作流不命中。
+/// 待执行和待最终失败结算的工作流均命中；JOIN 被前驱阻塞或已全部成功的工作流不命中。
 #[tokio::test]
 async fn executable_workflow_ids_only_returns_claimable_sessions() {
     let Some(database) = connect_test().await else {
         return;
     };
     let repo = PgTaskRepo::new(database.pool().clone());
-    async fn insert_task(
-        repo: &PgTaskRepo,
-        workflow_id: &str,
-        name: &str,
-        deps: Vec<i64>,
-    ) -> TaskRecord {
-        repo.enqueue(&Task {
-            task_type: "normal".into(),
-            workflow_id: workflow_id.to_string(),
-            run_id: None,
-            name: name.to_string(),
-            parent_task_id: None,
-            max_attempts: 3,
-            depends_on_ids: deps,
-            depends_on_names: vec![],
-            input: json!({}),
-        })
-        .await
-        .unwrap()
+    async fn insert_task(repo: &PgTaskRepo, workflow_id: &str, name: &str) -> TaskRecord {
+        repo.enqueue(&Task::new(workflow_id, name, json!({})))
+            .await
+            .unwrap()
     }
 
     // 可认领：pending 且无依赖 → 命中。
     let claimable = "exec_sess_claimable";
-    insert_task(&repo, claimable, "narration", vec![]).await;
+    insert_task(&repo, claimable, "narration").await;
 
-    // 被依赖阻塞：后继 pending 但前驱未成功 → 不命中。先把前驱认领掉
+    // JOIN 被前驱阻塞：后继 pending 但前驱未成功 → 不命中。先把前驱认领掉
     // （running + 租约未过期 → 前驱自身也不可认领），否则前驱的 pending 行
     // 本身就会让工作流命中，测试的「阻塞」前提不成立。
     let blocked = "exec_sess_blocked";
-    let dep = insert_task(&repo, blocked, "commit_scene", vec![]).await;
-    insert_task(&repo, blocked, "narration", vec![dep.task_id]).await;
-    repo.claim_many(blocked, "worker", 5).await.unwrap();
+    let dep = insert_task(&repo, blocked, "commit_scene").await;
+    let mut join = Task::new(blocked, "narration", json!({}));
+    join.task_type = "join".into();
+    join.run_id = dep.run_id;
+    join.depends_on_names = vec![dep.name];
+    repo.enqueue(&join).await.unwrap();
+    assert_eq!(
+        repo.claim_many(blocked, "worker", 5).await.unwrap().len(),
+        1
+    );
 
     // 已全部成功：无 pending/running → 不命中。
     let done = "exec_sess_done";
-    insert_task(&repo, done, "narration", vec![]).await;
+    insert_task(&repo, done, "narration").await;
     let finished = repo.claim_many(done, "worker", 1).await.unwrap().remove(0);
     repo.succeed(&finished, &json!({})).await.unwrap();
 
     // 预算耗尽后仍需认领，以通过图的统一失败流程结算。
     let exhausted = "exec_sess_exhausted";
-    insert_task(&repo, exhausted, "narration", vec![]).await;
+    insert_task(&repo, exhausted, "narration").await;
     for _ in 0..3 {
         let claim = repo
             .claim_many(exhausted, "worker", 5)
@@ -753,17 +639,17 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     assert_eq!(rows[0].error.as_deref(), Some(WINDOW_EXPIRED_ERR));
     assert!(rows[0].lease_until.is_none());
     assert_eq!(rows[1].status, TaskStatus::Pending);
-    assert_eq!(rows[1].parent_task_id, Some(root.task_id));
-    assert!(rows[1].depends_on_ids.is_empty());
+    assert_eq!(rows[1].parent_task_ids, [root.task_id]);
     reject_stale_writes(&repo, &next).await;
 
-    // 无执行预算的任务也通过失败结算传播到依赖，不会被直接封存。
+    // 无执行预算的任务也通过失败结算传播到等待它的 JOIN，不会被直接封存。
     let mut input = Task::new("zero-budget", "source", json!({}));
     input.max_attempts = 0;
     let zero = repo.enqueue(&input).await.unwrap();
     let mut child = Task::new("zero-budget", "dependent", json!({}));
+    child.task_type = "join".into();
     child.run_id = zero.run_id;
-    child.depends_on_ids = vec![zero.task_id];
+    child.depends_on_names = vec![zero.name.clone()];
     let child = repo.enqueue(&child).await.unwrap();
     let claim = repo
         .claim_many("zero-budget", "recovery", 1)
@@ -799,9 +685,8 @@ async fn task_ready_notifications_carry_workflow_id() {
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "scene_proposal".to_string(),
-            parent_task_id: None,
             max_attempts: 3,
-            depends_on_ids: vec![],
+            parent_task_ids: vec![],
             depends_on_names: vec![],
             input: json!({}),
         })
@@ -813,10 +698,9 @@ async fn task_ready_notifications_carry_workflow_id() {
     repo.enqueue_fanout(
         workflow_id,
         root.run_id,
-        Some(root.task_id),
+        &[root.task_id],
         "commit_scene",
         &[json!({})],
-        &[root.task_id],
         "normal",
         &[],
         3,
@@ -841,9 +725,8 @@ async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i
         workflow_id: workflow_id.into(),
         run_id,
         name: name.into(),
-        parent_task_id: None,
         max_attempts: 5,
-        depends_on_ids: vec![],
+        parent_task_ids: vec![],
         depends_on_names: vec![],
         input: json!({}),
     })
@@ -907,14 +790,13 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         .unwrap()
         .remove(0);
     let mut dependent = Task {
-        task_type: "normal".into(),
+        task_type: "join".into(),
         workflow_id: workflow_id.into(),
         run_id: Some(7),
         name: "dependent".into(),
-        parent_task_id: None,
         max_attempts: 3,
-        depends_on_ids: vec![root.task_id],
-        depends_on_names: vec![],
+        parent_task_ids: vec![],
+        depends_on_names: vec![root.name.clone()],
         input: json!({}),
     };
     repo.enqueue(&dependent).await.unwrap();
@@ -960,7 +842,6 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     assert_eq!(settled.output, Some(json!("current")));
     // Bulk cleanup is restricted to the stopped worker, including within one workflow.
     dependent.name = "another".into();
-    dependent.depends_on_ids.clear();
     repo.enqueue(&dependent).await.unwrap();
     let a = repo
         .claim_many(workflow_id, "worker-a", 1)
@@ -1094,14 +975,13 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
     let rows = repo.list_all(workflow_id).await.unwrap();
     assert_eq!(rows.len(), 4, "two source tasks and exactly two JOIN tasks");
     for join in rows.iter().filter(|task| task.task_type == "join") {
-        assert!([Some(left.task_id), Some(right.task_id)].contains(&join.parent_task_id));
         assert_eq!(
             join.input,
             json!({"left": left.task_id, "right": right.task_id})
         );
-        let mut dependencies = join.depends_on_ids.clone();
-        dependencies.sort_unstable();
-        assert_eq!(dependencies, [left.task_id, right.task_id]);
+        let mut parents = join.parent_task_ids.clone();
+        parents.sort_unstable();
+        assert_eq!(parents, [left.task_id, right.task_id]);
     }
     assert_eq!(
         repo.claim_many(workflow_id, "join-worker", 10)

@@ -69,7 +69,7 @@ pub trait TaskStore: Sync {
 
     /// 原子入队任务并确定运行身份，返回已持久化的任务快照。
     /// run_id 为 None 时，以新分配的 task_id 创建独立运行；Some(id) 则保留指定运行。
-    /// 节点类型、父任务、依赖和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
+    /// 节点类型、来源任务、静态前驱和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
@@ -77,11 +77,11 @@ pub trait TaskStore: Sync {
     ///
     /// 待处理任务必须同时满足：
     /// - 状态为 pending / running，未持有租约或租约已过期。
-    /// - `depends_on_ids` 中每个 ID 在同一 workflow 内均存在且已成功；缺失依赖必须阻塞。
-    /// - JOIN 还要求记录中 `depends_on_names` 的每个前驱，在同一 `workflow_id + run_id`
+    /// - JOIN 要求记录中 `depends_on_names` 的每个前驱，在同一 `workflow_id + run_id`
     ///   下至少存在一个实例，且全部实例均已成功；同为 NULL 的 run_id 视为同组。
     ///   skipped / failed / superseded 均不算成功。前驱集合为空时不增加此项限制
     ///   （图规划的失败后继当前使用空集合）；普通任务不使用前驱名作认领闸门。
+    /// `parent_task_ids` 只记录来源，不参与认领资格判断。
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
     /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入固定 300 秒租约。
@@ -98,11 +98,11 @@ pub trait TaskStore: Sync {
     /// 在同一事务内写入产物、标记成功并入队全部成功后继。
     ///
     /// 必须校验当前有效认领且 attempt <= max_attempts；旧执行者和仅用于最终失败的认领不能提交成功。
-    /// 成功后继依赖源任务，并继承结算时最新的任务身份（如 `run_id`）。
+    /// 成功后继记录源任务 ID，并继承结算时最新的任务身份（如 `run_id`）。
     /// 普通后继每条输入创建独立任务。JOIN 按同一 workflow、run、节点名汇入已有
-    /// pending / running JOIN，依赖 ID 取去重并集，输入通过 [`merge_join_input`] 累积。
-    /// 新任务的 parent_task_id 为源任务 ID；JOIN 合并后保留首次创建时的父任务 ID。
-    /// 前驱成功、依赖累积、JOIN 输入合并与后继创建必须在同一事务提交，且并发首次
+    /// pending / running JOIN，parent_task_ids 取去重并集，输入通过 [`merge_join_input`] 累积。
+    /// 新任务的 parent_task_ids 为仅包含源任务 ID 的数组。
+    /// 前驱成功、来源累积、JOIN 输入合并与后继创建必须在同一事务提交，且并发首次
     /// 汇入不能创建重复 JOIN。认领校验与原子结算保证同一父任务不会重复生成后继。
     /// 新建 JOIN 如已有静态前驱永久 failed，应直接标记 failed。
     fn settle_success<'a>(
@@ -114,10 +114,10 @@ pub trait TaskStore: Sync {
 
     /// 在同一事务内结算失败，并入队失败后继或级联已有依赖任务。
     ///
-    /// `successors` 非空时标记 `superseded`，失败后继不依赖源任务；为空时标记 `failed`，
-    /// 并将同一工作流、同一 run 内直接依赖该任务 ID 或节点名的已有 pending 任务标记失败。
+    /// `successors` 非空时标记 `superseded`；为空时标记 `failed`，并将同一工作流、
+    /// 同一 run 内以源节点名为静态前驱的已有 pending JOIN 标记失败。
     /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
-    /// 失败后继仍以源任务 ID 记录 parent_task_id，使用与成功后继相同的创建和 JOIN 汇合规则。
+    /// 失败后继同样将源任务 ID 写入 parent_task_ids，使用与成功后继相同的创建和 JOIN 汇合规则。
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn settle_failure<'a>(
         &'a self,

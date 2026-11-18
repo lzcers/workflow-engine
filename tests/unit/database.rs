@@ -21,10 +21,9 @@ fn task() -> Task {
         task_type: "normal".into(),
         workflow_id: "connection-check".into(),
         run_id: Some(1),
-        parent_task_id: None,
+        parent_task_ids: vec![],
         name: "start".into(),
         max_attempts: 3,
-        depends_on_ids: vec![],
         depends_on_names: vec![],
         input: json!({"persisted": true}),
     }

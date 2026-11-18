@@ -18,8 +18,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一。
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。
     task_id INTEGER NOT NULL CHECK (task_id > 0),
-    -- 首次创建任务的父任务 ID；入口可为 NULL，JOIN 汇合保留首个父任务，全部执行依赖由 depends_on_ids 记录。
-    parent_task_id INTEGER CHECK (parent_task_id > 0),
+    -- 来源任务 ID JSON 数组；入口为空，成功和失败后继均记录源任务，JOIN 累积并去重所有贡献者。
+    -- 引用同一 workflow_id 下的 task_id，仅用于溯源，不要求来源任务成功。
+    parent_task_ids TEXT NOT NULL DEFAULT '[]'
+        CHECK (json_valid(parent_task_ids) AND json_type(parent_task_ids) = 'array'),
     -- 工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。
     name TEXT NOT NULL,
     -- pending 待认领，running 已认领，succeeded 成功，failed 永久失败，
@@ -37,10 +39,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 该任务行的业务执行次数上限（含首次）；耗尽后重新认领并通过统一失败流程结算。
     -- 失败边新建的任务单独计数。
     max_attempts INTEGER NOT NULL DEFAULT 3,
-    -- 直接依赖的任务 ID JSON 数组，引用同一 workflow_id 下的 task_id。
-    -- 用于依赖就绪判定、JOIN 合并、溯源及失败级联；空数组表示无直接依赖。
-    depends_on_ids TEXT NOT NULL DEFAULT '[]'
-        CHECK (json_valid(depends_on_ids) AND json_type(depends_on_ids) = 'array'),
     -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；join 汇合节点，额外检查静态前驱。
     task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event')),
     -- 静态前驱节点名的 JSON 数组，用于血缘记录及 JOIN 失败级联。
@@ -55,7 +53,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     error TEXT,
     -- 任务记录创建时间，由数据库时钟写入 UTC 文本。
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    -- 最近更新时间（UTC 文本）；仓储在认领、结算、依赖合并或租约变更时显式更新，无触发器。
+    -- 最近更新时间（UTC 文本）；仓储在认领、结算、来源合并或租约变更时显式更新，无触发器。
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (workflow_id, task_id)
 );

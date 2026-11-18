@@ -31,17 +31,18 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
 `Task::new(workflow_id, name, input)` 默认创建无依赖的独立运行入口，尝试预算为 3；
-入队前可设置 `run_id`、`parent_task_id`、`depends_on_ids`、`depends_on_names`、`task_type` 和 `max_attempts`。
+入队前可设置 `run_id`、`parent_task_ids`、`depends_on_names`、`task_type` 和 `max_attempts`。
 存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
 业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
 
-`parent_task_id` 记录首次创建任务的源任务 ID，独立入口为 `None`。成功和失败后继均由
-引擎自动填写；它不替代 `depends_on_ids`，失败后继可以记录创建者而不依赖其成功。
+`parent_task_ids` 记录来源任务 ID 集合，独立入口为空数组。成功和失败后继均由
+引擎自动填写；它只表达来源关系，不要求来源任务成功，也不参与认领资格判断。
 普通节点每条输入创建独立任务，以 `task_id` 标识；同一父任务的多个子任务共享
-`parent_task_id`，不同父任务的同名后继也独立存在。父任务结算与后继创建原子提交，
+`parent_task_ids = [源任务 ID]`，不同父任务的同名后继也独立存在。父任务结算与后继创建原子提交，
 并通过认领校验阻止重复结算，因此不需要额外的实例编号去重。
 只有 JOIN 按 `workflow_id + run_id + name` 汇入已有 pending / running JOIN，跨父任务
-累积依赖及输入，保留首次创建时的 `parent_task_id`；所有前驱仍由 `depends_on_ids` 记录。
+累积输入，并将所有贡献者 ID 去重合并到 `parent_task_ids`。JOIN 是否就绪由
+`depends_on_names` 判断：同一运行内每个静态前驱至少存在一个实例，且已有实例全部成功。
 
 ## 引擎与工作流实例
 
