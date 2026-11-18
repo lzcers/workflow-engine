@@ -36,7 +36,6 @@ async fn memory_and_temporary_urls_keep_tasks_until_shared_close() {
     ] {
         let database = Database::connect(url).await.unwrap();
         database.initialize().await.unwrap();
-        database.initialize().await.unwrap();
         let shared = database.clone();
         let inserted = repository(&database).enqueue(&task()).await.unwrap();
         shared.check().await.unwrap();

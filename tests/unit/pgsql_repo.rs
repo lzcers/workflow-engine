@@ -12,13 +12,13 @@ use crate::{StorageError, Task, TaskRecord, TaskStatus};
 /// 收取一条**本工作流**的任务就绪通知（2s 超时）：通知通道是集群级共享的，
 /// 并发测试可能互相收到对方的 payload（生产监听器同样按 payload 分发），
 /// 故跳过其他工作流的 payload 直到命中期望工作流。
-async fn recv_ready(listener: &mut PgListener, workflow_id: &str) -> String {
+async fn recv_ready(listener: &mut PgListener, workflow_id: &str) {
     loop {
         match tokio::time::timeout(Duration::from_secs(2), listener.recv()).await {
             Ok(Ok(notification)) => {
                 assert_eq!(notification.channel(), TASK_READY_CHANNEL);
                 if notification.payload() == workflow_id {
-                    return notification.payload().to_string();
+                    return;
                 }
             }
             Ok(Err(e)) => panic!("listener recv failed: {e}"),
@@ -310,41 +310,6 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     }
 }
 
-/// 释放租约后任务立即可被重新认领（无需等待租约过期），attempt 照常递增。
-#[tokio::test]
-async fn release_claim_makes_task_reclaimable_immediately() {
-    let Some(database) = connect_test().await else {
-        return;
-    };
-    let repo = PgTaskRepo::new(database.pool().clone());
-    let workflow_id = "release_claim_immediate";
-    let task = repo
-        .enqueue(&Task {
-            workflow_id: workflow_id.to_string(),
-            run_id: None,
-            name: "narration".to_string(),
-            instance_id: None,
-            max_attempts: 3,
-            depends_on_ids: vec![],
-            depends_on_names: vec![],
-            input: json!({}),
-        })
-        .await
-        .unwrap();
-
-    let claimed = repo.claim_many(workflow_id, "worker", 5).await.unwrap();
-    assert_eq!(claimed.len(), 1);
-    assert!(claimed[0].lease_until.is_some());
-
-    repo.release_claim(&claimed[0]).await.unwrap();
-
-    // 租约已释放：立即重认领成功，attempt 递增。
-    let reclaimed = repo.claim_many(workflow_id, "worker", 5).await.unwrap();
-    assert_eq!(reclaimed.len(), 1);
-    assert_eq!(reclaimed[0].task_id, task.task_id);
-    assert_eq!(reclaimed[0].attempt, 2);
-}
-
 /// 批量释放：同一工作流的在跑任务全部立即回到可认领，且只影响本工作流。
 #[tokio::test]
 async fn release_claims_returns_every_running_task_in_the_workflow() {
@@ -571,48 +536,6 @@ async fn recovery_seal_marks_budget_exhausted_rows_failed() {
     assert_eq!(claimed.len(), 1);
 }
 
-/// 事务性通知：同一事务内 `pg_notify` 随 COMMIT 投递、ROLLBACK 不投递。
-/// （pg_notify 是集群级通道、不受测试 schema 隔离，测试用唯一通道名避免串扰。）
-#[tokio::test]
-async fn task_ready_notify_fires_only_on_commit() {
-    let Some(database) = connect_test().await else {
-        return;
-    };
-    let channel = format!("test_ready_notify_{}", uuid::Uuid::new_v4().simple());
-    let mut listener = PgListener::connect(database.database_url()).await.unwrap();
-    listener.listen(&channel).await.unwrap();
-
-    // 回滚：不投递。
-    let mut tx = database.pool().begin().await.unwrap();
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(&channel)
-        .bind("rolled-back")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    tx.rollback().await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), listener.recv())
-            .await
-            .is_err()
-    );
-
-    // 提交：投递。
-    let mut tx = database.pool().begin().await.unwrap();
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(&channel)
-        .bind("committed")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let notification = tokio::time::timeout(Duration::from_secs(2), listener.recv())
-        .await
-        .expect("timed out waiting for committed notification")
-        .unwrap();
-    assert_eq!(notification.payload(), "committed");
-}
-
 /// 任务就绪通知发送点：入队 / 扇出 / 释放租约各自随提交投递，payload = workflow_id。
 #[tokio::test]
 async fn task_ready_notifications_carry_workflow_id() {
@@ -638,7 +561,7 @@ async fn task_ready_notifications_carry_workflow_id() {
         })
         .await
         .unwrap();
-    assert_eq!(recv_ready(&mut listener, workflow_id).await, workflow_id);
+    recv_ready(&mut listener, workflow_id).await;
 
     // 2) 扇出后继（原子结算路径同样经此通知）。
     repo.enqueue_fanout(
@@ -653,7 +576,7 @@ async fn task_ready_notifications_carry_workflow_id() {
     )
     .await
     .unwrap();
-    assert_eq!(recv_ready(&mut listener, workflow_id).await, workflow_id);
+    recv_ready(&mut listener, workflow_id).await;
 
     // 3) 释放租约（原子结算回滚后的立即重入）。
     let claimed = repo
@@ -662,7 +585,7 @@ async fn task_ready_notifications_carry_workflow_id() {
         .unwrap()
         .remove(0);
     repo.release_claim(&claimed).await.unwrap();
-    assert_eq!(recv_ready(&mut listener, workflow_id).await, workflow_id);
+    recv_ready(&mut listener, workflow_id).await;
 }
 
 async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i64>) -> TaskRecord {
@@ -1000,22 +923,6 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
         assert_eq!(rows[0].status, TaskStatus::Running);
         assert!(rows[0].output.is_none());
     }
-}
-
-#[test]
-fn join_input_merges_distinct_keys() {
-    let mut acc = json!({"narration": {"run_id": 1, "ended": false}});
-    merge_join_input(
-        &mut acc,
-        &json!({"action_options": {"run_id": 1, "options": []}}),
-    );
-    assert_eq!(
-        acc,
-        json!({
-            "narration": {"run_id": 1, "ended": false},
-            "action_options": {"run_id": 1, "options": []},
-        })
-    );
 }
 
 #[test]

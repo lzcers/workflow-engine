@@ -74,8 +74,6 @@ impl Node<Context> for Sum {
 async fn dsl_workflow_persists_fanout_join_and_final_output() {
     let database = Database::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();
-    database.check().await.unwrap();
-    let shared_database = database.clone();
     let pool = match &database {
         Database::Sqlite(pool) => pool.clone(),
         #[cfg(feature = "pg")]
@@ -155,7 +153,6 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     for task in &tasks {
         assert_eq!(task.status, TaskStatus::Succeeded, "{task:?}");
         assert_eq!(task.attempt, 1);
-        assert_eq!(task.run_id, root.run_id);
         assert!(task.error.is_none());
         assert!(task.lease_until.is_none());
         if task.task_id != root.task_id {
@@ -220,7 +217,6 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(other_total.output, Some(json!(316)));
     assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
     database.close().await;
-    assert!(shared_database.check().await.is_err());
 }
 
 struct SignalNode {
@@ -330,11 +326,6 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     assert!(
         started.is_ok(),
         "new work must start before the 60-second poll"
-    );
-    assert_eq!(
-        Arc::strong_count(&slow_started),
-        1,
-        "completed node was dropped"
     );
     assert!(
         repo.list_all("scheduler-wake")

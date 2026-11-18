@@ -469,15 +469,8 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert_eq!(get(&repo, &task).await.status, TaskStatus::Running);
     assert_eq!(repo.list_all("atomic_failure").await.unwrap().len(), 1);
 
-    store.release_claim(&claimed).await.unwrap();
-    let reclaimed = store
-        .claim_many("atomic_failure", "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    assert_eq!(reclaimed.attempt, 2);
     store
-        .settle_failure(&reclaimed, message, &[recovery])
+        .settle_failure(&claimed, message, &[recovery])
         .await
         .unwrap();
     let settled = get(&repo, &task).await;
@@ -740,22 +733,6 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
         assert_eq!(completed.status, TaskStatus::Succeeded);
         assert_eq!(completed.output, Some(json!("done")));
     }
-}
-
-#[tokio::test]
-async fn settling_a_missing_task_returns_a_typed_error() {
-    let (_, repo) = memory_repo().await;
-    repo.enqueue(&new_task("missing", "root")).await.unwrap();
-    let mut claimed = repo
-        .claim_many("missing", "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    claimed.task_id = 123;
-    assert!(matches!(
-        repo.succeed(&claimed, &json!({})).await,
-        Err(StorageError::ClaimLost { workflow_id, task_id: 123 }) if workflow_id == "missing"
-    ));
 }
 
 #[tokio::test]

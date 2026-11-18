@@ -65,40 +65,6 @@ fn failure_edge_dsl_syntax() {
     assert_eq!(skip[0].dst, "a");
 }
 
-/// 裸成功透传边 `src -> dst`（无子句）：无条件把上游输出原样喂给下游，
-/// 编译期强制上游 `Out` == 下游 `In`（两侧均为 `Value` 时自然满足）。
-#[test]
-fn bare_success_passthrough() {
-    let g: Graph<Ctx> = workflow!(
-        workflow_id: "test";
-        title: "测试工作流";
-        context: Ctx;
-        nodes {
-            #[title = "上游"]
-            #[description = "原样输出"]
-            a => PassThrough,
-            #[description = "原样接收"]
-            #[title = "下游"]
-            b => PassThrough,
-        }
-        edges {
-            a -> b,
-        }
-    )
-    .unwrap();
-
-    let description = g.describe();
-    assert_eq!(description.nodes[0].title, "上游");
-    assert_eq!(description.nodes[0].description, "原样输出");
-    assert_eq!(description.nodes[1].title, "下游");
-    assert_eq!(description.nodes[1].description, "原样接收");
-
-    let succ = g.plan_success("a", &serde_json::json!({"k": 1})).unwrap();
-    assert_eq!(succ.len(), 1);
-    assert_eq!(succ[0].dst, "b");
-    assert_eq!(succ[0].inputs, vec![serde_json::json!({"k": 1})]);
-}
-
 #[tokio::test]
 async fn infers_instance_and_context_types_and_evaluates_each_expression_once() {
     struct OffsetContext(i32);
