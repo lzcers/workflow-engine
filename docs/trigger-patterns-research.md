@@ -20,7 +20,7 @@ Temporal 还将重叠执行策略和迟到补发窗口作为 Schedule 行为显�
 - 本项目把节点定义为一次 `execute(input) -> output`，Scheduler 从存储认领任务后执行；因此长时间监听外部事件会占用一个在途任务槽位。[Node](../src/node/mod.rs)、[Scheduler](../src/scheduler.rs)
 - 宿主已经负责 worker 生命周期、唤醒与恢复扫描；触发源的 HTTP 路由和 cron 驱动可延续这个责任边界。[README](../README.md)
 - SQLite 后端已经提供 `insert_task(tx, NewTask)`，可在宿主事务中插入入口任务；独立 `enqueue()` 只是插入并提交，不等同于事件去重。[SqliteTaskRepo](../src/backend/sqlite/repo.rs)
-- 当前 `run_id` 是可承载业务血缘的分组键，扇入去重和 JOIN 都依赖它；并不是已定义好的不可变工作流执行身份。每个新事件必须获得隔离的分组范围，不能让所有触发事件都落入相同的 `run_id = NULL` 分组；若业务会改变血缘，应先确定独立执行身份的边界。[TaskRecord](../src/task/record.rs)
+- 当前 `run_id` 是可承载业务血缘的分组键，JOIN 汇合与等齐前驱都依赖它；并不是已定义好的不可变工作流执行身份。每个新事件必须获得隔离的分组范围，不能让所有触发事件都落入相同的 `run_id = NULL` 分组；若业务会改变血缘，应先确定独立执行身份的边界。[TaskRecord](../src/task/record.rs)
 - 已有 Tokio、serde、SQLx 和可选 chrono；当前依赖中没有专门的 cron 解析器或 HTTP 服务框架。应用已有 HTTP 服务时，应直接接入其路由；cron 计算应选成熟库，具体包需要另行核对维护情况。[Cargo.toml](../Cargo.toml)
 
 ## 建议的最小闭环

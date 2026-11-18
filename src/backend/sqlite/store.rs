@@ -1,6 +1,6 @@
 //! [`SqliteTaskStore`]：通用引擎 [`crate::task::TaskStore`] 的 SQLite 实现。
 //!
-//! 通过 [`SqliteTaskRepo`] 供多个工作流共享，复用任务模块定义的后继实例转换规则，
+//! 通过 [`SqliteTaskRepo`] 供多个工作流共享，直接持久化图规划的后继输入，
 //! 不感知任何业务字段。
 
 use futures::future::BoxFuture;
@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::repo::SqliteTaskRepo;
 use crate::error::StorageError;
-use crate::task::{FanoutInstances, FanoutPlan, TaskStore};
+use crate::task::{FanoutPlan, TaskStore};
 use crate::{Task, TaskRecord};
 
 /// 共享任务存储：通过 `SqliteTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
@@ -58,10 +58,8 @@ impl TaskStore for SqliteTaskStore {
         successors: &'a [FanoutPlan],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            let fanouts: Vec<FanoutInstances> =
-                successors.iter().map(FanoutInstances::from).collect();
             self.repo
-                .succeed_and_enqueue(task, output, &fanouts, self.max_attempts)
+                .succeed_and_enqueue(task, output, successors, self.max_attempts)
                 .await
                 .map(|_| ())
         })
@@ -75,10 +73,8 @@ impl TaskStore for SqliteTaskStore {
         successors: &'a [FanoutPlan],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            let fanouts: Vec<FanoutInstances> =
-                successors.iter().map(FanoutInstances::from).collect();
             self.repo
-                .fail_and_enqueue(task, message, &fanouts, self.max_attempts)
+                .fail_and_enqueue(task, message, successors, self.max_attempts)
                 .await
         })
     }

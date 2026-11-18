@@ -9,13 +9,13 @@ use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
-use crate::task::FanoutInstances;
+use crate::task::FanoutPlan;
 use crate::{Task, TaskRecord, TaskStatus};
 
 use crate::task::store::{LEASE_DURATION, merge_join_input};
 
 /// Columns suitable for application queries against the same task table.
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, producer_task_id, name, instance_id, status, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_id, name, status, \
     claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
     input_json, output_json, error, created_at, updated_at";
 
@@ -96,61 +96,33 @@ async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
-    producer_task_id: Option<i64>,
+    parent_task_id: Option<i64>,
     name: &str,
-    instances: &[(Option<i32>, Value)],
+    inputs: &[Value],
     depends_on_ids: &[i64],
     task_type: &str,
     depends_on_names: &[String],
     max_attempts: i32,
 ) -> Result<Vec<TaskRecord>, StorageError> {
-    let mut rows = Vec::with_capacity(instances.len());
-    for (instance_id, input) in instances {
-        if let Some(instance_id) = instance_id {
-            let task_id = allocate_task_id(tx, workflow_id).await?;
-            let row = sqlx::query_as::<_, TaskRow>(&format!(
+    let mut rows = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let existing = if task_type == "join" {
+            sqlx::query_as::<_, TaskRow>(&format!(
                 r#"
-                INSERT INTO tasks
-                    (workflow_id, task_id, run_id, name, instance_id, status,
-                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
-                     producer_task_id)
-                VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?8, ?9, ?10, ?11)
-                ON CONFLICT DO NOTHING
-                RETURNING {ROW_COLS}
+                SELECT {ROW_COLS} FROM tasks
+                WHERE workflow_id = ?1 AND name = ?2 AND run_id IS ?3
+                  AND task_type = 'join' AND status IN ('pending', 'running')
+                ORDER BY task_id LIMIT 1
                 "#
             ))
             .bind(workflow_id)
-            .bind(task_id)
-            .bind(run_id)
             .bind(name)
-            .bind(*instance_id)
-            .bind(max_attempts)
-            .bind(task_type)
-            .bind(Json(depends_on_ids))
-            .bind(Json(depends_on_names))
-            .bind(input)
-            .bind(producer_task_id)
+            .bind(run_id)
             .fetch_optional(&mut **tx)
-            .await?;
-            if let Some(row) = row {
-                rows.push(row.into());
-            }
-            continue;
-        }
-
-        let existing = sqlx::query_as::<_, TaskRow>(&format!(
-            r#"
-            SELECT {ROW_COLS} FROM tasks
-            WHERE workflow_id = ?1 AND name = ?2 AND run_id IS ?3
-              AND instance_id IS NULL AND status IN ('pending', 'running')
-            ORDER BY task_id LIMIT 1
-            "#
-        ))
-        .bind(workflow_id)
-        .bind(name)
-        .bind(run_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+            .await?
+        } else {
+            None
+        };
 
         let row = if let Some(existing) = existing {
             let mut dependencies = existing.depends_on_ids;
@@ -160,9 +132,7 @@ async fn enqueue_fanout_in_tx(
                 }
             }
             let mut merged_input = existing.input_json;
-            if task_type == "join" {
-                merge_join_input(&mut merged_input, input);
-            }
+            merge_join_input(&mut merged_input, input);
             sqlx::query_as::<_, TaskRow>(&format!(
                 r#"
                 UPDATE tasks
@@ -202,10 +172,10 @@ async fn enqueue_fanout_in_tx(
             sqlx::query_as::<_, TaskRow>(&format!(
                 r#"
                 INSERT INTO tasks
-                    (workflow_id, task_id, run_id, name, instance_id, status,
+                    (workflow_id, task_id, run_id, name, status,
                      attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
-                     producer_task_id)
-                VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)
+                     parent_task_id)
+                VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)
                 RETURNING {ROW_COLS}
                 "#
             ))
@@ -223,7 +193,7 @@ async fn enqueue_fanout_in_tx(
             .bind(Json(depends_on_ids))
             .bind(Json(depends_on_names))
             .bind(input)
-            .bind(producer_task_id)
+            .bind(parent_task_id)
             .fetch_one(&mut **tx)
             .await?
         };
@@ -248,10 +218,10 @@ impl SqliteTaskRepo {
         let row = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
             INSERT INTO tasks
-                (workflow_id, task_id, run_id, name, instance_id, status,
+                (workflow_id, task_id, run_id, name, status,
                  attempt, max_attempts, depends_on_ids, depends_on_names, input_json,
-                 producer_task_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?8, ?9, ?10)
+                 parent_task_id)
+            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)
             RETURNING {ROW_COLS}
             "#
         ))
@@ -259,12 +229,11 @@ impl SqliteTaskRepo {
         .bind(task_id)
         .bind(task.run_id.unwrap_or(task_id))
         .bind(&task.name)
-        .bind(task.instance_id)
         .bind(task.max_attempts)
         .bind(Json(&task.depends_on_ids))
         .bind(Json(&task.depends_on_names))
         .bind(&task.input)
-        .bind(task.producer_task_id)
+        .bind(task.parent_task_id)
         .fetch_one(&mut **tx)
         .await?;
         Ok(row.into())
@@ -278,17 +247,16 @@ impl SqliteTaskRepo {
         Ok(row)
     }
 
-    /// Enqueue all instances atomically. Single instances merge dependencies (and
-    /// JOIN input) across producers, preserving the initial producer. Numbered map
-    /// instances are deduplicated within each producer's output to the destination.
+    /// Enqueue inputs atomically. Ordinary inputs each create a task; JOIN inputs
+    /// merge dependencies and input across parents, preserving the initial parent.
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_fanout(
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
-        producer_task_id: Option<i64>,
+        parent_task_id: Option<i64>,
         name: &str,
-        instances: &[(Option<i32>, Value)],
+        inputs: &[Value],
         depends_on_ids: &[i64],
         task_type: &str,
         depends_on_names: &[String],
@@ -299,9 +267,9 @@ impl SqliteTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
-            producer_task_id,
+            parent_task_id,
             name,
-            instances,
+            inputs,
             depends_on_ids,
             task_type,
             depends_on_names,
@@ -318,7 +286,7 @@ impl SqliteTaskRepo {
         &self,
         task: &TaskRecord,
         output: &Value,
-        fanouts: &[FanoutInstances],
+        fanouts: &[FanoutPlan],
         max_attempts: i32,
     ) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -348,10 +316,10 @@ impl SqliteTaskRepo {
                 &task.workflow_id,
                 settled.run_id,
                 Some(task.task_id),
-                &fanout.name,
-                &fanout.instances,
+                fanout.dst,
+                &fanout.inputs,
                 &[settled.task_id],
-                &fanout.task_type,
+                fanout.task_type,
                 &fanout.depends_on_names,
                 max_attempts,
             )
@@ -366,7 +334,7 @@ impl SqliteTaskRepo {
         &self,
         task: &TaskRecord,
         error: &str,
-        fanouts: &[FanoutInstances],
+        fanouts: &[FanoutPlan],
         max_attempts: i32,
     ) -> Result<(), StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -402,10 +370,10 @@ impl SqliteTaskRepo {
                 &task.workflow_id,
                 settled.run_id,
                 Some(task.task_id),
-                &fanout.name,
-                &fanout.instances,
+                fanout.dst,
+                &fanout.inputs,
                 &[],
-                &fanout.task_type,
+                fanout.task_type,
                 &fanout.depends_on_names,
                 max_attempts,
             )

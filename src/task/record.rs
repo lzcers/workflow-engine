@@ -56,15 +56,12 @@ impl TryFrom<String> for TaskStatus {
 pub struct TaskRecord {
     pub workflow_id: String,
     pub task_id: i64,
-    /// 分组键（代际分组）：同组任务共享扇入去重与 JOIN 等齐前驱的判定域
+    /// 分组键（代际分组）：同组任务共享 JOIN 汇合与等齐前驱的判定域
     /// 业务侧可承载血缘语义。
     pub run_id: Option<i64>,
-    /// 首次创建该任务的源任务 ID；入口为 None。汇合保留首个创建者，全部前驱见 depends_on_ids。
-    /// 多实例以此区分不同源任务产生的同名、同序号后继。
-    pub producer_task_id: Option<i64>,
+    /// 首次创建该任务的父任务 ID；入口为 None。JOIN 保留首个父任务，全部执行依赖见 depends_on_ids。
+    pub parent_task_id: Option<i64>,
     pub name: String,
-    /// NULL=单实例；Some(i)=map 边扇出的第 i 个实例（i ∈ 0..N-1）。
-    pub instance_id: Option<i32>,
     pub status: TaskStatus,
     /// 最近一次认领的执行器身份；Scheduler 每次启动生成新的 UUID。
     pub claimed_by: Option<String>,
@@ -95,11 +92,9 @@ pub struct Task {
     pub workflow_id: String,
     /// Some(id) 加入指定运行；None 在入队时以新任务的 task_id 创建独立运行。
     pub run_id: Option<i64>,
-    /// 创建者任务 ID；独立入口为 None，不替代执行依赖 depends_on_ids。
-    pub producer_task_id: Option<i64>,
+    /// 父任务 ID；独立入口为 None，不替代执行依赖 depends_on_ids。
+    pub parent_task_id: Option<i64>,
     pub name: String,
-    /// NULL=单实例；Some(i)=map 边扇出的第 i 个实例。
-    pub instance_id: Option<i32>,
     pub max_attempts: i32,
     pub depends_on_ids: Vec<i64>,
     /// JOIN 静态前驱节点名全集（普通节点默认空集）。
@@ -108,14 +103,13 @@ pub struct Task {
 }
 
 impl Task {
-    /// 创建无依赖的独立运行入口；可在入队前设置 run_id、依赖、实例编号和尝试预算。
+    /// 创建无依赖的独立运行入口；可在入队前设置 run_id、父任务、依赖和尝试预算。
     pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             workflow_id: workflow_id.into(),
             run_id: None,
-            producer_task_id: None,
+            parent_task_id: None,
             name: name.into(),
-            instance_id: None,
             max_attempts: 3,
             depends_on_ids: Vec::new(),
             depends_on_names: Vec::new(),

@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS task_counters (
     -- 工作流标识；每个工作流独立维护 task_id 计数。
     workflow_id  TEXT PRIMARY KEY NOT NULL,
-    -- 最近一次分配的 task_id；分配时先加 1 再返回，首次返回 1，去重跳过插入时可能留下空号。
+    -- 最近一次分配的 task_id；分配时先加 1 再返回，首次返回 1。
     next_task_id INTEGER NOT NULL DEFAULT 0
 );
 
@@ -12,19 +12,16 @@ CREATE TABLE IF NOT EXISTS task_counters (
 CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流标识；用于隔离任务、分配 task_id 和限定调度范围，与 task_id 组成主键。
     workflow_id TEXT NOT NULL,
-    -- 运行分组键；用于扇入去重、JOIN 等齐前驱及失败级联，后继继承源任务的值。
+    -- 运行分组键；用于 JOIN 汇合、等齐前驱及失败级联，后继继承源任务的值。
     -- enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。
     run_id INTEGER,
     -- 工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一。
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。
     task_id INTEGER NOT NULL CHECK (task_id > 0),
-    -- 首次创建任务的源任务 ID；入口可为 NULL，汇合保留首个创建者，全部前驱由 depends_on_ids 记录。
-    producer_task_id INTEGER CHECK (producer_task_id > 0),
+    -- 首次创建任务的父任务 ID；入口可为 NULL，JOIN 汇合保留首个父任务，全部执行依赖由 depends_on_ids 记录。
+    parent_task_id INTEGER CHECK (parent_task_id > 0),
     -- 工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。
     name TEXT NOT NULL,
-    -- 节点扇出的实例序号；NULL 表示单实例，多实例从 0 开始编号。
-    -- 与 workflow_id、run_id、producer_task_id、name 一起用于扇出去重。
-    instance_id INTEGER,
     -- pending 待认领，running 已认领，succeeded 成功，failed 永久失败，
     -- skipped 跳过，superseded 失败已由后继接管。
     status TEXT NOT NULL CHECK (
@@ -41,7 +38,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 失败边新建的任务单独计数。
     max_attempts INTEGER NOT NULL DEFAULT 3,
     -- 直接依赖的任务 ID JSON 数组，引用同一 workflow_id 下的 task_id。
-    -- 用于依赖就绪判定、扇入合并、溯源及失败级联；空数组表示无直接依赖。
+    -- 用于依赖就绪判定、JOIN 合并、溯源及失败级联；空数组表示无直接依赖。
     depends_on_ids TEXT NOT NULL DEFAULT '[]'
         CHECK (json_valid(depends_on_ids) AND json_type(depends_on_ids) = 'array'),
     -- 节点声明的任务类型：normal 普通节点；join 汇合节点，额外检查静态前驱是否全部就绪。
@@ -66,13 +63,3 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(workflow_id, status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_tasks_recovery ON tasks(status, workflow_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_predecessors ON tasks(workflow_id, run_id, name, status);
-
--- 分开约束 NULL 与非 NULL 的 run，避免把 NULL 与有效 run_id（如 0）合并。
--- 未指定创建者使用独立的 0 键空间；有效任务 ID 必须为正数。单实例不受此唯一键约束。
-CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_fanout_instance
-ON tasks(workflow_id, run_id, COALESCE(producer_task_id, 0), name, instance_id)
-WHERE instance_id IS NOT NULL AND run_id IS NOT NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_fanout_instance_without_run
-ON tasks(workflow_id, COALESCE(producer_task_id, 0), name, instance_id)
-WHERE instance_id IS NOT NULL AND run_id IS NULL;

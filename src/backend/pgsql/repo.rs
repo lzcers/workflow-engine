@@ -10,7 +10,7 @@ use sqlx::PgPool;
 use super::rows::TaskRow;
 use crate::error::StorageError;
 use crate::task::{
-    FanoutInstances,
+    FanoutPlan,
     store::{LEASE_DURATION, merge_join_input},
 };
 use crate::{Task, TaskRecord, TaskStatus};
@@ -21,7 +21,7 @@ const WINDOW_EXPIRED_ERR: &str = "task execution window expired; retry budget ex
 
 /// 任务行 SELECT / RETURNING 列（顺序与表结构一致）。`pub`：消费方的业务查询
 /// 与同一张表交互时复用同一列序。
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, producer_task_id, name, instance_id, status, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_id, name, status, \
      claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
      input_json, output_json, error, created_at, updated_at";
 
@@ -163,182 +163,117 @@ async fn settle_in_tx(
     Ok(row.into())
 }
 
-/// 事务内入队后继实例：调用方先获取运行锁，单实例用行锁合并，多实例独立成行
-/// （同键经 `ON CONFLICT DO NOTHING` 去重），返回各行记录。供
-/// [`PgTaskRepo::enqueue_fanout`] 与原子结算方法共用，**不自行开事务/提交**。
+/// 事务内入队后继：普通任务逐条创建，JOIN 按运行和节点名累积依赖与输入。
+/// 调用方先获取运行锁，覆盖 JOIN 首次创建的窗口；本方法不自行开事务或提交。
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
     run_id: Option<i64>,
-    producer_task_id: Option<i64>,
+    parent_task_id: Option<i64>,
     name: &str,
-    instances: &[(Option<i32>, Value)],
+    inputs: &[Value],
     depends_on_ids: &[i64],
     task_type: &str,
     depends_on_names: &[String],
     max_attempts: i32,
 ) -> Result<Vec<TaskRecord>, StorageError> {
-    let mut rows = Vec::with_capacity(instances.len());
-    let select_cols = format!("SELECT {ROW_COLS}");
-    let return_cols = format!("RETURNING {ROW_COLS}");
+    let mut rows = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let existing = if task_type == "join" {
+            sqlx::query_as::<_, TaskRow>(&format!(
+                r#"
+                SELECT {ROW_COLS} FROM tasks
+                WHERE workflow_id = $1 AND name = $2
+                  AND run_id IS NOT DISTINCT FROM $3
+                  AND task_type = 'join' AND status IN ('pending', 'running')
+                ORDER BY task_id LIMIT 1 FOR UPDATE
+                "#
+            ))
+            .bind(workflow_id)
+            .bind(name)
+            .bind(run_id)
+            .fetch_optional(&mut **tx)
+            .await?
+        } else {
+            None
+        };
 
-    for (instance_id, input) in instances {
-        if let Some(instance_id) = instance_id {
-            // 多实例：独立插入一行。同键冲突（结算事务已提交但响应丢失后的重执行再入队）
-            // 时跳过——既有行保持，计数空跳产生的 id 空洞无害。
+        let row = if let Some(existing) = existing {
+            let mut dependencies = existing.depends_on_ids;
+            for &dependency in depends_on_ids {
+                if !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
+                }
+            }
+            let mut merged_input = existing.input_json;
+            merge_join_input(&mut merged_input, input);
+            sqlx::query_as::<_, TaskRow>(&format!(
+                r#"
+                UPDATE tasks
+                SET depends_on_ids = $3, input_json = $4::jsonb, updated_at = NOW()
+                WHERE workflow_id = $1 AND task_id = $2
+                RETURNING {ROW_COLS}
+                "#
+            ))
+            .bind(workflow_id)
+            .bind(existing.task_id)
+            .bind(&dependencies)
+            .bind(merged_input)
+            .fetch_one(&mut **tx)
+            .await?
+        } else {
+            let failed_predecessor = if task_type == "join" {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM tasks
+                        WHERE workflow_id = $1
+                          AND run_id IS NOT DISTINCT FROM $2
+                          AND name = ANY($3) AND status = 'failed'
+                    )
+                    "#,
+                )
+                .bind(workflow_id)
+                .bind(run_id)
+                .bind(depends_on_names)
+                .fetch_one(&mut **tx)
+                .await?
+            } else {
+                false
+            };
             let task_id = allocate_task_id(tx, workflow_id).await?;
-            let inserted: Option<TaskRow> = sqlx::query_as::<_, TaskRow>(&format!(
+            sqlx::query_as::<_, TaskRow>(&format!(
                 r#"
                 INSERT INTO tasks
-                    (workflow_id, task_id, run_id, name, instance_id, status, claimed_by, lease_until,
-                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
-                     output_json, error, created_at, updated_at, producer_task_id)
-                VALUES
-                    ($1, $2, $3, $4, $5, 'pending', NULL, NULL, 0, $6, $7, $8, $9, $10::jsonb,
-                     NULL, NULL, NOW(), NOW(), $11)
-                ON CONFLICT DO NOTHING
-                {return_cols}
+                    (workflow_id, task_id, run_id, name, status,
+                     attempt, max_attempts, task_type, depends_on_ids, depends_on_names,
+                     input_json, parent_task_id)
+                VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10::jsonb, $11)
+                RETURNING {ROW_COLS}
                 "#
             ))
             .bind(workflow_id)
             .bind(task_id)
             .bind(run_id)
             .bind(name)
-            .bind(*instance_id)
+            .bind(if failed_predecessor {
+                "failed"
+            } else {
+                "pending"
+            })
             .bind(max_attempts)
             .bind(task_type)
             .bind(depends_on_ids)
             .bind(depends_on_names)
             .bind(input)
-            .bind(producer_task_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            if let Some(row) = inserted {
-                rows.push(row.into());
-            }
-        } else {
-            // 单实例：扇入合并。
-            let existing: Option<TaskRow> = sqlx::query_as::<_, TaskRow>(&format!(
-                r#"
-                {select_cols}
-                FROM tasks
-                WHERE workflow_id = $1
-                  AND name = $2
-                  AND run_id IS NOT DISTINCT FROM $3
-                  AND instance_id IS NULL
-                  AND status IN ('pending', 'running')
-                ORDER BY task_id
-                LIMIT 1
-                FOR UPDATE
-                "#
-            ))
-            .bind(workflow_id)
-            .bind(name)
-            .bind(run_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-
-            let row = if let Some(existing) = existing {
-                // 扇入汇聚：并集 depends_on_ids，去重。
-                let mut merged = existing.depends_on_ids;
-                for &d in depends_on_ids {
-                    if !merged.contains(&d) {
-                        merged.push(d);
-                    }
-                }
-                // 仅 JOIN 任务做输入合并：把新到达的 `{前驱名: 贡献}` 并入已有 Map
-                // （同名 key 合并为数组）。普通节点输入是单一强类型，合并会破坏之，
-                // 故保持首个输入不变，只并 depends_on_ids。
-                let (set_cols, merged_input) = if task_type == "join" {
-                    let mut mi = existing.input_json.clone();
-                    merge_join_input(&mut mi, input);
-                    (
-                        "depends_on_ids = $3, input_json = $4::jsonb, ".to_string(),
-                        Some(mi),
-                    )
-                } else {
-                    ("depends_on_ids = $3, ".to_string(), None)
-                };
-                let sql = format!(
-                    r#"
-                    UPDATE tasks
-                    SET {set_cols}updated_at = NOW()
-                    WHERE workflow_id = $1 AND task_id = $2
-                    {return_cols}
-                    "#
-                );
-                let mut q = sqlx::query_as::<_, TaskRow>(&sql)
-                    .bind(workflow_id)
-                    .bind(existing.task_id)
-                    .bind(&merged);
-                if let Some(mi) = merged_input {
-                    q = q.bind(mi);
-                }
-                q.fetch_one(&mut **tx).await?
-            } else {
-                // 新建。JOIN 任务（task_type='join'）的静态前驱有已**永久失败**者
-                // （如前驱先失败、后继后入队）→ 直接以 failed 落库，否则会因等齐闸门
-                // 永远不齐而悬挂。普通节点不设等齐闸门，无需此判定。
-                let new_status = if task_type != "join" {
-                    "pending".to_string()
-                } else {
-                    let failed_pre: bool = sqlx::query_scalar(
-                        r#"
-                        SELECT EXISTS (
-                            SELECT 1 FROM tasks
-                            WHERE workflow_id = $1
-                              AND run_id IS NOT DISTINCT FROM $2
-                              AND name = ANY($3)
-                              AND status = 'failed'
-                        )
-                        "#,
-                    )
-                    .bind(workflow_id)
-                    .bind(run_id)
-                    .bind(depends_on_names)
-                    .fetch_one(&mut **tx)
-                    .await?;
-                    if failed_pre {
-                        "failed".to_string()
-                    } else {
-                        "pending".to_string()
-                    }
-                };
-                let task_id = allocate_task_id(tx, workflow_id).await?;
-                sqlx::query_as::<_, TaskRow>(&format!(
-                    r#"
-                    INSERT INTO tasks
-                        (workflow_id, task_id, run_id, name, instance_id, status, claimed_by, lease_until,
-                         attempt, max_attempts, task_type, depends_on_ids, depends_on_names, input_json,
-                         output_json, error, created_at, updated_at, producer_task_id)
-                    VALUES
-                        ($1, $2, $3, $4, NULL, $5, NULL, NULL, 0, $6, $7, $8, $9, $10::jsonb,
-                         NULL, NULL, NOW(), NOW(), $11)
-                    {return_cols}
-                    "#
-                ))
-                .bind(workflow_id)
-                .bind(task_id)
-                .bind(run_id)
-                .bind(name)
-                .bind(&new_status)
-                .bind(max_attempts)
-                .bind(task_type)
-                .bind(depends_on_ids)
-                .bind(depends_on_names)
-                .bind(input)
-                .bind(producer_task_id)
-                .fetch_one(&mut **tx)
-                .await?
-            };
-            rows.push(row.into());
-        }
+            .bind(parent_task_id)
+            .fetch_one(&mut **tx)
+            .await?
+        };
+        rows.push(row.into());
     }
-
-    // 任务就绪通知：与本次扇出同一事务，COMMIT 才投递（覆盖普通 fanout 与原子结算）。
     notify_tasks_ready(tx, workflow_id).await?;
-
     Ok(rows)
 }
 
@@ -416,15 +351,15 @@ impl PgTaskRepo {
             r#"
             INSERT INTO tasks
                 (
-                    workflow_id, task_id, run_id, name, instance_id, status,
+                    workflow_id, task_id, run_id, name, status,
                     claimed_by, lease_until, attempt, max_attempts, depends_on_ids, depends_on_names,
-                    input_json, output_json, error, created_at, updated_at, producer_task_id
+                    input_json, output_json, error, created_at, updated_at, parent_task_id
                 )
             VALUES
                 (
-                    $1, $2, $3, $4, $5, 'pending',
-                    NULL, NULL, 0, $6, $7, $8,
-                    $9::jsonb, NULL, NULL, NOW(), NOW(), $10
+                    $1, $2, $3, $4, 'pending',
+                    NULL, NULL, 0, $5, $6, $7,
+                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9
                 )
             RETURNING {ROW_COLS}
             "#
@@ -434,12 +369,11 @@ impl PgTaskRepo {
             .bind(task_id)
             .bind(task.run_id.unwrap_or(task_id))
             .bind(&task.name)
-            .bind(task.instance_id)
             .bind(task.max_attempts)
             .bind(&task.depends_on_ids)
             .bind(&task.depends_on_names)
             .bind(&task.input)
-            .bind(task.producer_task_id)
+            .bind(task.parent_task_id)
             .fetch_one(&mut **tx)
             .await?;
         Ok(row.into())
@@ -455,31 +389,17 @@ impl PgTaskRepo {
         Ok(row)
     }
 
-    /// 入队后继任务（统一 fanout 入口）。
-    ///
-    /// `instances` 为 `(instance_id, input)` 列表：
-    /// - `instance_id = None`：**单实例**（扇入合并）。若 `(workflow_id, run_id, name, NULL)`
-    ///   已有 pending/running 实例则做扇入合并（把 `depends_on_ids` 并集追加进现存任务的
-    ///   `depends_on_ids`，避免对同一后继重复入队）。运行级事务锁覆盖“查无记录再创建”的窗口，
-    ///   已有记录通过行锁合并。
-    /// - `instance_id = Some(i)`：**多实例**（map 边扇出的第 i 个实例），独立成行、互不合并；
-    ///   按 workflow、run、producer_task_id、name、instance_id 唯一，
-    ///   不同产生者的实例编号互不冲突；同键重入队经唯一键
-    ///   `ON CONFLICT DO NOTHING` 跳过。
-    ///
-    /// producer_task_id 记录首次创建者；单实例汇合匹配不按产生者隔离，合并时保留原值。
-    /// 全部实例在**同一事务**内分配连续 task_id 并插入/合并，返回每个实例的记录
-    /// （供扇出父一次性把实例全集登记进 JOIN 节点的 `depends_on_ids`；冲突跳过的实例不在内）。
-    /// `task_type` 为目标节点产出的任务类型（`normal`/`join`）；`depends_on_names` 为目标节点
-    /// 的静态前驱节点名全集（通用血缘，仅 `task_type = 'join'` 用作等齐前驱的认领闸门）。
+    /// 在同一事务中逐条入队输入；仅 JOIN 按运行和节点名汇合。
+    /// JOIN 保留首次创建时的 parent_task_id，累积执行依赖和输入。
+    /// 运行级事务锁覆盖首次创建窗口，已有 JOIN 通过行锁合并。
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_fanout(
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
-        producer_task_id: Option<i64>,
+        parent_task_id: Option<i64>,
         name: &str,
-        instances: &[(Option<i32>, Value)],
+        inputs: &[Value],
         depends_on_ids: &[i64],
         task_type: &str,
         depends_on_names: &[String],
@@ -495,9 +415,9 @@ impl PgTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
-            producer_task_id,
+            parent_task_id,
             name,
-            instances,
+            inputs,
             depends_on_ids,
             task_type,
             depends_on_names,
@@ -513,7 +433,7 @@ impl PgTaskRepo {
         &self,
         task: &TaskRecord,
         output: &Value,
-        fanouts: &[FanoutInstances],
+        fanouts: &[FanoutPlan],
         max_attempts: i32,
     ) -> Result<TaskRecord, StorageError> {
         // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
@@ -530,10 +450,10 @@ impl PgTaskRepo {
                 &task.workflow_id,
                 settled.run_id,
                 Some(task.task_id),
-                &f.name,
-                &f.instances,
+                f.dst,
+                &f.inputs,
                 &[task.task_id],
-                &f.task_type,
+                f.task_type,
                 &f.depends_on_names,
                 max_attempts,
             )
@@ -548,7 +468,7 @@ impl PgTaskRepo {
         &self,
         task: &TaskRecord,
         error: &str,
-        fanouts: &[FanoutInstances],
+        fanouts: &[FanoutPlan],
         max_attempts: i32,
     ) -> Result<(), StorageError> {
         // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
@@ -569,10 +489,10 @@ impl PgTaskRepo {
                 &task.workflow_id,
                 settled.run_id,
                 Some(task.task_id),
-                &f.name,
-                &f.instances,
+                f.dst,
+                &f.inputs,
                 &[],
-                &f.task_type,
+                f.task_type,
                 &f.depends_on_names,
                 max_attempts,
             )

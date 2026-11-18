@@ -49,8 +49,7 @@ pub struct Successor {
     pub dst: &'static str,
     /// 目标节点产出的任务类型（普通节点 / JOIN 门），入队时落库到 `task_type` 列。
     pub task_type: TaskType,
-    /// 喂给 `dst` 的输入列表。`len == 1` 为单实例（扇入合并）；`len > 1` 为 map 边扇出的
-    /// 多实例（每个输入各建一个独立任务实例）。
+    /// 喂给 `dst` 的输入列表。普通节点每条输入创建独立任务，JOIN 在同一运行内累积输入。
     pub inputs: Vec<Value>,
     /// 目标节点的静态前驱节点名全集（通用血缘，`String` 以便直接落库）。是否用其做
     /// 「等齐前驱」闸门由 `task_type` 决定（仅 [`TaskType::Join`] 生效）。
@@ -124,7 +123,7 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 规划 `name` 节点的成功后继：遍历其出成功边，`when` 命中后经 `map` 产出 dst 输入，
-    /// 并按 dst 聚合为批量后继（同 dst 的多条输入 = 扇出多实例）。
+    /// 并按 dst 聚合为批量后继，是否汇合由目标节点类型决定。
     ///
     /// 返回 [`Successor`] 列表：`when` 不命中或 `map` 返回空则无该项；无 `map` 时透传 `out`。
     /// 纯函数，不触碰 DB——只回答「该入队哪些后继、各喂什么输入（单条 or 多条）」。

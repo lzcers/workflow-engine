@@ -119,7 +119,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .await
         .unwrap();
     assert_eq!(root.run_id, Some(root.task_id));
-    assert_eq!(root.producer_task_id, None);
+    assert_eq!(root.parent_task_id, None);
     assert_eq!(other_root.run_id, Some(other_root.task_id));
     assert_ne!(root.run_id, other_root.run_id);
     let store = SqliteTaskStore::new(repo.clone()).with_max_attempts(5);
@@ -168,11 +168,10 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(tasks[0].output, Some(json!(1)));
 
     let mut workers: Vec<_> = tasks.iter().filter(|task| task.name == "worker").collect();
-    workers.sort_unstable_by_key(|task| task.instance_id);
+    workers.sort_unstable_by_key(|task| task.task_id);
     assert_eq!(workers.len(), 2);
-    for (worker, instance_id, input, output) in [(workers[0], 0, 1, 2), (workers[1], 1, 11, 12)] {
-        assert_eq!(worker.instance_id, Some(instance_id));
-        assert_eq!(worker.producer_task_id, Some(root.task_id));
+    for (worker, input, output) in [(workers[0], 1, 2), (workers[1], 11, 12)] {
+        assert_eq!(worker.parent_task_id, Some(root.task_id));
         assert_eq!(worker.input, json!(input));
         assert_eq!(worker.output, Some(json!(output)));
         assert_eq!(worker.depends_on_ids, [root.task_id]);
@@ -182,7 +181,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert_eq!(summary.input, json!(1));
     assert_eq!(summary.output, Some(json!(2)));
     assert_eq!(summary.depends_on_ids, [root.task_id]);
-    assert_eq!(summary.producer_task_id, Some(root.task_id));
+    assert_eq!(summary.parent_task_id, Some(root.task_id));
 
     assert_eq!(
         tasks.iter().filter(|task| task.name == "collect").count(),
@@ -190,7 +189,6 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     );
     let join = tasks.iter().find(|task| task.name == "collect").unwrap();
     assert_eq!(join.task_type, "join");
-    assert_eq!(join.instance_id, None);
     let mut predecessors = join.depends_on_names.clone();
     predecessors.sort();
     assert_eq!(predecessors, ["summary", "worker"]);
@@ -199,7 +197,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     let mut expected_ids = vec![workers[0].task_id, workers[1].task_id, summary.task_id];
     expected_ids.sort_unstable();
     assert_eq!(dependency_ids, expected_ids);
-    assert!(expected_ids.contains(&join.producer_task_id.unwrap()));
+    assert!(expected_ids.contains(&join.parent_task_id.unwrap()));
     let mut collected: Collected = serde_json::from_value(join.input.clone()).unwrap();
     collected.worker.sort_unstable();
     assert_eq!(collected.worker, [2, 12]);
@@ -208,7 +206,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
 
     let total = tasks.iter().find(|task| task.name == "total").unwrap();
     assert_eq!(total.depends_on_ids, [join.task_id]);
-    assert_eq!(total.producer_task_id, Some(join.task_id));
+    assert_eq!(total.parent_task_id, Some(join.task_id));
     assert_eq!(total.input, join.input);
     assert_eq!(total.output, Some(json!(16)));
 
@@ -234,7 +232,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
 }
 
 #[tokio::test]
-async fn two_level_fanout_executes_all_children_from_each_producer() {
+async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
     let database = Database::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();
     let pool = match &database {
@@ -252,10 +250,12 @@ async fn two_level_fanout_executes_all_children_from_each_producer() {
             start => AddOne,
             a => AddOne,
             b => AddOne,
+            c => AddOne,
         }
         edges {
             start -> a |> |output| vec![*output, *output + 10],
             a -> b |> |output| vec![*output, *output + 100],
+            b -> c,
         }
     }
     .unwrap();
@@ -273,42 +273,49 @@ async fn two_level_fanout_executes_all_children_from_each_producer() {
         tokio::select! {
             _ = scheduler.run() => panic!("scheduler must run until cancelled"),
             _ = async {
-                for _ in 0..7 {
+                for _ in 0..11 {
                     completions.recv().await.expect("every task completes");
                 }
             } => {}
         }
     })
     .await
-    .expect("root, two A tasks and four B tasks all execute");
+    .expect("root, two A tasks, four B tasks and four C tasks all execute");
 
     let tasks = repo.list_all("nested-fanout").await.unwrap();
-    assert_eq!(tasks.len(), 7);
+    assert_eq!(tasks.len(), 11);
     assert!(tasks.iter().all(|task| task.run_id == root.run_id
         && task.status == TaskStatus::Succeeded
         && task.attempt == 1));
     let mut parents: Vec<_> = tasks.iter().filter(|task| task.name == "a").collect();
-    parents.sort_unstable_by_key(|task| task.instance_id);
+    parents.sort_unstable_by_key(|task| task.task_id);
     assert_eq!(parents.len(), 2);
     assert_eq!(tasks.iter().filter(|task| task.name == "b").count(), 4);
-    for (parent, parent_index, parent_input) in [(parents[0], 0, 1), (parents[1], 1, 11)] {
-        assert_eq!(parent.producer_task_id, Some(root.task_id));
-        assert_eq!(parent.instance_id, Some(parent_index));
+    assert_eq!(tasks.iter().filter(|task| task.name == "c").count(), 4);
+    for (parent, parent_input) in [(parents[0], 1), (parents[1], 11)] {
+        assert_eq!(parent.parent_task_id, Some(root.task_id));
         assert_eq!(parent.input, json!(parent_input));
         let mut children: Vec<_> = tasks
             .iter()
-            .filter(|task| task.name == "b" && task.producer_task_id == Some(parent.task_id))
+            .filter(|task| task.name == "b" && task.parent_task_id == Some(parent.task_id))
             .collect();
-        children.sort_unstable_by_key(|task| task.instance_id);
+        children.sort_unstable_by_key(|task| task.task_id);
         assert_eq!(children.len(), 2, "each A must produce its own two B tasks");
-        for (child, index, input) in [
-            (children[0], 0, parent_input + 1),
-            (children[1], 1, parent_input + 101),
+        for (child, input) in [
+            (children[0], parent_input + 1),
+            (children[1], parent_input + 101),
         ] {
-            assert_eq!(child.instance_id, Some(index));
             assert_eq!(child.depends_on_ids, [parent.task_id]);
             assert_eq!(child.input, json!(input));
             assert_eq!(child.output, Some(json!(input + 1)));
+            let successors: Vec<_> = tasks
+                .iter()
+                .filter(|task| task.name == "c" && task.parent_task_id == Some(child.task_id))
+                .collect();
+            assert_eq!(successors.len(), 1);
+            assert_eq!(successors[0].depends_on_ids, [child.task_id]);
+            assert_eq!(successors[0].input, json!(input + 1));
+            assert_eq!(successors[0].output, Some(json!(input + 2)));
         }
     }
     database.close().await;
@@ -352,9 +359,8 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     let mut task = Task {
         workflow_id: "scheduler-wake".into(),
         run_id: None,
-        producer_task_id: None,
+        parent_task_id: None,
         name: "slow".into(),
-        instance_id: None,
         max_attempts: 3,
         depends_on_ids: vec![],
         depends_on_names: vec![],

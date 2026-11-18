@@ -60,7 +60,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert_eq!(other.task_id, 1, "task IDs are scoped to each workflow");
     assert_eq!(other.run_id, Some(other.task_id));
     assert_eq!(first.name, "root");
-    assert_eq!(first.producer_task_id, None);
+    assert_eq!(first.parent_task_id, None);
     assert_eq!(first.input, input.input);
     assert_eq!(first.status, TaskStatus::Pending);
     assert_eq!(first.task_type, "normal");
@@ -112,15 +112,13 @@ async fn claims_require_all_dependencies_including_missing_ids() {
     let root = repo.enqueue(&new_task("deps", "root")).await.unwrap();
     let mut child = new_task("deps", "child");
     child.run_id = root.run_id;
-    child.instance_id = Some(2);
-    child.producer_task_id = Some(root.task_id);
+    child.parent_task_id = Some(root.task_id);
     child.max_attempts = 5;
     child.depends_on_ids = vec![root.task_id];
     child.depends_on_names = vec!["root".into()];
     let child = repo.enqueue(&child).await.unwrap();
     assert_eq!(child.run_id, root.run_id);
-    assert_eq!(child.instance_id, Some(2));
-    assert_eq!(child.producer_task_id, Some(root.task_id));
+    assert_eq!(child.parent_task_id, Some(root.task_id));
     assert_eq!(child.max_attempts, 5);
     assert_eq!(child.depends_on_ids, [root.task_id]);
     assert_eq!(child.depends_on_names, ["root"]);
@@ -269,7 +267,7 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
 }
 
 #[tokio::test]
-async fn join_merges_across_producers_and_waits_for_all_predecessors() {
+async fn join_merges_across_parents_and_waits_for_all_predecessors() {
     let (_, repo) = memory_repo().await;
     let images = repo
         .enqueue_fanout(
@@ -277,7 +275,7 @@ async fn join_merges_across_producers_and_waits_for_all_predecessors() {
             Some(1),
             None,
             "image",
-            &[(Some(0), json!("a")), (Some(1), json!("b"))],
+            &[json!("a"), json!("b")],
             &[],
             "normal",
             &[],
@@ -329,7 +327,7 @@ async fn join_merges_across_producers_and_waits_for_all_predecessors() {
         .into_iter()
         .find(|task| task.name == "collect")
         .unwrap();
-    assert_eq!(join.producer_task_id, Some(claimed[0].task_id));
+    assert_eq!(join.parent_task_id, Some(claimed[0].task_id));
     assert!(
         repo.claim_many("join", "worker", 10)
             .await
@@ -345,7 +343,7 @@ async fn join_merges_across_producers_and_waits_for_all_predecessors() {
         .await
         .unwrap();
     let merged = get(&repo, &join).await;
-    assert_eq!(merged.producer_task_id, Some(claimed[0].task_id));
+    assert_eq!(merged.parent_task_id, Some(claimed[0].task_id));
     assert_eq!(merged.input, json!({"image": ["a", "b"]}));
     assert_eq!(
         merged.depends_on_ids,
@@ -379,7 +377,6 @@ async fn join_merges_across_producers_and_waits_for_all_predecessors() {
     let claimed = repo.claim_many("join", "worker", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, join.task_id);
-    assert_eq!(claimed[0].instance_id, None);
     assert_eq!(
         claimed[0].input,
         json!({"image": ["a", "b"], "text": "text"})
@@ -410,7 +407,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
                 run_id,
                 Some(11),
                 "collect",
-                &[(None, json!({"image": "first"}))],
+                &[json!({"image": "first"})],
                 &[11],
                 "join",
                 &["image".into()],
@@ -425,7 +422,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
                 run_id,
                 Some(12),
                 "collect",
-                &[(None, json!({"image": ["second", "third"]}))],
+                &[json!({"image": "second"}), json!({"image": ["third"]})],
                 &[11, 12],
                 "join",
                 &["image".into()],
@@ -433,9 +430,10 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             )
             .await
             .unwrap()
-            .remove(0);
+            .pop()
+            .unwrap();
         assert_eq!(merged.task_id, first.task_id);
-        assert_eq!(merged.producer_task_id, Some(11));
+        assert_eq!(merged.parent_task_id, Some(11));
         assert_eq!(merged.run_id, run_id);
         assert_eq!(merged.depends_on_ids, [11, 12]);
         assert_eq!(merged.input, json!({"image": ["first", "second", "third"]}));
@@ -450,7 +448,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
             None,
             Some(1),
             "normal",
-            &[(None, json!({"first": true}))],
+            &[json!({"first": true})],
             &[1],
             "normal",
             &[],
@@ -459,13 +457,13 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .await
         .unwrap()
         .remove(0);
-    let merged = repo
+    let second = repo
         .enqueue_fanout(
             "fanin",
             None,
             Some(2),
             "normal",
-            &[(None, json!({"second": true}))],
+            &[json!({"second": true})],
             &[2, 1],
             "normal",
             &[],
@@ -474,71 +472,13 @@ async fn fanin_accumulates_join_inputs_and_isolates_null_and_numbered_runs() {
         .await
         .unwrap()
         .remove(0);
-    assert_eq!(merged.task_id, first.task_id);
-    assert_eq!(merged.producer_task_id, Some(1));
-    assert_eq!(
-        merged.input, first.input,
-        "normal nodes keep their typed initial input"
-    );
-    assert_eq!(merged.depends_on_ids, [1, 2]);
-}
-
-#[tokio::test]
-async fn map_enqueue_deduplicates_per_producer_even_after_settlement() {
-    let (_, repo) = memory_repo().await;
-    for run_id in [None, Some(-1), Some(0), Some(1)] {
-        for producer_task_id in [None, Some(10), Some(11)] {
-            let instances = [
-                (Some(0), json!({"producer": producer_task_id, "value": 0})),
-                (Some(1), json!({"producer": producer_task_id, "value": 1})),
-            ];
-            let inserted = repo
-                .enqueue_fanout(
-                    "map",
-                    run_id,
-                    producer_task_id,
-                    "image",
-                    &instances,
-                    &[],
-                    "normal",
-                    &[],
-                    3,
-                )
-                .await
-                .unwrap();
-            assert_eq!(inserted.len(), 2);
-            for (task, (instance_id, input)) in inserted.iter().zip(&instances) {
-                assert_eq!(task.producer_task_id, producer_task_id);
-                assert_eq!(task.instance_id, *instance_id);
-                assert_eq!(&task.input, input);
-            }
-            let claim = repo
-                .claim_many("map", "worker", 10)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|task| task.task_id == inserted[0].task_id)
-                .unwrap();
-            repo.succeed(&claim, &json!({})).await.unwrap();
-            let duplicate = repo
-                .enqueue_fanout(
-                    "map",
-                    run_id,
-                    producer_task_id,
-                    "image",
-                    &instances,
-                    &[],
-                    "normal",
-                    &[],
-                    3,
-                )
-                .await
-                .unwrap();
-            assert!(duplicate.is_empty());
-            assert_eq!(get(&repo, &inserted[0]).await.status, TaskStatus::Succeeded);
-        }
-    }
-    assert_eq!(repo.list_all("map").await.unwrap().len(), 24);
+    assert_ne!(second.task_id, first.task_id);
+    assert_eq!(first.parent_task_id, Some(1));
+    assert_eq!(second.parent_task_id, Some(2));
+    assert_eq!(first.input, json!({"first": true}));
+    assert_eq!(second.input, json!({"second": true}));
+    assert_eq!(first.depends_on_ids, [1]);
+    assert_eq!(second.depends_on_ids, [2, 1]);
 }
 
 #[tokio::test]
@@ -573,9 +513,20 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         .await
         .unwrap();
     store
-        .settle_success(&claimed, &json!({"done": true}), &[valid])
+        .settle_success(
+            &claimed,
+            &json!({"done": true}),
+            std::slice::from_ref(&valid),
+        )
         .await
         .unwrap();
+    assert!(matches!(
+        store
+            .settle_success(&claimed, &json!({"done": true}), &[valid])
+            .await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+    assert_eq!(repo.list_all("atomic_success").await.unwrap().len(), 3);
     let settled = get(&repo, &claimed).await;
     assert_eq!(settled.run_id, Some(9));
     assert_eq!(settled.status, TaskStatus::Succeeded);
@@ -585,16 +536,14 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         .await
         .unwrap();
     assert_eq!(children.len(), 2);
+    assert_ne!(children[0].task_id, children[1].task_id);
     assert_eq!(
-        children
-            .iter()
-            .map(|t| t.instance_id)
-            .collect::<HashSet<_>>(),
-        HashSet::from([Some(0), Some(1)])
+        children.iter().map(|task| &task.input).collect::<Vec<_>>(),
+        [&json!("a"), &json!("b")]
     );
     for child in children {
         assert_eq!(child.run_id, Some(9));
-        assert_eq!(child.producer_task_id, Some(task.task_id));
+        assert_eq!(child.parent_task_id, Some(task.task_id));
         assert_eq!(child.depends_on_ids, [task.task_id]);
         assert_eq!(child.max_attempts, 7);
     }
@@ -658,8 +607,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
         .unwrap()
         .remove(0);
     assert_eq!(recovery.name, "recovery");
-    assert_eq!(recovery.instance_id, None);
-    assert_eq!(recovery.producer_task_id, Some(task.task_id));
+    assert_eq!(recovery.parent_task_id, Some(task.task_id));
     assert_eq!(recovery.run_id, Some(4));
     assert!(recovery.depends_on_ids.is_empty());
     store.settle_failure(&recovery, message, &[]).await.unwrap();
@@ -688,7 +636,7 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
     let successors = store.claim_many("same_name", "worker", 1).await.unwrap();
     assert_eq!(successors.len(), 1);
     assert_ne!(successors[0].task_id, source.task_id);
-    assert_eq!(successors[0].producer_task_id, Some(source.task_id));
+    assert_eq!(successors[0].parent_task_id, Some(source.task_id));
     assert_eq!(successors[0].input, json!({"retry": true}));
     assert!(successors[0].depends_on_ids.is_empty());
 }
@@ -742,7 +690,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
             root.run_id,
             None,
             "join",
-            &[(None, json!({}))],
+            &[json!({})],
             &[],
             "join",
             &["root".into()],
@@ -757,7 +705,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
             Some(0),
             None,
             "join",
-            &[(None, json!({}))],
+            &[json!({})],
             &[],
             "join",
             &["root".into()],
@@ -817,7 +765,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
             root.run_id,
             None,
             "late_join",
-            &[(None, json!({}))],
+            &[json!({})],
             &[],
             "join",
             &["root".into()],
@@ -856,7 +804,7 @@ async fn cascade_matches_runs_for_named_and_direct_dependencies() {
                     run_id,
                     None,
                     "join",
-                    &[(None, json!({}))],
+                    &[json!({})],
                     &[],
                     "join",
                     &["root".into()],
@@ -1140,7 +1088,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
                     None,
                     Some(n),
                     "collect",
-                    &[(None, json!({"worker": n}))],
+                    &[json!({"worker": n})],
                     &[n],
                     "join",
                     &["worker".into()],

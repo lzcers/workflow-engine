@@ -21,7 +21,7 @@
 
 `run_id` 标识一次提交产生的运行，`worker_id` 标识一次调度循环。一次调度循环生成一个
 UUID 作为 `worker_id`，可以处理同一 `workflow_id` 下多个不同 `run_id` 的任务。
-不同运行的扇入与 JOIN 判定由存储隔离。
+不同运行的 JOIN 汇合与前驱判定由存储隔离。
 
 并发上限属于 Scheduler 实例。一个 Workflow 的所有运行共享默认 8 个槽；若为同一个
 `workflow_id` 创建多个实例，每个实例都有自己的额度，8 不是跨实例或跨进程的全局上限。
@@ -41,7 +41,7 @@ UUID 作为 `worker_id`，可以处理同一 `workflow_id` 下多个不同 `run_
 提交失败也不影响已经启动的调度器。所有运行共享构造时启动的同一个后台任务。
 
 存储统一使用 `enqueue(Task)` 入队：`run_id = None` 时以新任务的 `task_id` 创建独立运行，
-`Some(id)` 时加入指定运行，依赖、实例编号和尝试预算沿用 Task 的字段。
+`Some(id)` 时加入指定运行，父任务、依赖和尝试预算沿用 Task 的字段。
 运行身份在 INSERT 时直接写入，不需要先插入任务再回填。
 
 Workflow 持有图与存储的共享句柄，Engine 释放不影响它。执行期间需要保留 Workflow；

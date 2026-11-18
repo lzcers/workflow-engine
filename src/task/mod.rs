@@ -4,4 +4,4 @@ mod record;
 pub(crate) mod store;
 
 pub use record::{Task, TaskRecord, TaskStatus};
-pub(crate) use store::{FanoutInstances, FanoutPlan, TaskStore};
+pub(crate) use store::{FanoutPlan, TaskStore};

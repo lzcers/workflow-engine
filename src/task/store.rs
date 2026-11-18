@@ -20,46 +20,11 @@ pub struct FanoutPlan {
     pub dst: &'static str,
     /// 目标节点产出的任务类型（`normal` / `join`），落库到 `task_type` 列。
     pub task_type: &'static str,
-    /// 喂给目标节点的输入列表：`len == 1` 单实例（扇入合并）；`len > 1` map 边扇出的
-    /// 多实例（每个 input 各建一个独立任务实例，互不合并）。
+    /// 喂给目标节点的输入列表：普通节点每条输入创建独立任务，JOIN 在同一运行内累积输入。
+    /// 空列表不创建任务。
     pub inputs: Vec<Value>,
     /// 目标节点的静态前驱节点名全集（仅 `task_type = join` 时用作等齐前驱的认领闸门）。
     pub depends_on_names: Vec<String>,
-}
-
-/// 一条后继入队计划（原子结算方法专用）：目标节点名、任务类型、实例列表、静态前驱名集。
-/// 各持久化后端在结算事务中使用同一模型。
-#[derive(Debug, Clone)]
-pub struct FanoutInstances {
-    /// 目标节点名。
-    pub name: String,
-    /// 目标节点产出的任务类型（`normal` / `join`），落库到 `task_type` 列。
-    pub task_type: String,
-    /// `(instance_id, input)` 实例列表：`None` = 单实例（扇入合并）；`Some(i)` = 第 i 个多实例。
-    pub instances: Vec<(Option<i32>, Value)>,
-    /// 目标节点的静态前驱节点名全集（仅 `task_type = 'join'` 用作等齐前驱的认领闸门）。
-    pub depends_on_names: Vec<String>,
-}
-
-impl From<&FanoutPlan> for FanoutInstances {
-    /// 单条输入参与扇入合并；多条输入按顺序编号为独立实例；空输入不创建实例。
-    fn from(plan: &FanoutPlan) -> Self {
-        let instances = if plan.inputs.len() == 1 {
-            vec![(None, plan.inputs[0].clone())]
-        } else {
-            plan.inputs
-                .iter()
-                .enumerate()
-                .map(|(i, input)| (Some(i as i32), input.clone()))
-                .collect()
-        };
-        Self {
-            name: plan.dst.to_string(),
-            task_type: plan.task_type.to_string(),
-            instances,
-            depends_on_names: plan.depends_on_names.clone(),
-        }
-    }
 }
 
 /// 将前驱贡献合并到 JOIN 的累积对象；同名 key 合为数组，已有数组及新贡献数组按元素追加。
@@ -104,7 +69,7 @@ pub trait TaskStore: Sync {
 
     /// 原子入队任务并确定运行身份，返回已持久化的任务快照。
     /// run_id 为 None 时，以新分配的 task_id 创建独立运行；Some(id) 则保留指定运行。
-    /// 依赖、实例编号和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
+    /// 父任务、依赖和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
@@ -134,13 +99,12 @@ pub trait TaskStore: Sync {
     ///
     /// 必须校验当前有效认领且 attempt <= max_attempts；旧执行者和仅用于最终失败的认领不能提交成功。
     /// 成功后继依赖源任务，并继承结算时最新的任务身份（如 `run_id`）。
-    /// 后继实例按 [`FanoutInstances::from`] 转换；单实例按同一 workflow、run、节点名
-    /// 汇入已有 pending / running 任务，依赖 ID 取去重并集。JOIN 输入通过
-    /// [`merge_join_input`] 累积，普通任务保留首个输入。
-    /// 新任务的 producer_task_id 为源任务 ID；多实例按 workflow、run、创建者、节点名、
-    /// 实例序号去重。单实例汇合不按创建者隔离，合并后保留首个创建者。
+    /// 普通后继每条输入创建独立任务。JOIN 按同一 workflow、run、节点名汇入已有
+    /// pending / running JOIN，依赖 ID 取去重并集，输入通过 [`merge_join_input`] 累积。
+    /// 新任务的 parent_task_id 为源任务 ID；JOIN 合并后保留首次创建时的父任务 ID。
     /// 前驱成功、依赖累积、JOIN 输入合并与后继创建必须在同一事务提交，且并发首次
-    /// 汇入不能创建重复单实例。新建单实例 JOIN 如已有静态前驱永久 failed，应直接标记 failed。
+    /// 汇入不能创建重复 JOIN。认领校验与原子结算保证同一父任务不会重复生成后继。
+    /// 新建 JOIN 如已有静态前驱永久 failed，应直接标记 failed。
     fn settle_success<'a>(
         &'a self,
         task: &'a TaskRecord,
@@ -153,7 +117,7 @@ pub trait TaskStore: Sync {
     /// `successors` 非空时标记 `superseded`，失败后继不依赖源任务；为空时标记 `failed`，
     /// 并将同一工作流、同一 run 内直接依赖该任务 ID 或节点名的已有 pending 任务标记失败。
     /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
-    /// 失败后继仍以源任务 ID 记录 producer_task_id，使用与成功后继相同的多实例去重规则。
+    /// 失败后继仍以源任务 ID 记录 parent_task_id，使用与成功后继相同的创建和 JOIN 汇合规则。
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn settle_failure<'a>(
         &'a self,
