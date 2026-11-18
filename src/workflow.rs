@@ -1,47 +1,43 @@
 //! 单图工作流实例：创建时启动后台调度器，提交独立运行并唤醒认领。
 
-use std::{sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc, time::Duration};
 
 use serde::Serialize;
 use tokio::{sync::Notify, task::JoinHandle};
 
 use crate::error::StorageError;
+use crate::graph::ErasedGraph;
 use crate::scheduler::Scheduler;
 use crate::task::TaskStore;
 use crate::{EngineError, Graph, NodeContext, Task, Trigger};
 
-/// 一张固定图的工作流实例，由 [`crate::Engine::make`] 创建。
+/// 一张固定图的非泛型工作流句柄，由 [`crate::Engine::make`] 创建。
 ///
 /// 创建时启动后台调度器，处理当前图的存量任务与后续提交；每次 submit 创建独立的 run_id。
-/// 工作流拥有图与存储的共享句柄，可在创建它的 Engine 释放后继续使用。
+/// 与后台调度器共享同一个图对象，通过 graph / graph_as 访问图及其具体上下文。
+/// 不同上下文的图返回同一种句柄，可在创建它的 Engine 释放后继续使用。
 /// 执行期间需保留此实例；丢弃 Workflow 会取消调度器及在途任务。
-pub struct Workflow<Ctx>
-where
-    Ctx: NodeContext + Sync + 'static,
-{
-    graph: Arc<Graph<Ctx>>,
+pub struct Workflow {
+    graph: Arc<dyn ErasedGraph>,
     store: Arc<dyn TaskStore<Error = StorageError> + Send>,
     worker: JoinHandle<()>,
     wake: Arc<Notify>,
 }
 
-impl<Ctx> Drop for Workflow<Ctx>
-where
-    Ctx: NodeContext + Sync + 'static,
-{
+impl Drop for Workflow {
     fn drop(&mut self) {
         self.worker.abort();
     }
 }
 
-impl<Ctx> Workflow<Ctx>
-where
-    Ctx: NodeContext + Sync + 'static,
-{
-    pub(crate) fn new(
+impl Workflow {
+    pub(crate) fn new<Ctx>(
         graph: Graph<Ctx>,
         store: Arc<dyn TaskStore<Error = StorageError> + Send>,
-    ) -> Self {
+    ) -> Self
+    where
+        Ctx: NodeContext + Sync + 'static,
+    {
         let graph = Arc::new(graph);
         let wake = Arc::new(Notify::new());
         let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_secs(1))
@@ -55,6 +51,16 @@ where
             worker,
             wake,
         }
+    }
+
+    /// 访问与调度器共享的原始图，可查询身份、描述、节点类型和触发声明。
+    pub fn graph(&self) -> &dyn ErasedGraph {
+        self.graph.as_ref()
+    }
+
+    /// 取回原始 Graph<Ctx> 的借用；上下文类型不匹配时返回 None。
+    pub fn graph_as<Ctx: 'static>(&self) -> Option<&Graph<Ctx>> {
+        (self.graph() as &dyn Any).downcast_ref()
     }
 
     /// 获取全部外部触发节点的名称与注册声明，按节点名排序。

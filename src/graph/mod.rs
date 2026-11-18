@@ -13,6 +13,7 @@ use super::node::{AnyNode, TypeFingerprint};
 
 mod builder;
 mod description;
+mod erased;
 
 pub use crate::edge::{
     EdgeError, EdgeImpl, ErrorWhenBuilder, FailureEdge, FailureEdgeImpl, SuccessEdge, WhenBuilder,
@@ -21,6 +22,7 @@ pub use crate::edge::{
 pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
 pub use builder::GraphBuilder;
 pub use description::{EdgeDescription, EdgeKind, GraphDescription, NodeDescription};
+pub use erased::ErasedGraph;
 
 /// 节点实例与注册时的展示信息共用一条记录，保证描述对应实际执行的节点。
 struct GraphNode<Ctx> {
@@ -85,7 +87,7 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 入队时使用目标节点声明的任务类型；不存在的入口由调用方报告。
-    pub(crate) fn task_type_of(&self, name: &str) -> Option<TaskType> {
+    pub fn task_type_of(&self, name: &str) -> Option<TaskType> {
         self.nodes.get(name).map(|entry| entry.node.task_type())
     }
 

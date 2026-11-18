@@ -7,7 +7,7 @@
 
 - 公共 API 围绕 `graph`、`engine`、`workflow`、`task` 和 `dsl` 组织；节点、上下文与建边接口属于图定义。
 - 通过 `Engine` 使用数据库，默认启用 SQLite；`pg` / `sqlite` feature 只选择后端，至少启用一个，也可同时启用。
-- 通过 `Engine::new(url).await` 创建可复用引擎，再用 `engine.make(graph)` 创建 `Workflow<Ctx>` 实例并启动后台调度。
+- 通过 `Engine::new(url).await` 创建可复用引擎，再用 `engine.make(graph)` 创建非泛型 `Workflow` 句柄并启动后台调度。
 - `Workflow::submit` 创建独立运行并唤醒调度器；数据库连接、任务存储、后端仓储和调度器由库内部管理。
 
 ## 公共模块
@@ -16,7 +16,7 @@
 | --- | --- |
 | [`graph`](src/graph) | `Graph`、构图接口、节点 `Node`、上下文 `NodeContext`、`JoinNode`、成功/失败边与图描述 |
 | [`engine`](src/engine.rs) | `Engine` 按 URL 初始化共享存储，通过 `make` 为不同的图创建工作流实例；`EngineError` 描述初始化与提交错误 |
-| [`workflow`](src/workflow.rs) | 单图 `Workflow<Ctx>` 提交独立运行并自动执行，返回 `RunHandle` |
+| [`workflow`](src/workflow.rs) | 单图 `Workflow` 提交独立运行并自动执行，返回 `RunHandle` |
 | [`task`](src/task) | 任务输入 `Task`、任务快照 `TaskRecord` 与状态 `TaskStatus` |
 | [`dsl`](src/dsl.rs) | `workflow!` 宏将 `nodes { … }` 和 `edges { … }` 展开为图构建链，并做编译期类型接线校验 |
 
@@ -46,9 +46,14 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 ## 引擎与工作流实例
 
 `Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享任务存储。
-`engine.make(graph)` 根据图定义创建 `Workflow<Ctx>`，构造时立即启动一个后台调度器，
+`engine.make(graph)` 接收 `Graph<Ctx>` 并返回非泛型的 `Workflow`，构造时立即启动一个后台调度器，
 因此必须在 Tokio runtime 内调用。调度器会认领当前图已有的可执行任务，无需先提交新运行。
 同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有独立的调度器。
+`Workflow` 通过 `Arc<dyn ErasedGraph>` 与后台调度器共享同一个 `Graph<Ctx>`，
+节点执行仍保留类型约束。宿主可以直接将不同上下文的工作流放入同一集合，
+并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型和触发声明。
+需要具体上下文或其他图操作时，调用 `workflow.graph_as::<Ctx>()` 获取 `Option<&Graph<Ctx>>`；
+类型不匹配返回 `None`。图访问直接读取共享对象，不保存独立的节点类型或触发配置副本。
 不同图定义应使用不同的 `workflow_id`。
 
 ```rust,no_run
@@ -64,6 +69,8 @@ where
 {
     let engine = Engine::new("sqlite://workflow.db").await?;
     let workflow = engine.make(graph);
+    let description = workflow.graph().describe();
+    let context: &Ctx = workflow.graph_as::<Ctx>().expect("original context type").context();
     // 创建 run_id 并唤醒调度器，返回时不等待运行结束。
     let run = workflow.submit("entry", input).await?;
     // 当前为空方法，不返回实际运行状态。

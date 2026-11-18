@@ -262,9 +262,24 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
     .node("start", AddOne)
     .build()
     .unwrap();
-    let first = engine.make(first_graph);
-    let second = engine.make(second_graph);
+    let first_description = first_graph.describe();
+    let [first, second] = [engine.make(first_graph), engine.make(second_graph)];
     drop(engine);
+    assert_eq!(first.graph().workflow_id(), "first");
+    assert_eq!(first.graph().title(), "First");
+    assert_eq!(first.graph().describe(), first_description);
+    assert_eq!(first.graph().task_type_of("start"), Some(TaskType::Normal));
+    assert_eq!(first.graph().task_type_of("missing"), None);
+    let first_graph = first.graph_as::<Context>().expect("original context type");
+    assert_eq!(first_graph.describe(), first_description);
+    assert!(first_graph.context().completed.is_some());
+    assert!(first.graph_as::<OtherContext>().is_none());
+    assert!(second.graph_as::<Context>().is_none());
+    let second_graph = second
+        .graph_as::<OtherContext>()
+        .expect("second workflow retains its own graph type");
+    assert_eq!(second_graph.workflow_id(), "second");
+    assert!(second_graph.context().0.completed.is_some());
     let first_run = first.submit("start", 10).await.unwrap();
     let another_run = first.submit("alternate", 20).await.unwrap();
     let second_run = second.submit("start", 30).await.unwrap();
