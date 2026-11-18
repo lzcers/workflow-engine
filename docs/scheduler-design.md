@@ -1,7 +1,7 @@
 # Scheduler 设计与调度流程
 
-本文描述当前实现：`Workflow::submit` 创建独立运行并自动驱动调度器，
-`Scheduler::run()` 持续执行，生命周期由所属实例管理。
+本文描述当前实现：`Engine::make(graph)` 创建工作流实例并立即启动调度器，
+`Workflow::submit` 创建独立运行并唤醒认领。`Scheduler::run()` 持续执行，生命周期由所属实例管理。
 
 核心代码：[Scheduler](../src/scheduler.rs)、[Workflow](../src/workflow.rs)、
 [TaskStore](../src/task/store.rs)、[Graph](../src/graph/mod.rs)。
@@ -13,7 +13,7 @@
 
 | 组件 | 职责 |
 | --- | --- |
-| `Workflow` | 提交入口任务、首次提交时启动后台调度器、唤醒认领、随实例释放取消后台任务 |
+| `Workflow` | 构造时启动后台调度器、提交入口任务、唤醒认领、随实例释放取消后台任务 |
 | `Scheduler` | 计算空闲槽、批量认领、并发执行、准备阶段续租、调用存储结算及异常释放 |
 | `Graph` | 提供节点与上下文，执行节点钩子和业务逻辑，规划成功或失败后继 |
 | `TaskStore` | 原子创建运行，筛选可认领任务，校验认领归属，原子提交状态与后继 |
@@ -27,21 +27,21 @@ UUID 作为 `worker_id`，可以处理同一 `workflow_id` 下多个不同 `run_
 `workflow_id` 创建多个实例，每个实例都有自己的额度，8 不是跨实例或跨进程的全局上限。
 存储通过认领凭据防止旧执行者覆盖新认领的结果。
 
-## 从提交到启动
+## 实例启动与提交
 
-`Engine::make(graph)` 构造 Workflow 和 Scheduler，此时不启动调度。
+`Engine::make(graph)` 构造 Workflow 和 Scheduler，并启动一次后台 `scheduler.run()`。
+因此 `make` 必须在 Tokio runtime 内调用。调度器开始认领该图已有的可执行任务，无需先提交新运行。
 每次 `Workflow::submit(entry, input)` 按以下顺序执行：
 
 1. 检查入口节点存在，将输入序列化为 JSON。节点 `In` 类型的反序列化检查留到实际执行阶段。
 2. 调用 `TaskStore::create_run`，在同一事务内分配 `run_id` 并保存入口任务。
-3. 通过 `OnceLock` 确保本实例只启动一次后台 `scheduler.run()`；并发提交不会重复启动。
-4. 调用共享 `Notify::notify_one()` 唤醒认领，返回包含 `workflow_id`、`run_id` 和入口 `task_id` 的 `RunHandle`。
+3. 调用共享 `Notify::notify_one()` 唤醒认领，返回包含 `workflow_id`、`run_id` 和入口 `task_id` 的 `RunHandle`。
 
-成功返回表示入口任务已持久化并安排执行，不等待节点完成。首次提交失败不会启动调度器。
-启动后的调度器会认领当前图已有的可执行任务，而非仅执行触发启动的那次提交。
+成功返回表示入口任务已持久化并安排执行，不等待节点完成。提交不会创建调度器，
+提交失败也不影响已经启动的调度器。所有运行共享构造时启动的同一个后台任务。
 
 Workflow 持有图与存储的共享句柄，Engine 释放不影响它。执行期间需要保留 Workflow；
-实例释放会通过 `Worker::drop` 中止后台任务，继而取消调度器的在途任务。
+实例释放会通过 `Workflow::drop` 中止后台任务，继而取消调度器的在途任务。
 `RunHandle` 只保存运行身份，持有它不会延长 Workflow 的生命周期。
 
 ## 主调度循环：按空槽补充任务
@@ -79,10 +79,10 @@ flowchart TD
 同时就绪时，选择顺序是任务完成、通知、轮询。满槽时不轮询，也不消耗就绪通知；
 有槽时，即使其他节点很慢，通知仍可唤醒认领。Notify 只是唤醒信号，可以合并多次通知，
 任务是否存在和可执行始终以数据库为准。
-Scheduler 本身不建立 PostgreSQL LISTEN；外部入队由轮询或宿主接入的唤醒源发现。
+Scheduler 本身不建立 PostgreSQL LISTEN；其他进程提交的任务由轮询发现。
 
-Workflow 使用 1 秒轮询间隔；直接构造 Scheduler 时由调用方传入 `poll`，并可用
-`with_max_concurrency` 设置并发上限，最小值为 1。轮询间隔是进入等待后的休眠时长，
+Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配置由库内部管理。
+轮询间隔是进入等待后的休眠时长，
 不是每秒固定扫描一次，也不是每个任务启动前都要等待的延迟。
 
 一个槽覆盖整个 `run_task`：上下文准备、业务执行、图规划、数据库结算、成功回调，
@@ -184,17 +184,21 @@ flowchart TD
 重新认领可能重复执行业务逻辑，外部写入应按任务身份设计幂等；数据库原子结算不提供
 外部副作用的 exactly-once 保证。Tokio 的取消在异步任务让出执行权时生效。
 
-已经启动的 Scheduler 只轮询自己绑定的图。进程重启后，仅 `Engine::make` 不会执行
-存量任务；首次新提交会启动该图调度，宿主也可直接驱动底层 Scheduler 恢复存量任务。
-跨工作流恢复由宿主先调用 `seal_budget_exhausted` 封存符合执行闸门的耗尽任务，再通过
-`executable_workflow_ids` 找出可调度的图；封存不执行失败边，也不递归传播失败。
-详见 [README 的数据库说明](../README.md)。当前 Workflow 不自动重启发生 panic 的调度器。
+进程重启后，连接同一持久化数据库并为相同 `workflow_id` 重新调用 `Engine::make(graph)`，
+新调度器即可处理该图的存量任务，无需新的 `submit`。遗留的 `running` 任务保持原状态，
+旧租约过期后由认领事务更新持有人、续上租约并递增 `attempt`，随后从节点开头重新执行。
+租约为最后一次成功认领或续租后的 300 秒；恢复时不会提前释放其他 worker 的有效租约。
+符合执行闸门但预算已耗尽的任务由认领事务封存为 `failed`；封存不执行失败边，也不递归传播失败。
+
+Scheduler 只轮询自己绑定的图。应用需要为要恢复的图创建并保留 Workflow 实例；
+引擎不会从数据库自动发现或重建尚未实例化的图。SQLite 内存及临时数据库不支持跨进程恢复。
+当前 Workflow 不自动重启发生 panic 的调度器。
 
 ## 代码导航
 
 | 实现位置 | 阅读重点 |
 | --- | --- |
-| [src/workflow.rs](../src/workflow.rs) | `submit`、首次启动、就绪通知、`Worker::drop` |
+| [src/workflow.rs](../src/workflow.rs) | 构造时启动、`submit`、就绪通知、`Workflow::drop` |
 | [src/scheduler.rs](../src/scheduler.rs) | `run_loop` → `claim_and_spawn` → `run_task` → `prepare_with_lease` → `prepare` → `settle` |
 | [src/task/store.rs](../src/task/store.rs) | 存储契约、`FanoutPlan`、租约时长 |
 | [src/graph/mod.rs](../src/graph/mod.rs) | 节点执行、成功与失败后继规划 |

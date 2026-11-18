@@ -7,8 +7,8 @@
 
 - 公共 API 围绕 `graph`、`engine`、`workflow`、`task` 和 `dsl` 组织；节点、上下文与建边接口属于图定义。
 - 通过 `Engine` 使用数据库，默认启用 SQLite；`pg` / `sqlite` feature 只选择后端，至少启用一个，也可同时启用。
-- 通过 `Engine::new(url).await` 创建可复用引擎，再用 `engine.make(graph)` 创建 `Workflow<Ctx>` 实例。
-- `Workflow::submit` 创建独立运行并自动启动后台调度；数据库连接、任务存储、后端仓储和调度器由库内部管理。
+- 通过 `Engine::new(url).await` 创建可复用引擎，再用 `engine.make(graph)` 创建 `Workflow<Ctx>` 实例并启动后台调度。
+- `Workflow::submit` 创建独立运行并唤醒调度器；数据库连接、任务存储、后端仓储和调度器由库内部管理。
 
 ## 公共模块
 
@@ -35,7 +35,8 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 ## 引擎与工作流实例
 
 `Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享任务存储。
-`engine.make(graph)` 根据图定义创建 `Workflow<Ctx>`，首次成功提交时启动后台执行。
+`engine.make(graph)` 根据图定义创建 `Workflow<Ctx>`，构造时立即启动一个后台调度器，
+因此必须在 Tokio runtime 内调用。调度器会认领当前图已有的可执行任务，无需先提交新运行。
 同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有独立的调度器。
 不同图定义应使用不同的 `workflow_id`。
 
@@ -52,7 +53,7 @@ where
 {
     let engine = Engine::new("sqlite://workflow.db").await?;
     let workflow = engine.make(graph);
-    // 创建 run_id 并启动后台执行，返回时不等待运行结束。
+    // 创建 run_id 并唤醒调度器，返回时不等待运行结束。
     let run = workflow.submit("entry", input).await?;
     // 当前为空方法，不返回实际运行状态。
     run.status().await;
@@ -68,12 +69,17 @@ where
 `workflow_id + run_id` 确定运行身份，后继继承 `run_id`，不同运行的扇入与 JOIN 相互隔离。
 选定入口需要能触达后续 JOIN 所需的前驱；多次 submit 不能补齐同一次运行的多个入口。
 RunHandle 保存 `workflow_id`、`run_id` 和入口任务的 `task_id`，`status()` 暂为空实现。
-首次成功提交自动启动当前实例的后台调度器，后续提交立即唤醒认领，返回时不等待运行
-结束。调度器执行当前图下所有已提交及后续提交的运行，空闲时持续等待。每个 Workflow
-的所有运行共享 8 个执行槽和 1 秒轮询周期，并发提交也只启动一个调度器。
+提交成功后立即唤醒认领，返回时不等待运行结束。调度器执行当前图下所有已提交及后续
+提交的运行，空闲时持续等待。每个 Workflow 的所有运行共享一个调度器、8 个执行槽和
+1 秒轮询周期，提交不会再创建调度器。
 
 执行期间需要保持 Workflow 存活。丢弃 Workflow 会取消后台调度器和在途节点，不能等待
 结算完成；已持久化的任务仍保留在数据库。Engine 释放后 Workflow 仍可使用。
+
+进程重启后，连接同一持久化数据库并为相同 `workflow_id` 重新 `make(graph)`，即可恢复
+存量任务，无需新的 `submit`。遗留的 `running` 任务等待旧租约过期后重新认领并从节点
+开头执行；每次认领消耗一次尝试预算，预算耗尽则标记失败。引擎只调度已创建实例的图，
+不会从数据库自动发现并重建其他图。SQLite 内存及临时数据库不支持跨进程恢复。
 
 上述示例使用默认 SQLite 后端，PostgreSQL 使用 `pg` feature 和对应连接 URL。
 

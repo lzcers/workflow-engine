@@ -1,4 +1,4 @@
-//! 通过公开 API 验证工作流提交、自动执行与并发额度。
+//! 通过公开 API 验证工作流创建恢复、提交执行与并发额度。
 
 use std::{sync::Arc, time::Duration};
 
@@ -47,6 +47,65 @@ impl Node<Context> for AddOne {
                 .unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn make_recovers_persisted_tasks_without_submit() {
+    let path = std::env::temp_dir().join(format!("workflow-recovery-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let engine = Engine::new(&url).await.unwrap();
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tasks (workflow_id, run_id, task_id, name, status, input_json,
+                            claimed_by, attempt, lease_until)
+         VALUES ('recovery', 1, 1, 'start', 'pending', '10', NULL, 0, NULL),
+                ('recovery', 2, 2, 'start', 'running', '20', 'old-worker', 1,
+                 '2000-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    drop(engine);
+
+    let engine = Engine::new(&url).await.unwrap();
+    let (completed, mut results) = mpsc::unbounded_channel();
+    let graph = Graph::builder(
+        "recovery",
+        "Recovery",
+        Context {
+            completed: Some(completed),
+            ..Context::default()
+        },
+    )
+    .node("start", AddOne)
+    .build()
+    .unwrap();
+    let workflow = engine.make(graph);
+    let mut recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut recovered = Vec::new();
+        for _ in 0..2 {
+            let (task, output) = results.recv().await.unwrap();
+            assert_eq!(task.workflow_id, "recovery");
+            assert!(task.claimed_by.is_some());
+            assert_ne!(task.claimed_by.as_deref(), Some("old-worker"));
+            recovered.push((
+                task.task_id,
+                task.run_id,
+                task.attempt,
+                output.as_i64().unwrap(),
+            ));
+        }
+        recovered
+    })
+    .await
+    .expect("make starts pending and expired running tasks without a new submit");
+    recovered.sort_unstable();
+    assert_eq!(recovered, [(1, Some(1), 1, 11), (2, Some(2), 2, 21)]);
+
+    drop(workflow);
+    drop(engine);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]

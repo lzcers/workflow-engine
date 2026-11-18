@@ -67,7 +67,7 @@ where
 
     /// 持续驱动当前图，直到此 future 被取消。
     ///
-    /// 调用方负责确保只有一个运行循环；Workflow 在首次提交时启动一次。
+    /// 调用方负责确保只有一个运行循环；Workflow 在创建时启动一次。
     /// Workflow 释放时取消此 future；取消会中止在途节点，无法等待结算。
     /// 调度循环 panic 时取消并等待全部在途任务，再传播 panic。
     pub async fn run(&self) {

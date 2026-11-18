@@ -1,9 +1,6 @@
-//! 单图工作流实例：提交独立运行并自动驱动后台调度器。
+//! 单图工作流实例：创建时启动后台调度器，提交独立运行并唤醒认领。
 
-use std::{
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use serde::Serialize;
 use tokio::{sync::Notify, task::JoinHandle};
@@ -15,7 +12,7 @@ use crate::{EngineError, Graph, NodeContext};
 
 /// 一张固定图的工作流实例，由 [`crate::Engine::make`] 创建。
 ///
-/// 每次 submit 创建独立的 run_id 并自动启动执行，所有运行共享一个后台调度器。
+/// 创建时启动后台调度器，处理当前图的存量任务与后续提交；每次 submit 创建独立的 run_id。
 /// 工作流拥有图与存储的共享句柄，可在创建它的 Engine 释放后继续使用。
 /// 执行期间需保留此实例；丢弃 Workflow 会取消调度器及在途任务。
 pub struct Workflow<Ctx>
@@ -24,18 +21,16 @@ where
 {
     graph: Arc<Graph<Ctx>>,
     store: Arc<dyn TaskStore<Error = StorageError> + Send>,
-    scheduler: Arc<Scheduler<Ctx, dyn TaskStore<Error = StorageError> + Send>>,
-    worker: OnceLock<Worker>,
+    worker: JoinHandle<()>,
     wake: Arc<Notify>,
 }
 
-struct Worker {
-    task: JoinHandle<()>,
-}
-
-impl Drop for Worker {
+impl<Ctx> Drop for Workflow<Ctx>
+where
+    Ctx: NodeContext + Sync + 'static,
+{
     fn drop(&mut self) {
-        self.task.abort();
+        self.worker.abort();
     }
 }
 
@@ -49,23 +44,23 @@ where
     ) -> Self {
         let graph = Arc::new(graph);
         let wake = Arc::new(Notify::new());
-        let scheduler = Arc::new(
-            Scheduler::new(graph.clone(), store.clone(), Duration::from_secs(1))
-                .with_wake(wake.clone()),
-        );
+        let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_secs(1))
+            .with_wake(wake.clone());
+        let worker = tokio::spawn(async move {
+            scheduler.run().await;
+        });
         Self {
             graph,
             store,
-            scheduler,
-            worker: OnceLock::new(),
+            worker,
             wake,
         }
     }
 
     /// 从指定节点创建并执行一次独立运行；原子分配 run_id 并持久化入口任务。
     ///
-    /// input 必须能被该节点的 In 类型反序列化。首次成功提交自动启动后台调度器，
-    /// 后续提交立即唤醒认领；所有 run 共享 8 个执行槽和 1 秒轮询周期。
+    /// input 必须能被该节点的 In 类型反序列化。成功提交立即唤醒认领；
+    /// 所有 run 共享 8 个执行槽和 1 秒轮询周期。
     /// 返回成功表示已持久化并安排执行，不等待节点执行完成。
     pub async fn submit(
         &self,
@@ -80,14 +75,6 @@ where
             .store
             .create_run(self.graph.workflow_id(), entry, &input)
             .await?;
-        self.worker.get_or_init(|| {
-            let scheduler = self.scheduler.clone();
-            Worker {
-                task: tokio::spawn(async move {
-                    scheduler.run().await;
-                }),
-            }
-        });
         self.wake.notify_one();
         Ok(RunHandle {
             workflow_id: record.workflow_id,
