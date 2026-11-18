@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use crate::{Database, Graph, NodeContext, StorageError, TaskStore, Workflow};
+use crate::database::Database;
+pub use crate::error::StorageError;
+use crate::task::TaskStore;
+use crate::{Graph, NodeContext, Workflow};
 
 /// 引擎初始化或工作流提交失败。
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +21,7 @@ pub enum EngineError {
 /// 可复用的引擎，持有由数据库 URL 选择的共享任务存储。
 ///
 /// 每次 [`Self::make`] 根据图创建独立的 Workflow 和 Scheduler，首次提交时自动启动调度。
-/// 需要启用 `pg` 或 `sqlite` feature。
+/// 默认使用 SQLite，也可通过 `pg` feature 启用 PostgreSQL。
 pub struct Engine {
     store: Arc<dyn TaskStore<Error = StorageError> + Send>,
 }

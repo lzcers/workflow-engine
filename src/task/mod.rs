@@ -1,7 +1,7 @@
-//! 数据库无关的任务记录与调度存储契约。
+//! 数据库无关的任务内容、记录与状态。
 
-pub mod record;
-pub mod store;
+mod record;
+pub(crate) mod store;
 
 pub use record::{Task, TaskRecord, TaskStatus};
-pub use store::{FanoutInstances, FanoutPlan, TaskStore};
+pub(crate) use store::{FanoutInstances, FanoutPlan, TaskStore};

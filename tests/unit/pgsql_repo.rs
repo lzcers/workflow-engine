@@ -6,8 +6,9 @@ use sqlx::postgres::PgListener;
 use super::super::test_support::connect_test;
 use super::BUDGET_EXHAUSTED_ERR;
 use super::{PgTaskRepo, TASK_READY_CHANNEL, merge_join_input};
+use crate::error::StorageError;
 use crate::task::FanoutInstances;
-use crate::{StorageError, Task, TaskRecord, TaskStatus};
+use crate::{Task, TaskRecord, TaskStatus};
 
 /// 收取一条**本工作流**的任务就绪通知（2s 超时）：通知通道是集群级共享的，
 /// 并发测试可能互相收到对方的 payload（生产监听器同样按 payload 分发），

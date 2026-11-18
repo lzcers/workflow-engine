@@ -1,4 +1,4 @@
-//! [`PgTaskStore`]：通用引擎 [`crate::TaskStore`] 的 pgsql 实现。
+//! [`PgTaskStore`]：通用引擎 [`crate::task::TaskStore`] 的 pgsql 实现。
 //!
 //! 通过 [`PgTaskRepo`] 供多个工作流共享，收编通用引擎的
 //! [`crate::task::FanoutPlan`] → [`crate::task::FanoutInstances`] 折叠，不感知任何业务字段。
@@ -7,8 +7,9 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::repo::PgTaskRepo;
-use crate::task::{FanoutInstances, FanoutPlan};
-use crate::{StorageError, Task, TaskRecord, TaskStore};
+use crate::error::StorageError;
+use crate::task::{FanoutInstances, FanoutPlan, TaskStore};
+use crate::{Task, TaskRecord};
 
 /// 共享任务存储：通过 `PgTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
 #[derive(Clone)]

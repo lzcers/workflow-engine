@@ -6,7 +6,8 @@ use std::{sync::Arc, time::Duration};
 use crate::backend::pgsql::{PgTaskRepo, PgTaskStore};
 #[cfg(feature = "sqlite")]
 use crate::backend::sqlite::{SqliteTaskRepo, SqliteTaskStore};
-use crate::{StorageError, TaskStore};
+use crate::error::StorageError;
+use crate::task::TaskStore;
 
 /// 工作流存储的共享连接句柄。
 ///
@@ -158,3 +159,7 @@ impl Database {
         }
     }
 }
+
+#[cfg(all(test, feature = "sqlite"))]
+#[path = "../tests/unit/database.rs"]
+mod tests;

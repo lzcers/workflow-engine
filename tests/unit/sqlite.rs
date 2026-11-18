@@ -4,8 +4,9 @@ use serde_json::{Value, json};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
 use super::{SqliteTaskRepo, SqliteTaskStore, migrate};
-use crate::task::FanoutPlan;
-use crate::{StorageError, Task, TaskRecord, TaskStatus, TaskStore};
+use crate::error::StorageError;
+use crate::task::{FanoutPlan, TaskStore};
+use crate::{Task, TaskRecord, TaskStatus};
 
 async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
     let pool = SqlitePoolOptions::new()

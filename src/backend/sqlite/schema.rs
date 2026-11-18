@@ -2,7 +2,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::StorageError;
+use crate::error::StorageError;
 
 const SCHEMA_DDL: &str = include_str!("../../../migrations/sqlite/0001_workflow_tasks.sql");
 

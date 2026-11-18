@@ -1,6 +1,6 @@
 //! 数据库后端：各自实现共享任务模型与存储契约。
 
-#[cfg(any(feature = "pg", test))]
+#[cfg(feature = "pg")]
 pub mod pgsql;
-#[cfg(any(feature = "sqlite", test))]
+#[cfg(feature = "sqlite")]
 pub mod sqlite;

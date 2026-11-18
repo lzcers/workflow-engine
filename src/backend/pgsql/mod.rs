@@ -1,6 +1,6 @@
-//! PostgreSQL 通用工作流实现：把 [`crate::TaskStore`] 落到 `tasks` 表。
+//! PostgreSQL 通用工作流实现：把 [`crate::task::TaskStore`] 落到 `tasks` 表。
 //!
-//! 本模块由 `pg` feature 门控（默认构建不含任何数据库依赖）。模块只依赖通用引擎
+//! 本模块由 `pg` feature 启用。模块只依赖通用引擎
 //! （[`crate::task`] / [`crate::graph`]）与**引擎自有 schema**（[`migrate`] 幂等执行）：
 //!
 //! - `tasks`：任务行（列见 [`rows::TaskRow`]），承载认领 / 扇出 / 原子结算 /
@@ -15,7 +15,7 @@
 //!
 //! 子模块划分：
 //! - [`repo`]：[`PgTaskRepo`]，通用 SQL 持久化操作（与业务查询解耦）；
-//! - [`store`]：[`PgTaskStore`]，[`crate::TaskStore`] 的 pgsql 实现；
+//! - [`store`]：[`PgTaskStore`]，[`crate::task::TaskStore`] 的 pgsql 实现；
 //! - [`crate::task::record`] / [`rows`]：数据库任务行与公共 [`crate::TaskRecord`]；
 //! - [`schema`]：引擎自有 DDL 与迁移入口。
 
@@ -28,7 +28,6 @@ mod store;
 #[path = "../../../tests/unit/pgsql_support.rs"]
 mod test_support;
 
-pub use repo::{PgTaskRepo, ROW_COLS, TASK_READY_CHANNEL, notify_tasks_ready};
-pub use rows::TaskRow;
+pub use repo::PgTaskRepo;
 pub use schema::migrate;
 pub use store::PgTaskStore;

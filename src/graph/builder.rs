@@ -74,13 +74,13 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
         )
     }
 
-    /// 追加一条成功边（条件/转换，前向 DAG，擦除为 [`AnySuccessEdge`] 存储）。
+    /// 追加一条成功边（条件/转换，前向 DAG）。
     pub fn edge<E: SuccessEdge + 'static>(mut self, e: E) -> Self {
         self.success_edges.push(Box::new(e));
         self
     }
 
-    /// 追加一条失败边（条件/转换，后向回退图，擦除为 [`AnyFailureEdge`] 存储）。
+    /// 追加一条失败边（条件/转换，后向回退图）。
     pub fn error_edge<E: FailureEdge + 'static>(mut self, e: E) -> Self {
         self.failure_edges.push(Box::new(e));
         self

@@ -8,8 +8,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use super::rows::TaskRow;
+use crate::error::StorageError;
 use crate::task::{FanoutInstances, store::LEASE_DURATION};
-use crate::{StorageError, Task, TaskRecord, TaskStatus};
+use crate::{Task, TaskRecord, TaskStatus};
 
 /// 任务行级重试预算耗尽时的封存错误信息（`attempt >= max_attempts` 不再被认领）。
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";

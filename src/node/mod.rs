@@ -28,7 +28,7 @@ pub use join::JoinNode;
 /// 错误统一为 [`NodeError`]。
 ///
 /// `In`/`Out` 的 `'static` 边界（不含非静态借用，非「永生」）由 build 期接线指纹校验
-/// （[`TypeFingerprint`]）要求：`TypeId::of` 只对 `'static` 类型可用。节点载荷经
+/// 要求：`TypeId::of` 只对 `'static` 类型可用。节点载荷经
 /// `Value` 落库，本就不含借用，此约束不构成实际限制。
 pub trait Node<Ctx>: Send + Sync {
     /// 任务输入类型，对应 DB `task.input`。

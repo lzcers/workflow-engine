@@ -8,8 +8,9 @@ use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
+use crate::error::StorageError;
 use crate::task::FanoutInstances;
-use crate::{StorageError, Task, TaskRecord, TaskStatus};
+use crate::{Task, TaskRecord, TaskStatus};
 
 use crate::task::store::LEASE_DURATION;
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";

@@ -2,15 +2,15 @@
 name = "workflow-engine"
 version = "0.1.0"
 edition = "2024"
-description = "Typed workflow graphs and schedulers with optional PostgreSQL and SQLite backends"
+description = "Typed workflow engine with PostgreSQL and SQLite backends"
 readme = "README.md"
 license = "MIT"
 
 [features]
-default = []
-# 数据库驱动按后端启用；默认构建保持零数据库依赖。
-pg = ["dep:sqlx", "sqlx/postgres"]
-sqlite = ["dep:sqlx", "dep:form_urlencoded", "sqlx/sqlite"]
+default = ["sqlite"]
+# 至少启用一个数据库后端；默认使用 SQLite，也可启用 PostgreSQL 或两者。
+pg = ["sqlx/postgres"]
+sqlite = ["dep:form_urlencoded", "sqlx/sqlite"]
 
 [dependencies]
 form_urlencoded = { version = "1.2.2", optional = true }
@@ -30,18 +30,10 @@ sqlx = { version = "0.8.6", default-features = false, features = [
     "macros",
     "chrono",
     "json",
-], optional = true }
+] }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["test-util"] }
-sqlx = { version = "0.8.6", default-features = false, features = [
-    "runtime-tokio-rustls",
-    "postgres",
-    "sqlite",
-    "macros",
-    "chrono",
-    "json",
-] }
 
 [[test]]
 name = "sqlite_backend"

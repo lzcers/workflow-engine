@@ -1,50 +1,33 @@
 //! 通用工作流引擎：与业务解耦的节点 trait + 图引擎。
 //!
-//! - [`node`]：强类型 [`Node`] trait 与类型擦除（[`node::AnyNode`]）。
-//! - [`edge`]：边模型（触发时机、守卫、扇出）与擦除辅助。
-//! - [`graph`]：图引擎（[`Graph`]），负责节点注册、边规划、执行与静态校验。
-//! - [`task`]：任务内容 [`Task`]、记录 [`TaskRecord`] 与持久化契约 [`TaskStore`]。
-//! - [`scheduler`]：通用调度器（[`Scheduler`]），认领任务、结算并规划后继。
-//! - `engine`（`pg` / `sqlite` feature）：可复用的引擎入口（`Engine`），初始化存储并创建工作流。
-//! - `workflow`（`pg` / `sqlite` feature）：单图实例（`Workflow`），提交时自动启动调度并返回 `RunHandle`。
-//! - [`backend::pgsql`]（`pg` feature）：PostgreSQL 通用实现（`PgTaskRepo` / `PgTaskStore` /
-//!   任务就绪通知与恢复查询）。默认关闭，引擎核心保持零数据库依赖。
-//! - [`backend::sqlite`]（`sqlite` feature）：SQLite 通用实现（`SqliteTaskRepo` /
-//!   `SqliteTaskStore`），支持原子结算、租约恢复与就绪工作流查询。
+//! - [`graph`]：图定义、节点接口、边构造与图描述，入口为 [`Graph`]。
+//! - [`engine`]：[`Engine`] 初始化存储并创建工作流。
+//! - [`workflow`](mod@workflow)：[`Workflow`] 提交运行并返回 [`RunHandle`]。
+//! - [`task`]：任务内容 [`Task`]、记录 [`TaskRecord`] 与状态 [`TaskStatus`]。
+//! - [`dsl`]：通过 [`workflow!`] 宏声明图，并在编译期校验节点接线。
 //!
-//! Workflow 自动管理后台调度器；使用底层 Scheduler 时，worker 生命周期由宿主应用管理。
-//! 跨工作流的通知监听与定期恢复扫描由宿主应用管理。
+//! 数据库连接、持久化后端与调度器由引擎内部管理。
+//! 默认使用 SQLite；通过 `pg` / `sqlite` feature 选择后端，至少启用一个。
 //!
-//! 节点**不携带名字**：阶段名作为 [`Graph`] 的 `HashMap` key 在注册实例时外部绑定，
-//! 同一节点实现可复用、可在不同名字下注册。
+//! 节点不携带名字：节点名在注册实例时外部绑定，同一节点实现可在不同名字下复用。
 
-#[cfg(any(feature = "pg", feature = "sqlite", test))]
+#[cfg(not(any(feature = "pg", feature = "sqlite")))]
+compile_error!("workflow-engine requires at least one database backend: enable `pg` or `sqlite`");
+
+mod backend;
+mod database;
+mod edge;
 mod error;
-#[cfg(any(feature = "pg", feature = "sqlite", test))]
-pub use error::StorageError;
+mod node;
+mod scheduler;
 
-#[cfg(any(feature = "pg", feature = "sqlite"))]
-pub mod database;
-#[cfg(any(feature = "pg", feature = "sqlite"))]
-pub use database::Database;
-
-pub mod backend;
 pub mod dsl;
-pub mod edge;
-#[cfg(any(feature = "pg", feature = "sqlite"))]
 pub mod engine;
 pub mod graph;
-pub mod node;
-pub mod scheduler;
 pub mod task;
-#[cfg(any(feature = "pg", feature = "sqlite"))]
 pub mod workflow;
 
-#[cfg(any(feature = "pg", feature = "sqlite"))]
 pub use engine::{Engine, EngineError};
-pub use graph::Graph;
-pub use node::{JoinNode, Node, NodeContext, NodeError};
-pub use scheduler::Scheduler;
-pub use task::{Task, TaskRecord, TaskStatus, TaskStore};
-#[cfg(any(feature = "pg", feature = "sqlite"))]
+pub use graph::{Graph, JoinNode, Node, NodeContext, NodeError};
+pub use task::{Task, TaskRecord, TaskStatus};
 pub use workflow::{RunHandle, Workflow};

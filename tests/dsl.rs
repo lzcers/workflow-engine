@@ -1,6 +1,5 @@
-use crate::node::Node;
-use crate::{Graph, NodeError};
 use std::future::Future;
+use workflow_engine::{Graph, Node, NodeError, workflow};
 
 struct Ctx;
 
@@ -12,7 +11,7 @@ impl Node<Ctx> for PassThrough {
         &self,
         _ctx: &mut Ctx,
         input: Self::In,
-    ) -> impl Future<Output = Result<Self::Out, crate::node::NodeError>> + Send {
+    ) -> impl Future<Output = Result<Self::Out, NodeError>> + Send {
         async move { Ok(input) }
     }
 }

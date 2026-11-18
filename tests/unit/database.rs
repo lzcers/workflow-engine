@@ -1,7 +1,12 @@
 #![cfg(feature = "sqlite")]
 
+use crate::{
+    backend::sqlite::SqliteTaskRepo,
+    database::Database,
+    error::StorageError,
+    task::{Task, TaskStatus},
+};
 use serde_json::json;
-use workflow_engine::{Database, StorageError, Task, TaskStatus, backend::sqlite::SqliteTaskRepo};
 
 fn repository(database: &Database) -> SqliteTaskRepo {
     match database {

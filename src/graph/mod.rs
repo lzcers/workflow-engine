@@ -1,20 +1,24 @@
 //! 图引擎：节点注册表 + 边集合，负责执行、后继规划、静态校验。
 //!
-//! 节点名字作为 [`Graph`] 的 `HashMap` key 在注册时外部绑定；边（[`super::edge`]）
+//! 节点名字作为 [`Graph`] 的 `HashMap` key 在注册时外部绑定；边
 //! 通过 `src`/`dst` 名字引用节点。
 //!
-//! 子模块划分：
-//! - [`builder`]：图构建器（[`GraphBuilder`]），负责注册节点、追加边、组装并校验。
+//! [`GraphBuilder`] 负责注册节点、追加边、组装并校验。
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-use super::edge::{AnyFailureEdge, AnySuccessEdge, EdgeError};
-use super::node::{AnyNode, NodeError, TaskType, TypeFingerprint};
+use super::edge::{AnyFailureEdge, AnySuccessEdge};
+use super::node::{AnyNode, TypeFingerprint};
 
 mod builder;
 mod description;
 
+pub use crate::edge::{
+    EdgeError, EdgeImpl, ErrorWhenBuilder, FailureEdge, FailureEdgeImpl, SuccessEdge, WhenBuilder,
+    map, on_error, when, when_error,
+};
+pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType};
 pub use builder::GraphBuilder;
 pub use description::{EdgeDescription, EdgeKind, GraphDescription, NodeDescription};
 
@@ -27,7 +31,7 @@ struct GraphNode<Ctx> {
 
 /// 图引擎：节点注册表 + 成功/失败边集合，持有上下文与节点实例，负责执行、后继规划、静态校验。
 ///
-/// 成功边与失败边分置两个集合（[`Graph::success_edges`] / [`Graph::failure_edges`]），
+/// 成功边与失败边分置两个集合，
 /// 对应两种独立路由维度：前向主 DAG 与后向回退图。
 pub struct Graph<Ctx> {
     workflow_id: String,
@@ -82,7 +86,6 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 控制平面在入队前检查任务引用的节点。
-    #[cfg(any(feature = "pg", feature = "sqlite"))]
     pub(crate) fn contains_node(&self, name: &str) -> bool {
         self.nodes.contains_key(name)
     }
@@ -166,7 +169,7 @@ impl<Ctx> Graph<Ctx> {
     /// 操作，可做错误分支、兜底降级等一般路由；无 `map` 时透传失败节点输入。
     ///
     /// 返回 [`Successor`] 列表：`when` 不命中或 `map` 返回空则无该项。
-    /// `task_type` 如实反映 dst 节点的类型（同 [`Graph::plan_success`]，经 [`Graph::task_type_of`]）；
+    /// `task_type` 如实反映 dst 节点的类型（同 [`Graph::plan_success`]）；
     /// `depends_on_names` **保持为空**——这是当前存储层的能力约束：认领闸门只支持
     /// 「等齐全部前驱**成功**」的 JOIN 语义，不支持「等齐失败/终态」。若把失败源节点名填入
     /// `depends_on_names`，失败后继会因源节点状态为 `failed`/`superseded` 而永远无法被认领
@@ -236,7 +239,7 @@ impl<Ctx> Graph<Ctx> {
     ///
     /// 类型接线指纹校验是命令式建图（非 DSL）的兜底：DSL 边有编译期检查，命令式边只有
     /// 闭包自洽的类型参数，与注册节点 `In`/`Out` 的错线此前要到任务结算时才以 serde 错误
-    /// 暴露，这里在 build 期提前拒绝（`Value` 边界兼容规则见 [`readable`]/[`writable`]）。
+    /// 暴露，这里在 build 期提前拒绝；`Value` 可作为任意载荷的读取或写入边界。
     pub fn validate(&self) -> Result<(), String> {
         if self.workflow_id.trim().is_empty() {
             return Err("workflow_id must not be empty".into());

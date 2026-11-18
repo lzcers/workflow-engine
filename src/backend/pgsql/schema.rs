@@ -6,7 +6,7 @@
 
 use sqlx::PgPool;
 
-use crate::StorageError;
+use crate::error::StorageError;
 
 /// 引擎 schema DDL（幂等，每次启动执行：`CREATE ... IF NOT EXISTS` 建表及索引，
 /// `COMMENT ON` 同步表和字段说明）。
