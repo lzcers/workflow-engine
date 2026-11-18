@@ -28,8 +28,48 @@ async fn recv_ready(listener: &mut PgListener, workflow_id: &str) {
     }
 }
 
+#[tokio::test]
+async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
+    let Some(database) = connect_test().await else {
+        return;
+    };
+    let repo = PgTaskRepo::new(database.pool().clone());
+    let workflow_id = "enqueue-runs";
+    let task = Task::new(workflow_id, "root", json!({"input": 1}));
+    let first = repo.enqueue(&task).await.unwrap();
+    let second = repo.enqueue(&task).await.unwrap();
+    assert_eq!(first.run_id, Some(first.task_id));
+    assert_eq!(second.run_id, Some(second.task_id));
+    assert_ne!(first.run_id, second.run_id);
+    assert_eq!(first.max_attempts, 3);
+
+    let child = Task {
+        run_id: first.run_id,
+        instance_id: Some(5),
+        max_attempts: 7,
+        depends_on_ids: vec![first.task_id],
+        depends_on_names: vec![first.name.clone()],
+        ..Task::new(workflow_id, "child", json!({"input": 2}))
+    };
+    let inserted = repo.enqueue(&child).await.unwrap();
+    let stored = repo
+        .get(workflow_id, inserted.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.run_id, first.run_id);
+    assert_eq!(stored.name, child.name);
+    assert_eq!(stored.instance_id, child.instance_id);
+    assert_eq!(stored.max_attempts, child.max_attempts);
+    assert_eq!(stored.depends_on_ids, child.depends_on_ids);
+    assert_eq!(stored.depends_on_names, child.depends_on_names);
+    assert_eq!(stored.input, child.input);
+    assert_eq!(stored.status, TaskStatus::Pending);
+    assert_eq!(stored.attempt, 0);
+}
+
 /// 原子成功结算：succeed + 全部后继（单实例 + 多实例）在同一事务内落库，
-/// 后继 run_id 取回填后的源任务 run_id、depends_on_ids 指向源任务。
+/// 后继继承源任务 run_id、depends_on_ids 指向源任务。
 #[tokio::test]
 async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     let Some(database) = connect_test().await else {
@@ -89,6 +129,8 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     // 三个后继全部落库，依赖均指向源任务。
     let rows = repo.list_all(workflow_id).await.unwrap();
     assert_eq!(rows.len(), 4);
+    assert_eq!(source.run_id, Some(source.task_id));
+    assert!(rows.iter().all(|task| task.run_id == source.run_id));
     let finalize: Vec<_> = rows.iter().filter(|t| t.name == "finalize_node").collect();
     assert_eq!(finalize.len(), 1);
     assert_eq!(finalize[0].instance_id, None);
@@ -230,9 +272,9 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         .unwrap();
     let mut dependents = Vec::new();
     for (name, run_id, by_name) in [
-        ("audio_dependent", None, false),
-        ("audio_join", None, true),
-        ("other_run", Some(1), true),
+        ("audio_dependent", failed.run_id, false),
+        ("audio_join", failed.run_id, true),
+        ("other_run", retried.run_id, true),
     ] {
         let dependent = repo
             .enqueue(&Task {
@@ -302,7 +344,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
             .await
             .unwrap()
             .unwrap();
-        let expected = if dependent.run_id.is_none() {
+        let expected = if dependent.run_id == failed.run_id {
             TaskStatus::Failed
         } else {
             TaskStatus::Pending
@@ -437,7 +479,7 @@ async fn claims_require_all_dependencies_including_missing_ids() {
     let sources = repo
         .enqueue_fanout(
             workflow_id,
-            None,
+            child.run_id,
             "source",
             &instances,
             &[],
@@ -657,7 +699,7 @@ async fn task_ready_notifications_carry_workflow_id() {
     // 2) 扇出后继（原子结算路径同样经此通知）。
     repo.enqueue_fanout(
         workflow_id,
-        None,
+        root.run_id,
         "commit_scene",
         &[(None, json!({}))],
         &[root.task_id],

@@ -1,0 +1,3 @@
+[env]
+# 本地专用 PostgreSQL 测试库；显式环境变量可覆盖此地址。
+WORKFLOW_ENGINE_TEST_DATABASE_URL = "postgresql://workflow_engine_test@127.0.0.1:5432/workflow_engine_test"

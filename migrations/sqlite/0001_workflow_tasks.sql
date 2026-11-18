@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流标识；用于隔离任务、分配 task_id 和限定调度范围，与 task_id 组成主键。
     workflow_id TEXT NOT NULL,
     -- 运行分组键；用于扇入去重、JOIN 等齐前驱及失败级联，后继继承源任务的值。
-    -- 由调用方指定或回填；NULL 表示尚未指定，同一工作流内的 NULL 按同组处理。
+    -- enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。
     run_id INTEGER,
     -- 工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一。
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。

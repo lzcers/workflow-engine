@@ -400,7 +400,7 @@ impl PgTaskRepo {
     }
 
     /// 事务内插入任务行：分配工作流级 task_id 并插入 pending 行，返回完整行。
-    /// `pub`：消费方业务入队路径（如「先封存旧链再插入新链根任务」）在自管事务内复用。
+    /// 未指定 run_id 时使用新分配的 task_id 创建独立运行；指定时保留原分组。
     pub async fn insert_task(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         task: &Task,
@@ -427,7 +427,7 @@ impl PgTaskRepo {
         let row = sqlx::query_as::<_, TaskRow>(&sql)
             .bind(&task.workflow_id)
             .bind(task_id)
-            .bind(task.run_id)
+            .bind(task.run_id.unwrap_or(task_id))
             .bind(&task.name)
             .bind(task.instance_id)
             .bind(task.max_attempts)
@@ -439,42 +439,8 @@ impl PgTaskRepo {
         Ok(row.into())
     }
 
-    /// 原子创建独立运行，以入口任务的 task_id 作为同一工作流内唯一的 run_id。
-    /// 入口任务与运行身份在同一事务提交，其他 worker 不会看到未分组的入口任务。
-    pub async fn create_run(
-        &self,
-        workflow_id: &str,
-        entry: &str,
-        input: &Value,
-        max_attempts: i32,
-    ) -> Result<TaskRecord, StorageError> {
-        let mut tx = self.pool.begin().await?;
-        let mut row = Self::insert_task(
-            &mut tx,
-            &Task {
-                workflow_id: workflow_id.to_owned(),
-                run_id: None,
-                name: entry.to_owned(),
-                instance_id: None,
-                max_attempts,
-                depends_on_ids: Vec::new(),
-                depends_on_names: Vec::new(),
-                input: input.clone(),
-            },
-        )
-        .await?;
-        sqlx::query("UPDATE tasks SET run_id = task_id WHERE workflow_id = $1 AND task_id = $2")
-            .bind(workflow_id)
-            .bind(row.task_id)
-            .execute(&mut *tx)
-            .await?;
-        row.run_id = Some(row.task_id);
-        notify_tasks_ready(&mut tx, workflow_id).await?;
-        tx.commit().await?;
-        Ok(row)
-    }
-
     /// 入队一个任务：原子分配工作流级 task_id 并插入 pending 行，随事务提交任务就绪通知。
+    /// run_id 为空时创建独立运行，否则加入指定运行；任务与运行身份在同一事务提交。
     pub async fn enqueue(&self, task: &Task) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin().await?;
         let row = Self::insert_task(&mut tx, task).await?;

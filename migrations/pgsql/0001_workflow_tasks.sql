@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS task_counters (
 
 -- 通用任务表：run_id 为「一次 run」的分组键（扇入去重 / JOIN 等齐前驱按同 run 判定），
 -- 业务可把自己的血缘键（如 world 的 commit_id）映射到该列，引擎不解读其内容；
--- 尚未指定分组时为 NULL，同一 workflow 下的 NULL 按同组处理。
+-- enqueue 未指定分组时以新任务 ID 创建运行；直接写入的 NULL 在同一 workflow 下按同组处理。
 CREATE TABLE IF NOT EXISTS tasks (
     workflow_id TEXT   NOT NULL,
     run_id      BIGINT,
@@ -44,7 +44,7 @@ COMMENT ON COLUMN task_counters.next_task_id IS '最近一次分配的 task_id�
 
 COMMENT ON TABLE tasks IS '工作流任务实例及其执行状态；以 (workflow_id, task_id) 唯一定位一条任务，同一次 run 可包含多个任务。';
 COMMENT ON COLUMN tasks.workflow_id IS '工作流标识；用于隔离任务、分配 task_id 和限定调度范围，与 task_id 组成主键。';
-COMMENT ON COLUMN tasks.run_id IS '运行分组键；同一工作流内用于扇入去重、JOIN 等齐前驱及失败级联，后继继承源任务的值；由调用方指定或回填，NULL 表示尚未指定，同一工作流内的 NULL 按同组处理。';
+COMMENT ON COLUMN tasks.run_id IS '运行分组键；同一工作流内用于扇入去重、JOIN 等齐前驱及失败级联，后继继承源任务的值；enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。';
 COMMENT ON COLUMN tasks.task_id IS '工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一，用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。';
 COMMENT ON COLUMN tasks.name IS '工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。';
 COMMENT ON COLUMN tasks.instance_id IS '节点扇出的实例序号；NULL 表示单实例，多实例从 0 开始编号，与 workflow_id、run_id、name 一起用于扇出去重。';

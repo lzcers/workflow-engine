@@ -234,6 +234,7 @@ impl SqliteTaskRepo {
     }
 
     /// Insert a pending task in an application-owned transaction.
+    /// Without an explicit run ID, the allocated task ID starts a new run.
     /// Start with `pool.begin_with("BEGIN IMMEDIATE")` when the transaction also reads.
     pub async fn insert_task(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -251,7 +252,7 @@ impl SqliteTaskRepo {
         ))
         .bind(&task.workflow_id)
         .bind(task_id)
-        .bind(task.run_id)
+        .bind(task.run_id.unwrap_or(task_id))
         .bind(&task.name)
         .bind(task.instance_id)
         .bind(task.max_attempts)
@@ -263,40 +264,7 @@ impl SqliteTaskRepo {
         Ok(row.into())
     }
 
-    /// Create an independent run, using its root task ID as the workflow-local run ID.
-    /// The root and its run ID become visible together when the transaction commits.
-    pub async fn create_run(
-        &self,
-        workflow_id: &str,
-        entry: &str,
-        input: &Value,
-        max_attempts: i32,
-    ) -> Result<TaskRecord, StorageError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut row = Self::insert_task(
-            &mut tx,
-            &Task {
-                workflow_id: workflow_id.to_owned(),
-                run_id: None,
-                name: entry.to_owned(),
-                instance_id: None,
-                max_attempts,
-                depends_on_ids: Vec::new(),
-                depends_on_names: Vec::new(),
-                input: input.clone(),
-            },
-        )
-        .await?;
-        sqlx::query("UPDATE tasks SET run_id = task_id WHERE workflow_id = ?1 AND task_id = ?2")
-            .bind(workflow_id)
-            .bind(row.task_id)
-            .execute(&mut *tx)
-            .await?;
-        row.run_id = Some(row.task_id);
-        tx.commit().await?;
-        Ok(row)
-    }
-
+    /// Enqueue in the supplied run, or atomically create a run using the new task ID.
     pub async fn enqueue(&self, task: &Task) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = Self::insert_task(&mut tx, task).await?;

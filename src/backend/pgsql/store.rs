@@ -19,7 +19,7 @@ pub struct PgTaskStore {
 }
 
 impl PgTaskStore {
-    /// 绑定仓储；新任务默认 `max_attempts = 3`。
+    /// 绑定仓储；结算时新建的后继任务默认 `max_attempts = 3`。
     pub fn new(repo: PgTaskRepo) -> Self {
         Self {
             repo,
@@ -27,7 +27,7 @@ impl PgTaskStore {
         }
     }
 
-    /// 覆盖新建任务的最大尝试次数。
+    /// 覆盖结算时新建后继任务的最大尝试次数；直接入队沿用 Task 的配置。
     pub fn with_max_attempts(mut self, n: i32) -> Self {
         self.max_attempts = n;
         self
@@ -36,18 +36,6 @@ impl PgTaskStore {
 
 impl TaskStore for PgTaskStore {
     type Error = StorageError;
-
-    fn create_run<'a>(
-        &'a self,
-        workflow_id: &'a str,
-        entry: &'a str,
-        input: &'a Value,
-    ) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
-        Box::pin(
-            self.repo
-                .create_run(workflow_id, entry, input, self.max_attempts),
-        )
-    }
 
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
         Box::pin(self.repo.enqueue(task))

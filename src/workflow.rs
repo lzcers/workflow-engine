@@ -8,7 +8,7 @@ use tokio::{sync::Notify, task::JoinHandle};
 use crate::error::StorageError;
 use crate::scheduler::Scheduler;
 use crate::task::TaskStore;
-use crate::{EngineError, Graph, NodeContext};
+use crate::{EngineError, Graph, NodeContext, Task};
 
 /// 一张固定图的工作流实例，由 [`crate::Engine::make`] 创建。
 ///
@@ -70,15 +70,16 @@ where
         if !self.graph.contains_node(entry) {
             return Err(EngineError::UnknownNode(entry.to_owned()));
         }
-        let input = serde_json::to_value(input)?;
-        let record = self
-            .store
-            .create_run(self.graph.workflow_id(), entry, &input)
-            .await?;
+        let task = Task::new(
+            self.graph.workflow_id(),
+            entry,
+            serde_json::to_value(input)?,
+        );
+        let record = self.store.enqueue(&task).await?;
         self.wake.notify_one();
         Ok(RunHandle {
             workflow_id: record.workflow_id,
-            run_id: record.run_id.expect("create_run must allocate a run ID"),
+            run_id: record.run_id.expect("enqueue must assign a run ID"),
             task_id: record.task_id,
         })
     }

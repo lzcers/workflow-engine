@@ -102,15 +102,9 @@ pub trait TaskStore: Sync {
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// 原子创建独立运行及其入口任务；返回记录的 run_id 必须是新分配的非空身份。
-    fn create_run<'a>(
-        &'a self,
-        workflow_id: &'a str,
-        entry: &'a str,
-        input: &'a Value,
-    ) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
-
-    /// 提交初始任务，返回已持久化的任务快照；工作流身份来自任务。
+    /// 原子入队任务并确定运行身份，返回已持久化的任务快照。
+    /// run_id 为 None 时，以新分配的 task_id 创建独立运行；Some(id) 则保留指定运行。
+    /// 依赖、实例编号和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批可执行任务（互相无依赖），最多 `limit` 个；数量不足或无可认领

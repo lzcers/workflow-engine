@@ -20,16 +20,7 @@ async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
 }
 
 fn new_task(workflow_id: &str, name: &str) -> Task {
-    Task {
-        workflow_id: workflow_id.to_owned(),
-        run_id: None,
-        name: name.to_owned(),
-        instance_id: None,
-        max_attempts: 3,
-        depends_on_ids: vec![],
-        depends_on_names: vec![],
-        input: json!({}),
-    }
+    Task::new(workflow_id, name, json!({}))
 }
 
 async fn get(repo: &SqliteTaskRepo, task: &TaskRecord) -> TaskRecord {
@@ -51,17 +42,23 @@ fn plan(dst: &'static str, task_type: &'static str, inputs: Vec<Value>) -> Fanou
 #[tokio::test]
 async fn migration_is_idempotent_and_task_values_round_trip() {
     let (pool, repo) = memory_repo().await;
+    let store = SqliteTaskStore::new(repo.clone());
     let mut input = new_task("workflow", "root");
     input.run_id = Some(42);
     input.input = json!({"text": "工作流 'quoted'", "nested": [null, true, {"n": 3}]});
-    let first = repo.enqueue(&input).await.unwrap();
+    let first = store.enqueue(&input).await.unwrap();
 
     migrate(&pool).await.unwrap();
-    let second = repo.enqueue(&new_task("workflow", "second")).await.unwrap();
+    let second = store
+        .enqueue(&new_task("workflow", "second"))
+        .await
+        .unwrap();
     let other = repo.enqueue(&new_task("other", "root")).await.unwrap();
     assert_eq!(first.task_id, 1);
     assert_eq!(second.task_id, 2);
+    assert_eq!(second.run_id, Some(second.task_id));
     assert_eq!(other.task_id, 1, "task IDs are scoped to each workflow");
+    assert_eq!(other.run_id, Some(other.task_id));
     assert_eq!(first.name, "root");
     assert_eq!(first.input, input.input);
     assert_eq!(first.status, TaskStatus::Pending);
@@ -74,6 +71,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert_eq!(rows.iter().map(|t| t.task_id).collect::<Vec<_>>(), [1, 2]);
     assert_eq!(rows[0].input, input.input);
     assert_eq!(rows[0].run_id, Some(42));
+    assert_eq!(rows[1].run_id, second.run_id);
     assert!(repo.get("missing", 1).await.unwrap().is_none());
 
     let output = json!([null, {"result": "完成"}]);
@@ -90,6 +88,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     let rolled_back = SqliteTaskRepo::insert_task(&mut tx, &new_task("workflow", "rollback"))
         .await
         .unwrap();
+    assert_eq!(rolled_back.run_id, Some(rolled_back.task_id));
     tx.rollback().await.unwrap();
     assert!(
         repo.get("workflow", rolled_back.task_id)
@@ -97,11 +96,13 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
             .unwrap()
             .is_none()
     );
-    let next = repo.enqueue(&new_task("workflow", "next")).await.unwrap();
+    let next = store.enqueue(&new_task("workflow", "next")).await.unwrap();
     assert_eq!(
         next.task_id, rolled_back.task_id,
         "allocation rolls back with insertion"
     );
+    assert_eq!(next.run_id, Some(next.task_id));
+    assert_ne!(next.run_id, second.run_id);
 }
 
 #[tokio::test]
@@ -109,9 +110,19 @@ async fn claims_require_all_dependencies_including_missing_ids() {
     let (_, repo) = memory_repo().await;
     let root = repo.enqueue(&new_task("deps", "root")).await.unwrap();
     let mut child = new_task("deps", "child");
+    child.run_id = root.run_id;
+    child.instance_id = Some(2);
+    child.max_attempts = 5;
     child.depends_on_ids = vec![root.task_id];
+    child.depends_on_names = vec!["root".into()];
     let child = repo.enqueue(&child).await.unwrap();
+    assert_eq!(child.run_id, root.run_id);
+    assert_eq!(child.instance_id, Some(2));
+    assert_eq!(child.max_attempts, 5);
+    assert_eq!(child.depends_on_ids, [root.task_id]);
+    assert_eq!(child.depends_on_names, ["root"]);
     let mut missing = new_task("deps", "missing_dependency");
+    missing.run_id = root.run_id;
     missing.depends_on_ids = vec![999];
     let missing = repo.enqueue(&missing).await.unwrap();
 
@@ -414,7 +425,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     assert!(unchanged.output.is_none());
     assert_eq!(repo.list_all("atomic_success").await.unwrap().len(), 1);
 
-    // A node can attach its run ID during execution; successors must use the latest row.
+    // A node can change its run ID during execution; successors must use the latest row.
     sqlx::query("UPDATE tasks SET run_id = 9 WHERE workflow_id = 'atomic_success'")
         .execute(&pool)
         .await
@@ -557,12 +568,13 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     let (pool, repo) = memory_repo().await;
     let root = repo.enqueue(&new_task("cascade", "root")).await.unwrap();
     let mut child = new_task("cascade", "child");
+    child.run_id = root.run_id;
     child.depends_on_ids = vec![root.task_id];
     let child = repo.enqueue(&child).await.unwrap();
     let join = repo
         .enqueue_fanout(
             "cascade",
-            None,
+            root.run_id,
             "join",
             &[(None, json!({}))],
             &[],
@@ -635,7 +647,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     let late = repo
         .enqueue_fanout(
             "cascade",
-            None,
+            root.run_id,
             "late_join",
             &[(None, json!({}))],
             &[],
@@ -657,7 +669,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
 
 #[tokio::test]
 async fn cascade_matches_runs_for_named_and_direct_dependencies() {
-    let runs = [Some(1), Some(2), None, Some(0)];
+    let runs = [Some(1), Some(2), Some(3), Some(0)];
     for source_run in runs {
         let (_, repo) = memory_repo().await;
         let mut root = new_task("cascade_runs", "root");
@@ -741,6 +753,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
     let (pool, repo) = memory_repo().await;
     let root = repo.enqueue(&new_task("fencing", "root")).await.unwrap();
     let mut child = new_task("fencing", "child");
+    child.run_id = root.run_id;
     child.depends_on_ids = vec![root.task_id];
     let child = repo.enqueue(&child).await.unwrap();
     let first = repo

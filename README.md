@@ -30,6 +30,9 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 `pending`、`running`、`succeeded`、`failed`、`skipped`、`superseded`；数据库中的未知状态
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
+`Task::new(workflow_id, name, input)` 默认创建无依赖的独立运行入口，尝试预算为 3；
+入队前可设置 `run_id`、`depends_on_ids`、`depends_on_names`、`instance_id` 和 `max_attempts`。
+存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
 业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
 
 ## 引擎与工作流实例
@@ -213,8 +216,18 @@ cargo test --all-features
 cargo test --features sqlite --test sqlite_backend
 ```
 
-PostgreSQL 集成测试需要 `WORKFLOW_ENGINE_TEST_DATABASE_URL`（或 `DATABASE_URL`）；
-未设置时，这些测试会跳过数据库连接。
+PostgreSQL 测试默认通过 [Cargo 配置](.cargo/config.toml) 连接本地专用库
+`postgresql://workflow_engine_test@127.0.0.1:5432/workflow_engine_test`。
+首次配置本地 PostgreSQL 时，以有权限的用户创建测试角色和数据库：
+
+```bash
+createuser -h 127.0.0.1 -p 5432 --no-superuser --no-createdb --no-createrole workflow_engine_test
+createdb -h 127.0.0.1 -p 5432 --owner=workflow_engine_test workflow_engine_test
+cargo test --all-features --lib backend::pgsql::
+```
+
+每项测试在专用库中创建独立 schema。CI 或其他环境通过显式设置
+`WORKFLOW_ENGINE_TEST_DATABASE_URL` 覆盖连接地址；本地地址沿用 PostgreSQL 的回环连接认证配置。
 SQLite 测试使用内存数据库与临时文件，无需外部服务，覆盖并发认领、持久化重开和原子回滚。
 [`tests/sqlite_backend.rs`](tests/sqlite_backend.rs) 通过公开 API 验证不同上下文工作流的自动执行与并发提交共享执行槽。
 [`tests/unit/sqlite_scheduler.rs`](tests/unit/sqlite_scheduler.rs) 使用 `dsl::workflow!` 构建

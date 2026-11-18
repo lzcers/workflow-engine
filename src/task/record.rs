@@ -88,6 +88,7 @@ pub struct TaskRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub workflow_id: String,
+    /// Some(id) 加入指定运行；None 在入队时以新任务的 task_id 创建独立运行。
     pub run_id: Option<i64>,
     pub name: String,
     /// NULL=单实例；Some(i)=map 边扇出的第 i 个实例。
@@ -97,4 +98,20 @@ pub struct Task {
     /// JOIN 静态前驱节点名全集（普通节点默认空集）。
     pub depends_on_names: Vec<String>,
     pub input: Value,
+}
+
+impl Task {
+    /// 创建无依赖的独立运行入口；可在入队前设置 run_id、依赖、实例编号和尝试预算。
+    pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
+        Self {
+            workflow_id: workflow_id.into(),
+            run_id: None,
+            name: name.into(),
+            instance_id: None,
+            max_attempts: 3,
+            depends_on_ids: Vec::new(),
+            depends_on_names: Vec::new(),
+            input,
+        }
+    }
 }

@@ -19,7 +19,7 @@ pub struct SqliteTaskStore {
 }
 
 impl SqliteTaskStore {
-    /// 绑定仓储；新任务默认 `max_attempts = 3`。
+    /// 绑定仓储；后继任务默认 `max_attempts = 3`，入队任务使用 Task 中的预算。
     pub fn new(repo: SqliteTaskRepo) -> Self {
         Self {
             repo,
@@ -27,7 +27,7 @@ impl SqliteTaskStore {
         }
     }
 
-    /// 覆盖新建任务的最大尝试次数。
+    /// 覆盖结算时创建的后继任务的最大尝试次数。
     pub fn with_max_attempts(mut self, n: i32) -> Self {
         self.max_attempts = n;
         self
@@ -36,18 +36,6 @@ impl SqliteTaskStore {
 
 impl TaskStore for SqliteTaskStore {
     type Error = StorageError;
-
-    fn create_run<'a>(
-        &'a self,
-        workflow_id: &'a str,
-        entry: &'a str,
-        input: &'a Value,
-    ) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
-        Box::pin(
-            self.repo
-                .create_run(workflow_id, entry, input, self.max_attempts),
-        )
-    }
 
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
         Box::pin(self.repo.enqueue(task))

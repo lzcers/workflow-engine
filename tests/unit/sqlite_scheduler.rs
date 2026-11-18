@@ -111,11 +111,11 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     .unwrap();
 
     let root = repo
-        .create_run("dsl-workflow", "start", &json!(0), 3)
+        .enqueue(&Task::new("dsl-workflow", "start", json!(0)))
         .await
         .unwrap();
     let other_root = repo
-        .create_run("dsl-workflow", "start", &json!(100), 3)
+        .enqueue(&Task::new("dsl-workflow", "start", json!(100)))
         .await
         .unwrap();
     assert_eq!(root.run_id, Some(root.task_id));
