@@ -1,21 +1,25 @@
 //! 单图调度器：认领当前工作流所有运行的任务，执行节点并将图规划交给存储结算。
 //!
-//! 每个任务通过 [`NodeContext::fork`] 创建执行上下文，所有 run 共享并发额度。
-//! 任务完成、就绪通知和轮询都会触发认领；停止后等待已认领任务完成结算。
+//! 调度循环只负责补充执行槽；单个任务依次完成业务准备、原子结算和成功回调。
+//! 准备阶段持续续租，结算时由存储再次校验认领；所有 run 共享并发额度。
+//! 停止信号只停止认领，已认领任务仍会执行到结束。
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use futures::FutureExt;
+use serde_json::Value;
 use tokio::{
     sync::Notify,
     task::JoinSet,
     time::{sleep, timeout},
 };
-use tracing::{Instrument, error, info, warn};
+use tracing::{error, info, warn};
 
-use super::graph::{Graph, Successor};
-use super::node::{NodeContext, NodeError};
-use super::task::{FanoutPlan, TaskRecord, TaskStore, store::LEASE_DURATION};
+use crate::{
+    graph::{Graph, Successor},
+    node::{NodeContext, NodeError},
+    task::{FanoutPlan, TaskRecord, TaskStore, store::LEASE_DURATION},
+};
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
 
@@ -48,7 +52,8 @@ where
         }
     }
 
-    /// 覆盖当前工作流所有 run 共享的并发结算上限（默认 8，至少 1）。
+    /// 设置当前调度器所有 run 共享的并发任务上限（默认 8，至少 1）。
+    /// 执行槽覆盖业务执行、数据库结算和成功回调。
     pub fn with_max_concurrency(mut self, n: usize) -> Self {
         self.max_concurrency = n.max(1);
         self
@@ -66,12 +71,12 @@ where
     /// 正常停止不会取消业务节点；直接中止此 future 会取消在途节点且无法等待清理。
     /// 调度循环 panic 时取消并等待全部在途任务，再传播 panic。
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
+        // 每次启动都有独立身份，重启后不会沿用上一次的认领归属。
         let worker_id = uuid::Uuid::new_v4().to_string();
         let mut in_flight = JoinSet::new();
-        let outcome =
-            std::panic::AssertUnwindSafe(self.run_loop(&mut in_flight, &worker_id, shutdown))
-                .catch_unwind()
-                .await;
+        let outcome = AssertUnwindSafe(self.run_loop(&mut in_flight, &worker_id, shutdown))
+            .catch_unwind()
+            .await;
         if let Err(panic) = outcome {
             in_flight.shutdown().await;
             std::panic::resume_unwind(panic);
@@ -91,7 +96,7 @@ where
     ) {
         tokio::pin!(shutdown);
         loop {
-            // 认领事务不因停止信号被中断：已提交的认领先执行，再等待结算后退出。
+            // 即使一直有任务可认领，也先检查停止信号。
             tokio::select! {
                 biased;
                 _ = &mut shutdown => return,
@@ -105,38 +110,25 @@ where
 
             let available = self.max_concurrency - in_flight.len();
             if available > 0 {
-                let claim = self
-                    .store
-                    .claim_many(self.graph.workflow_id(), worker_id, available);
+                // shutdown 可以包含异步工作，认领期间也要持续轮询它。
+                let claim = self.claim_and_spawn(in_flight, worker_id, available);
                 tokio::pin!(claim);
-                let (claimed, stopping) = tokio::select! {
+                tokio::select! {
                     biased;
-                    _ = &mut shutdown => (claim.await, true),
-                    claimed = &mut claim => (claimed, false),
-                };
-                match claimed {
-                    Ok(tasks) if !tasks.is_empty() => {
-                        info!(count = tasks.len(), "claim tasks");
-                        for task in tasks {
-                            in_flight.spawn(settle_safely(
-                                self.graph.clone(),
-                                self.store.clone(),
-                                task,
-                            ));
-                        }
-                        if stopping {
-                            return;
-                        }
-                        continue;
+                    _ = &mut shutdown => {
+                        // 事务可能已提交，必须接收并启动本批任务，再由 run 等待结算。
+                        claim.await;
+                        return;
                     }
-                    Ok(_) => {}
-                    Err(e) => error!(error = %e, "worker claim failed"),
-                }
-                if stopping {
-                    return;
+                    count = &mut claim => {
+                        if count > 0 {
+                            continue;
+                        }
+                    }
                 }
             }
 
+            // 满槽时只等待任务结束或停止，不做无效轮询，也不消耗就绪通知。
             tokio::select! {
                 biased;
                 _ = &mut shutdown => return,
@@ -150,13 +142,42 @@ where
             }
         }
     }
+
+    /// 按空槽数认领并启动任务，返回本批数量；调用方必须完整等待此过程。
+    async fn claim_and_spawn(
+        &self,
+        in_flight: &mut JoinSet<()>,
+        worker_id: &str,
+        limit: usize,
+    ) -> usize {
+        match self
+            .store
+            .claim_many(self.graph.workflow_id(), worker_id, limit)
+            .await
+        {
+            Ok(tasks) => {
+                let count = tasks.len();
+                if count > 0 {
+                    info!(count, "claim tasks");
+                }
+                for task in tasks {
+                    in_flight.spawn(run_task(self.graph.clone(), self.store.clone(), task));
+                }
+                count
+            }
+            Err(error) => {
+                error!(error = %error, "worker claim failed");
+                0
+            }
+        }
+    }
 }
 
-/// 节点执行与规划完成后的结果；业务钩子和数据库结算分阶段管理租约。
+/// 业务执行与后继规划的结果。成功时保留上下文，供提交后的 on_success 使用。
 enum PreparedTask<Ctx> {
     Success {
         context: Ctx,
-        output: serde_json::Value,
+        output: Value,
         successors: Vec<FanoutPlan>,
     },
     Failure {
@@ -165,6 +186,98 @@ enum PreparedTask<Ctx> {
     },
 }
 
+/// 单个认领的完整生命周期；续租失败、结算失败或 panic 都进入同一释放路径。
+#[tracing::instrument(
+    name = "settle",
+    skip_all,
+    fields(
+        workflow_id = %task.workflow_id,
+        task_id = task.task_id,
+        attempt = task.attempt,
+        worker_id = task.claimed_by.as_deref(),
+        name = task.name.as_str(),
+    )
+)]
+async fn run_task<Ctx, S>(graph: Arc<Graph<Ctx>>, store: Arc<S>, task: TaskRecord)
+where
+    Ctx: NodeContext + Sync + 'static,
+    S: TaskStore + Send + ?Sized + 'static,
+{
+    let work = async {
+        let prepared = prepare_with_lease(graph.as_ref(), store.as_ref(), &task)
+            .await
+            .ok_or(())?;
+        settle(graph.as_ref(), store.as_ref(), &task, prepared)
+            .await
+            .map_err(|error| {
+                error!(error = %error, "settle transaction failed; releasing claim");
+            })
+    };
+    match AssertUnwindSafe(work).catch_unwind().await {
+        Ok(Ok(())) => return,
+        Ok(Err(())) => {}
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("(non-string panic payload)");
+            error!(panic = %detail, "settle task panicked; releasing claim");
+        }
+    }
+
+    // 释放也校验认领凭据；已过期、被接管或已结算的任务不会被这次清理修改。
+    if let Err(error) = store.release_claim(&task).await {
+        warn!(error = %error, "could not release task claim");
+    }
+}
+
+/// 只为业务准备续租；失去执行权返回 None，不生成业务失败后继。
+async fn prepare_with_lease<Ctx, S>(
+    graph: &Graph<Ctx>,
+    store: &S,
+    task: &TaskRecord,
+) -> Option<PreparedTask<Ctx>>
+where
+    Ctx: NodeContext + Sync,
+    S: TaskStore + ?Sized,
+{
+    // 认领返回后也可能经历进程暂停；fork 和业务钩子之前重新验证租约。
+    if !renew_claim(store, task).await {
+        return None;
+    }
+    let heartbeat = async {
+        loop {
+            sleep(LEASE_DURATION / 3).await;
+            if !renew_claim(store, task).await {
+                return;
+            }
+        }
+    };
+    // 同时就绪时优先处理续租失败。丢弃准备 future 不会撤回已有的外部副作用。
+    tokio::select! {
+        biased;
+        _ = heartbeat => None,
+        prepared = prepare(graph, task) => Some(prepared),
+    }
+}
+
+/// 无法确认租约有效时停止准备；限制单次续租耗时，避免数据库阻塞后仍持续执行。
+async fn renew_claim<S: TaskStore + ?Sized>(store: &S, task: &TaskRecord) -> bool {
+    match timeout(LEASE_DURATION / 3, store.renew_claim(task)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!(error = %error, "claim renewal failed; stopping task execution");
+            false
+        }
+        Err(_) => {
+            warn!("claim renewal timed out; stopping task execution");
+            false
+        }
+    }
+}
+
+/// fork 独立上下文、执行节点并规划后继；此阶段不提交任务状态。
 async fn prepare<Ctx>(graph: &Graph<Ctx>, task: &TaskRecord) -> PreparedTask<Ctx>
 where
     Ctx: NodeContext + Sync,
@@ -181,6 +294,7 @@ where
                     successors: successors.into_iter().map(FanoutPlan::from).collect(),
                 };
             }
+            // 无法规划成功后继时，按不可重试的业务错误进入失败路径。
             Err(error) => NodeError::permanent(error.to_string()),
         },
         Err(error) => error,
@@ -200,50 +314,7 @@ where
     }
 }
 
-/// 续租出错或超时后，不再继续业务执行。释放与结算另由数据库检查认领归属。
-async fn renew_claim<S: TaskStore + ?Sized>(store: &S, task: &TaskRecord) -> bool {
-    match timeout(LEASE_DURATION / 3, store.renew_claim(task)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            warn!(error = %error, "claim renewal failed; stopping task execution");
-            false
-        }
-        Err(_) => {
-            warn!("claim renewal timed out; stopping task execution");
-            false
-        }
-    }
-}
-
-async fn prepare_with_lease<Ctx, S>(
-    graph: &Graph<Ctx>,
-    store: &S,
-    task: &TaskRecord,
-) -> Option<PreparedTask<Ctx>>
-where
-    Ctx: NodeContext + Sync,
-    S: TaskStore + ?Sized,
-{
-    // 认领返回后也可能经历进程暂停；开始业务前重新验证租约，拒绝过期任务。
-    if !renew_claim(store, task).await {
-        return None;
-    }
-    let heartbeat = async {
-        loop {
-            sleep(LEASE_DURATION / 3).await;
-            if !renew_claim(store, task).await {
-                return;
-            }
-        }
-    };
-    tokio::select! {
-        biased;
-        _ = heartbeat => None,
-        prepared = prepare(graph, task) => Some(prepared),
-    }
-}
-
-/// 数据库结算校验 owner、attempt 和租约；提交后的成功回调无需再续租。
+/// 原子提交任务状态与后继；续租已结束，存储必须再次校验 owner、attempt 和租约。
 async fn settle<Ctx, S>(
     graph: &Graph<Ctx>,
     store: &S,
@@ -261,6 +332,7 @@ where
             successors,
         } => {
             store.settle_success(task, &output, &successors).await?;
+            // 成功提交后任务已是终态，不再续租；只有持久化成功才调用成功钩子。
             graph.on_success(&task.name, &mut context, &output).await;
             Ok(())
         }
@@ -269,47 +341,6 @@ where
             successors,
         } => store.settle_failure(task, &message, &successors).await,
     }
-}
-
-/// 记录执行错误与 panic，释放认领供重试；旧认领的释放会被数据库拒绝。
-async fn settle_safely<Ctx, S>(graph: Arc<Graph<Ctx>>, store: Arc<S>, task: TaskRecord)
-where
-    Ctx: NodeContext + Sync + 'static,
-    S: TaskStore + Send + ?Sized + 'static,
-{
-    let span = tracing::info_span!(
-        "settle", workflow_id = %task.workflow_id, task_id = task.task_id,
-        attempt = task.attempt, worker_id = task.claimed_by.as_deref(), name = task.name.as_str(),
-    );
-    async {
-        let work = async {
-            let prepared = prepare_with_lease(graph.as_ref(), store.as_ref(), &task)
-                .await
-                .ok_or(())?;
-            settle(graph.as_ref(), store.as_ref(), &task, prepared)
-                .await
-                .map_err(|error| {
-                    error!(error = %error, "settle transaction failed; releasing claim");
-                })
-        };
-        match std::panic::AssertUnwindSafe(work).catch_unwind().await {
-            Ok(Ok(())) => return,
-            Ok(Err(())) => {}
-            Err(panic) => {
-                let detail = panic
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("(non-string panic payload)");
-                error!(panic = %detail, "settle task panicked; releasing claim");
-            }
-        }
-        if let Err(error) = store.release_claim(&task).await {
-            warn!(error = %error, "could not release task claim");
-        }
-    }
-    .instrument(span)
-    .await;
 }
 
 /// 存储只接收入队计划，不依赖图类型。
