@@ -297,6 +297,10 @@ let description = graph.describe();
 
 ## 开发
 
+测试代码统一放在 `tests/`：顶层 `.rs` 文件是集成测试，`unit/` 存放单元测试与
+测试辅助代码，`doctests/` 存放编译失败示例。单元测试通过 `#[cfg(test)]` + `#[path]`
+在所属模块中加载，保留私有成员访问；文档测试通过 `include_str!` 嵌入 API 文档。
+
 ```bash
 # 类型检查 / 测试
 cargo check

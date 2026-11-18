@@ -25,6 +25,7 @@ mod schema;
 mod store;
 
 #[cfg(test)]
+#[path = "../../../tests/unit/pgsql_support.rs"]
 mod test_support;
 
 pub use repo::{PgTaskRepo, ROW_COLS, TASK_READY_CHANNEL, notify_tasks_ready};

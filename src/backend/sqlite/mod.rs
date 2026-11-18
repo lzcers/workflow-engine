@@ -15,6 +15,7 @@ mod schema;
 mod store;
 
 #[cfg(test)]
+#[path = "../../../tests/unit/sqlite.rs"]
 mod tests;
 
 pub use repo::{ROW_COLS, SqliteTaskRepo};
