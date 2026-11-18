@@ -10,8 +10,8 @@
 //! 引擎表不持有指向业务表的 FK；消费方在自己的业务表之外执行 [`migrate`] 建立引擎表，
 //! 再以 `ALTER TABLE` 补充业务完整性约束（如 FK 到自己的业务表）。
 //!
-//! 宿主应用监听 [`TASK_READY_CHANNEL`] 并按 payload 唤醒调度器，恢复时调用
-//! [`PgTaskRepo::seal_budget_exhausted`] 和 [`PgTaskRepo::executable_workflow_ids`]。
+//! 每个 Workflow 的调度器轮询本图任务，接管到期认领；预算耗尽后重新认领仅用于
+//! 最终失败结算，失败状态与后继入队或依赖失败传播在同一事务内完成。
 //!
 //! 子模块划分：
 //! - [`repo`]：[`PgTaskRepo`]，通用 SQL 持久化操作（与业务查询解耦）；

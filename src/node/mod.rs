@@ -60,7 +60,8 @@ pub trait Node<Ctx>: Send + Sync {
     fn on_success(_ctx: &mut Ctx, _out: &Value) -> impl Future<Output = ()> + Send {
         async {}
     }
-    /// 执行失败后回调。`err` 为节点错误，发生在任务落库为失败之前。
+    /// 失败结算提交后回调。`err` 为节点错误或尝试预算耗尽原因。
+    /// 回调不阻塞后继认领，也不保证必达；进程退出或处理窗口到期时可能被取消。
     fn on_error(_ctx: &mut Ctx, _err: &NodeError) -> impl Future<Output = ()> + Send {
         async {}
     }

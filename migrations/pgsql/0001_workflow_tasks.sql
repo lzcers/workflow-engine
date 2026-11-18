@@ -52,9 +52,9 @@ COMMENT ON COLUMN tasks.producer_task_id IS '首次创建任务的源任务 ID�
 COMMENT ON COLUMN tasks.instance_id IS '节点扇出的实例序号；NULL 表示单实例，每个创建者的多实例从 0 开始编号，与 workflow_id、run_id、producer_task_id、name 一起用于扇出去重。';
 COMMENT ON COLUMN tasks.status IS '任务状态：pending 待认领，running 已认领，succeeded 成功，failed 永久失败，skipped 跳过，superseded 失败已由后继接管。';
 COMMENT ON COLUMN tasks.claimed_by IS '最近一次认领任务的 worker 标识；未认领时为 NULL，任务结算后保留，不代表租约仍有效。';
-COMMENT ON COLUMN tasks.lease_until IS '认领租约的到期时间；NULL 表示无有效租约，pending/running 任务在无租约或租约到期后可按依赖和次数预算重新认领；结算或释放时清空。';
-COMMENT ON COLUMN tasks.attempt IS '该任务行已被认领的次数；初始为 0，每次认领加 1，包括首次执行及租约回收后的重新执行。';
-COMMENT ON COLUMN tasks.max_attempts IS '该任务行允许被认领的总次数，默认 3（含首次执行）；预算耗尽且再次满足执行条件时封存为 failed，失败边新建任务单独计数。';
+COMMENT ON COLUMN tasks.lease_until IS '本次认领的固定处理截止时间，不续租；NULL 表示无有效租约，pending/running 任务在无租约或到期后可按依赖重新认领；结算或释放时清空。';
+COMMENT ON COLUMN tasks.attempt IS '认领代次；初始为 0，每次认领加 1，用于写入校验；超过 max_attempts 的认领只处理最终失败，不再执行业务。';
+COMMENT ON COLUMN tasks.max_attempts IS '该任务行的业务执行次数上限，默认 3（含首次）；耗尽后重新认领并通过统一失败流程结算，失败边新建任务单独计数。';
 COMMENT ON COLUMN tasks.depends_on_ids IS '直接依赖的任务 ID 数组，引用同一 workflow_id 下的 task_id；用于依赖就绪判定、扇入合并、溯源及失败级联，空数组表示无直接依赖。';
 COMMENT ON COLUMN tasks.depends_on_names IS '静态前驱节点名数组；join 认领时要求同一 workflow_id、run_id 下每个前驱至少有一个实例且全部实例成功，同时用于血缘记录及失败级联。';
 COMMENT ON COLUMN tasks.task_type IS '节点声明的任务类型：normal 为普通节点，join 为汇合节点；join 额外检查 depends_on_names 中的静态前驱是否全部就绪。';

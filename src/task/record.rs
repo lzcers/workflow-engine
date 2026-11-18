@@ -68,9 +68,11 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     /// 最近一次认领的执行器身份；Scheduler 每次启动生成新的 UUID。
     pub claimed_by: Option<String>,
+    /// 本次认领的固定处理截止时间，覆盖执行与结算，不续租。
     pub lease_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// 每次认领递增，作为认领代次参与写入校验。
+    /// 每次认领递增的代次，用于写入校验；超过 max_attempts 后只处理最终失败。
     pub attempt: i32,
+    /// 业务执行的最大尝试次数；最终失败的恢复认领不再执行业务。
     pub max_attempts: i32,
     /// 任务类型（`normal`/`join`）：由节点 `TASK_TYPE` 声明，决定存储的等齐前驱闸门。
     pub task_type: String,

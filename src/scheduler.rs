@@ -1,7 +1,7 @@
 //! 单图调度器：认领当前工作流所有运行的任务，执行节点并将图规划交给存储结算。
 //!
 //! 调度循环只负责补充执行槽；单个任务依次完成业务执行与后继规划、原子结算和成功回调。
-//! 执行阶段持续续租，结算时由存储再次校验认领；所有 run 共享并发额度。
+//! 认领租约限定本次处理窗口，结算时由存储再次校验认领；所有 run 共享并发额度。
 //! 调度循环随所属实例释放而取消，同时取消在途任务。
 
 use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
@@ -11,14 +11,14 @@ use serde_json::Value;
 use tokio::{
     sync::Notify,
     task::JoinSet,
-    time::{sleep, timeout},
+    time::{Instant, sleep, sleep_until},
 };
 use tracing::{error, info, warn};
 
 use crate::{
     graph::{Graph, Successor},
     node::{NodeContext, NodeError},
-    task::{FanoutPlan, TaskRecord, TaskStore, store::LEASE_DURATION},
+    task::{FanoutPlan, TaskRecord, TaskStore},
 };
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -148,12 +148,13 @@ enum ExecutionOutcome<Ctx> {
         successors: Vec<FanoutPlan>,
     },
     Failure {
-        message: String,
+        context: Option<Ctx>,
+        error: NodeError,
         successors: Vec<FanoutPlan>,
     },
 }
 
-/// 单个认领的完整生命周期；续租失败、结算失败或 panic 都进入同一释放路径。
+/// 单个认领的完整生命周期；固定窗口覆盖执行、结算、回调和异常释放。
 #[tracing::instrument(
     name = "settle",
     skip_all,
@@ -170,10 +171,20 @@ where
     Ctx: NodeContext + Sync + 'static,
     S: TaskStore + Send + ?Sized + 'static,
 {
+    // 认领到开始处理之间的等待也消耗窗口；过期快照不能再进入业务代码。
+    let started_at = Instant::now();
+    let Some(remaining) = task
+        .lease_until
+        .and_then(|until| (until - chrono::Utc::now()).to_std().ok())
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        warn!("claim has no remaining processing window");
+        return;
+    };
+    let deadline = started_at + remaining;
+
     let work = async {
-        let outcome = execute_with_lease(graph.as_ref(), store.as_ref(), &task)
-            .await
-            .ok_or(())?;
+        let outcome = execute_and_plan(graph.as_ref(), &task).await;
 
         settle(graph.as_ref(), store.as_ref(), &task, outcome)
             .await
@@ -181,77 +192,50 @@ where
                 error!(error = %error, "settle transaction failed; releasing claim");
             })
     };
-    match AssertUnwindSafe(work).catch_unwind().await {
-        Ok(Ok(())) => return,
-        Ok(Err(())) => {}
-        Err(panic) => {
-            let detail = panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("(non-string panic payload)");
-            error!(panic = %detail, "settle task panicked; releasing claim");
-        }
-    }
-
-    // 释放也校验认领凭据；已过期、被接管或已结算的任务不会被这次清理修改。
-    if let Err(error) = store.release_claim(&task).await {
-        warn!(error = %error, "could not release task claim");
-    }
-}
-
-/// 执行节点并规划后继，期间持续续租；失去执行权返回 None，不生成业务失败后继。
-async fn execute_with_lease<Ctx, S>(
-    graph: &Graph<Ctx>,
-    store: &S,
-    task: &TaskRecord,
-) -> Option<ExecutionOutcome<Ctx>>
-where
-    Ctx: NodeContext + Sync,
-    S: TaskStore + ?Sized,
-{
-    // 认领返回后也可能经历进程暂停；fork 和业务钩子之前重新验证租约。
-    if !renew_claim(store, task).await {
-        return None;
-    }
-    // 任务执行期间持续续租
-    let heartbeat = async {
-        loop {
-            sleep(LEASE_DURATION / 3).await;
-            if !renew_claim(store, task).await {
-                return;
+    let lifecycle = async {
+        match AssertUnwindSafe(work).catch_unwind().await {
+            Ok(Ok(())) => return,
+            Ok(Err(())) => {}
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("(non-string panic payload)");
+                error!(panic = %detail, "settle task panicked; releasing claim");
             }
         }
+
+        // 释放也校验认领凭据；已过期、被接管或已结算的任务不会被这次清理修改。
+        if let Err(error) = store.release_claim(&task).await {
+            warn!(error = %error, "could not release task claim");
+        }
     };
-    // 同时就绪时优先处理续租失败。丢弃执行 future 不会撤回已有的外部副作用。
+    // 截止时间优先：到期丢弃本地 future、释放执行槽，由下一次认领重试或处理最终失败。
+    // 已提交的结算不会回滚，已发生的外部副作用不会撤回。
     tokio::select! {
         biased;
-        _ = heartbeat => None,
-        outcome = execute_and_plan(graph, task) => Some(outcome),
+        _ = sleep_until(deadline) => {
+            warn!("claim processing window elapsed; stopping local work");
+        }
+        _ = lifecycle => {}
     }
 }
 
-/// 无法确认租约有效时停止执行；限制单次续租耗时，避免数据库阻塞后仍持续执行。
-async fn renew_claim<S: TaskStore + ?Sized>(store: &S, task: &TaskRecord) -> bool {
-    match timeout(LEASE_DURATION / 3, store.renew_claim(task)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            warn!(error = %error, "claim renewal failed; stopping task execution");
-            false
-        }
-        Err(_) => {
-            warn!("claim renewal timed out; stopping task execution");
-            false
-        }
-    }
-}
-
-/// fork 独立上下文、执行节点并规划后继；此阶段不提交任务状态。
+/// fork 独立上下文并规划结算；预算耗尽的认领只走最终失败流程，不再执行节点。
 async fn execute_and_plan<Ctx>(graph: &Graph<Ctx>, task: &TaskRecord) -> ExecutionOutcome<Ctx>
 where
     Ctx: NodeContext + Sync,
 {
     let name = task.name.as_str();
+    if task.attempt > task.max_attempts {
+        let error = NodeError::permanent(
+            task.error
+                .as_deref()
+                .expect("exhausted claims must carry their final failure reason"),
+        );
+        return plan_failure(graph, task, None, error);
+    }
     let mut context = graph.context().fork(task).await;
     graph.on_start(name, &mut context, &task.input).await;
     let error = match graph.execute(name, &mut context, task.input.clone()).await {
@@ -268,9 +252,21 @@ where
         },
         Err(error) => error,
     };
+    plan_failure(graph, task, Some(context), error)
+}
+
+/// 业务错误与预算耗尽共用失败后继规划；错误回调在结算成功后执行。
+fn plan_failure<Ctx>(
+    graph: &Graph<Ctx>,
+    task: &TaskRecord,
+    context: Option<Ctx>,
+    error: NodeError,
+) -> ExecutionOutcome<Ctx>
+where
+    Ctx: NodeContext + Sync,
+{
     warn!(error = %error, "task failed");
-    graph.on_error(name, &mut context, &error).await;
-    let successors = match graph.plan_failure(name, &task.input, &error) {
+    let successors = match graph.plan_failure(&task.name, &task.input, &error) {
         Ok(successors) => successors.into_iter().map(FanoutPlan::from).collect(),
         Err(error) => {
             warn!(error = %error, "plan failure successors failed");
@@ -278,12 +274,13 @@ where
         }
     };
     ExecutionOutcome::Failure {
-        message: error.to_string(),
+        context,
+        error,
         successors,
     }
 }
 
-/// 原子提交任务状态与后继；续租已结束，存储必须再次校验 owner、attempt 和租约。
+/// 原子提交任务状态与后继；存储再次校验 owner、attempt 和固定租约期限。
 async fn settle<Ctx, S>(
     graph: &Graph<Ctx>,
     store: &S,
@@ -301,14 +298,26 @@ where
             successors,
         } => {
             store.settle_success(task, &output, &successors).await?;
-            // 成功提交后任务已是终态，不再续租；只有持久化成功才调用成功钩子。
+            // 成功提交后任务已是终态；成功钩子仍受本次处理窗口限制。
             graph.on_success(&task.name, &mut context, &output).await;
             Ok(())
         }
         ExecutionOutcome::Failure {
-            message,
+            context,
+            error,
             successors,
-        } => store.settle_failure(task, &message, &successors).await,
+        } => {
+            store
+                .settle_failure(task, &error.to_string(), &successors)
+                .await?;
+            // 恢复结算不依赖业务上下文；即使 fork 或错误钩子卡住，终态与后继已经持久化。
+            let mut context = match context {
+                Some(context) => context,
+                None => graph.context().fork(task).await,
+            };
+            graph.on_error(&task.name, &mut context, &error).await;
+            Ok(())
+        }
     }
 }
 
@@ -323,3 +332,7 @@ impl From<Successor> for FanoutPlan {
         }
     }
 }
+
+#[cfg(all(test, feature = "sqlite"))]
+#[path = "../tests/unit/scheduler.rs"]
+mod tests;

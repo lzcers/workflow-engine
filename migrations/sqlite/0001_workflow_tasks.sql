@@ -32,12 +32,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     ),
     -- 最近一次认领任务的 worker 标识；未认领时为 NULL，结算后保留，不代表租约仍有效。
     claimed_by TEXT,
-    -- 租约到期时间（UTC 文本）；NULL 表示无有效租约，结算或释放时清空。
-    -- pending/running 任务在无租约或租约到期后可按依赖和次数预算重新认领。
+    -- 本次认领的固定处理截止时间（UTC 文本），不续租；NULL 表示无有效租约，结算或释放时清空。
+    -- pending/running 任务在无租约或到期后可按依赖重新认领。
     lease_until TEXT,
-    -- 该任务行已被认领的次数；从 0 开始，每次认领加 1，包括首次及租约回收后的重新执行。
+    -- 认领代次，从 0 开始，每次认领加 1；超过 max_attempts 后只处理最终失败，不再执行业务。
     attempt INTEGER NOT NULL DEFAULT 0,
-    -- 该任务行允许被认领的总次数（含首次）；耗尽且再次满足执行条件时封存为 failed。
+    -- 该任务行的业务执行次数上限（含首次）；耗尽后重新认领并通过统一失败流程结算。
     -- 失败边新建的任务单独计数。
     max_attempts INTEGER NOT NULL DEFAULT 3,
     -- 直接依赖的任务 ID JSON 数组，引用同一 workflow_id 下的 task_id。

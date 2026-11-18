@@ -5,9 +5,9 @@
 //! 数组与 JSON 输入输出存为 JSON 文本，时间存为 UTC 文本。
 //! 写事务通过 `BEGIN IMMEDIATE` 串行化，保证并发认领和扇入合并的原子性。
 //!
-//! SQLite 没有 LISTEN/NOTIFY；宿主应用定期调用
-//! [`SqliteTaskRepo::seal_budget_exhausted`] 和 [`SqliteTaskRepo::executable_workflow_ids`]，
-//! 为就绪工作流创建或唤醒调度器，发现其他连接提交的任务并恢复到期租约。
+//! SQLite 没有 LISTEN/NOTIFY；工作流创建时启动调度器，通过轮询发现其他连接提交的任务。
+//! 固定执行窗口到期后可重新认领；预算耗尽的任务取得新的结算认领，
+//! 由调度器规划失败后继并原子结算，恢复时不再执行节点。
 
 mod repo;
 mod rows;

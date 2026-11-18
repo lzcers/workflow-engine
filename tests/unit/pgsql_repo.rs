@@ -4,7 +4,7 @@ use serde_json::json;
 use sqlx::postgres::PgListener;
 
 use super::super::test_support::connect_test;
-use super::BUDGET_EXHAUSTED_ERR;
+use super::{BUDGET_EXHAUSTED_ERR, WINDOW_EXPIRED_ERR};
 use super::{PgTaskRepo, TASK_READY_CHANNEL};
 use crate::error::StorageError;
 use crate::task::FanoutInstances;
@@ -592,7 +592,7 @@ async fn claims_require_all_dependencies_including_missing_ids() {
 }
 
 /// 恢复扫描只返回「存在可认领任务」的工作流（与 `claim_many` 同款闸门）：
-/// 可认领（pending 无依赖）命中；被依赖阻塞、已全部成功、重试预算耗尽的工作流不命中。
+/// 待执行和待最终失败结算的工作流均命中；被依赖阻塞或已全部成功的工作流不命中。
 #[tokio::test]
 async fn executable_workflow_ids_only_returns_claimable_sessions() {
     let Some(database) = connect_test().await else {
@@ -638,7 +638,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     let finished = repo.claim_many(done, "worker", 1).await.unwrap().remove(0);
     repo.succeed(&finished, &json!({})).await.unwrap();
 
-    // 预算耗尽：attempt >= max_attempts（认领三次后不再被认领）→ 不命中。
+    // 预算耗尽后仍需认领，以通过图的统一失败流程结算。
     let exhausted = "exec_sess_exhausted";
     insert_task(&repo, exhausted, "narration", vec![]).await;
     for _ in 0..3 {
@@ -654,102 +654,132 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     sessions.sort();
     assert_eq!(
         sessions,
-        vec![claimable.to_string()],
-        "只应命中可认领会话，阻塞/成功/耗尽均不命中"
+        vec![claimable.to_string(), exhausted.to_string()],
+        "可执行业务或需最终失败结算的工作流都应被发现"
     );
 }
 
-/// 「恢复封存」清扫预算耗尽的残留行：租约过期、依赖齐备、attempt >= max_attempts
-/// 的任务被全量置为 `failed`；有剩余预算的任务不受影响。
-///
-/// 对应线上事故形态：任务经租约过期被反复重认领刷满 attempt，进程重启后恢复扫描
-/// 找不到该工作流（同款 `attempt < max_attempts` 闸门），`claim_many` 内的封存
-/// 永不执行，行永久停在 running。
+/// 预算耗尽后重新认领，只允许原子失败结算；旧认领不能修改恢复者或创建失败后继。
 #[tokio::test]
-async fn recovery_seal_marks_budget_exhausted_rows_failed() {
+async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     let Some(database) = connect_test().await else {
         return;
     };
     let repo = PgTaskRepo::new(database.pool().clone());
-
-    // 预算耗尽残留：认领 3 次刷满 attempt，模拟「租约过期被杀、无人再碰」。
-    let stale = "recovery_seal_stale";
-    let stale_task = repo
-        .enqueue(&Task {
-            workflow_id: stale.to_string(),
-            run_id: None,
-            name: "scene_proposal".to_string(),
-            producer_task_id: None,
-            instance_id: None,
-            max_attempts: 3,
-            depends_on_ids: vec![],
-            depends_on_names: vec![],
-            input: json!({}),
-        })
+    let workflow_id = "exhausted-recovery";
+    let mut input = Task::new(workflow_id, "source", json!({}));
+    input.max_attempts = 1;
+    let root = repo.enqueue(&input).await.unwrap();
+    let old = repo
+        .claim_many(workflow_id, "old", 1)
         .await
-        .unwrap();
-    for attempt in 0..3 {
-        repo.claim_many(stale, "worker", 5).await.unwrap();
-        if attempt < 2 {
-            sqlx::query(
-                "UPDATE tasks SET lease_until = NOW() - interval '1 second' WHERE workflow_id = $1 AND task_id = $2",
-            )
-            .bind(stale)
-            .bind(stale_task.task_id)
-            .execute(database.pool())
-            .await
-            .unwrap();
-        }
-    }
-    let still_running = repo.get(stale, stale_task.task_id).await.unwrap().unwrap();
-    assert_eq!(still_running.status, TaskStatus::Running);
-    assert_eq!(still_running.attempt, 3);
+        .unwrap()
+        .remove(0);
+    assert_eq!(old.attempt, 1);
     assert!(
-        still_running.lease_until.is_some(),
-        "行仍持有有效租约（进程存活时封存不应误伤在途执行）"
+        repo.claim_many(workflow_id, "recovery", 1)
+            .await
+            .unwrap()
+            .is_empty()
     );
+    sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1")
+        .bind(workflow_id).execute(database.pool()).await.unwrap();
+    assert_eq!(repo.executable_workflow_ids().await.unwrap(), [workflow_id]);
+    let recovery = repo
+        .claim_many(workflow_id, "recovery", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(recovery.task_id, root.task_id);
+    assert_eq!(recovery.attempt, 2);
+    assert_eq!(recovery.status, TaskStatus::Running);
+    assert_eq!(recovery.error.as_deref(), Some(WINDOW_EXPIRED_ERR));
+    reject_stale_writes(&repo, &old).await;
+    assert!(matches!(
+        repo.succeed(&recovery, &json!("forbidden")).await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+    let mut forged_budget = recovery.clone();
+    forged_budget.max_attempts = 100;
+    assert!(matches!(
+        repo.succeed(&forged_budget, &json!("forbidden")).await,
+        Err(StorageError::ClaimLost { .. })
+    ));
 
-    // 先模拟租约过期（如进程重启后），恢复封存才应命中。
+    let fanout = FanoutInstances {
+        name: "handle_failure".into(),
+        task_type: "normal".into(),
+        instances: vec![(None, json!({"reason": "timeout"}))],
+        depends_on_names: vec![],
+    };
+    let mut invalid = fanout.clone();
+    invalid.name = "invalid".into();
     sqlx::query(
-        "UPDATE tasks SET lease_until = NOW() - interval '1 second' WHERE workflow_id = $1 AND task_id = $2",
+        "ALTER TABLE tasks ADD CONSTRAINT reject_recovery_successor CHECK (name <> 'invalid')",
     )
-    .bind(stale)
-    .bind(stale_task.task_id)
     .execute(database.pool())
     .await
     .unwrap();
-
-    // 对照工作流：有剩余预算（pending, attempt=0），封存不该动它。
-    let fresh = "recovery_seal_fresh";
-    repo.enqueue(&Task {
-        workflow_id: fresh.to_string(),
-        run_id: None,
-        name: "narration".to_string(),
-        producer_task_id: None,
-        instance_id: None,
-        max_attempts: 3,
-        depends_on_ids: vec![],
-        depends_on_names: vec![],
-        input: json!({}),
-    })
-    .await
-    .unwrap();
-
-    let sealed = repo.seal_budget_exhausted().await.unwrap();
-    assert_eq!(sealed, 1, "只应封存滞留在可执行态的预算耗尽行");
-
-    let settled = repo.get(stale, stale_task.task_id).await.unwrap().unwrap();
-    assert_eq!(settled.status, TaskStatus::Failed);
-    assert_eq!(
-        settled.error.as_deref(),
-        Some(BUDGET_EXHAUSTED_ERR),
-        "封存错误信息与 claim_many 内封存保持一致"
+    assert!(
+        repo.fail_and_enqueue(&recovery, WINDOW_EXPIRED_ERR, &[fanout.clone(), invalid], 3)
+            .await
+            .is_err()
     );
-    assert!(settled.lease_until.is_none(), "封存应清空租约");
+    let unchanged = repo.get(workflow_id, root.task_id).await.unwrap().unwrap();
+    assert_eq!(unchanged.status, TaskStatus::Running);
+    assert_eq!(unchanged.attempt, recovery.attempt);
+    assert_eq!(unchanged.lease_until, recovery.lease_until);
+    assert_eq!(repo.list_all(workflow_id).await.unwrap().len(), 1);
+    sqlx::query("ALTER TABLE tasks DROP CONSTRAINT reject_recovery_successor")
+        .execute(database.pool())
+        .await
+        .unwrap();
 
-    // 预算充足的工作流不受影响，仍可认领。
-    let claimed = repo.claim_many(fresh, "worker", 5).await.unwrap();
-    assert_eq!(claimed.len(), 1);
+    // 失败结算自身也允许重新认领，首次保存的超时原因不能被释放租约覆盖。
+    repo.release_claim(&recovery).await.unwrap();
+    let next = repo
+        .claim_many(workflow_id, "next", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(next.attempt, 3);
+    assert_eq!(next.error.as_deref(), Some(WINDOW_EXPIRED_ERR));
+    reject_stale_writes(&repo, &recovery).await;
+    repo.fail_and_enqueue(&next, WINDOW_EXPIRED_ERR, &[fanout], 3)
+        .await
+        .unwrap();
+    let rows = repo.list_all(workflow_id).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].status, TaskStatus::Superseded);
+    assert_eq!(rows[0].error.as_deref(), Some(WINDOW_EXPIRED_ERR));
+    assert!(rows[0].lease_until.is_none());
+    assert_eq!(rows[1].status, TaskStatus::Pending);
+    assert_eq!(rows[1].producer_task_id, Some(root.task_id));
+    assert!(rows[1].depends_on_ids.is_empty());
+    reject_stale_writes(&repo, &next).await;
+
+    // 无执行预算的任务也通过失败结算传播到依赖，不会被直接封存。
+    let mut input = Task::new("zero-budget", "source", json!({}));
+    input.max_attempts = 0;
+    let zero = repo.enqueue(&input).await.unwrap();
+    let mut child = Task::new("zero-budget", "dependent", json!({}));
+    child.run_id = zero.run_id;
+    child.depends_on_ids = vec![zero.task_id];
+    let child = repo.enqueue(&child).await.unwrap();
+    let claim = repo
+        .claim_many("zero-budget", "recovery", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(claim.attempt, 1);
+    assert_eq!(claim.error.as_deref(), Some(BUDGET_EXHAUSTED_ERR));
+    repo.fail_and_enqueue(&claim, BUDGET_EXHAUSTED_ERR, &[], 3)
+        .await
+        .unwrap();
+    for task_id in [zero.task_id, child.task_id] {
+        let settled = repo.get("zero-budget", task_id).await.unwrap().unwrap();
+        assert_eq!(settled.status, TaskStatus::Failed);
+    }
 }
 
 /// 任务就绪通知发送点：入队 / 扇出 / 释放租约各自随提交投递，payload = workflow_id。
@@ -829,10 +859,6 @@ async fn reject_stale_writes(repo: &PgTaskRepo, task: &TaskRecord) {
         instances: vec![(None, json!({}))],
         depends_on_names: vec![],
     }];
-    assert!(matches!(
-        repo.renew_claim(task).await,
-        Err(StorageError::ClaimLost { .. })
-    ));
     assert!(matches!(
         repo.release_claim(task).await,
         Err(StorageError::ClaimLost { .. })
@@ -925,16 +951,6 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     assert_eq!(unchanged.claimed_by, current.claimed_by);
     assert_eq!(unchanged.attempt, current.attempt);
     assert_eq!(unchanged.lease_until, current.lease_until);
-    sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() + interval '30 seconds' WHERE workflow_id = $1 AND task_id = $2")
-        .bind(workflow_id).bind(current.task_id).execute(database.pool()).await.unwrap();
-    repo.renew_claim(&current).await.unwrap();
-    let renewed = repo
-        .get(workflow_id, current.task_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(renewed.attempt, current.attempt);
-    assert!(renewed.lease_until.unwrap() > chrono::Utc::now() + chrono::Duration::seconds(200));
     repo.succeed(&current, &json!("current")).await.unwrap();
     reject_stale_writes(&repo, &current).await;
     let settled = repo
@@ -962,10 +978,10 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         1
     );
     assert!(matches!(
-        repo.renew_claim(&a).await,
+        repo.release_claim(&a).await,
         Err(StorageError::ClaimLost { .. })
     ));
-    repo.renew_claim(&b).await.unwrap();
+    repo.succeed(&b, &json!("unaffected")).await.unwrap();
 }
 
 async fn wait_for_lock_waiters(pool: &sqlx::PgPool, expected: i64) {
@@ -1104,7 +1120,7 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
         return;
     };
     let repo = PgTaskRepo::new(database.pool().clone());
-    for operation in 0..4 {
+    for operation in 0..3 {
         let workflow_id = format!("lease-lock-wait-{operation}");
         seed(&repo, &workflow_id, "root", None).await;
         let claim = repo
@@ -1123,9 +1139,8 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
         let worker_repo = repo.clone();
         let worker = tokio::spawn(async move {
             match operation {
-                0 => worker_repo.renew_claim(&claim).await,
-                1 => worker_repo.release_claim(&claim).await,
-                2 => worker_repo.succeed(&claim, &json!({})).await.map(|_| ()),
+                0 => worker_repo.release_claim(&claim).await,
+                1 => worker_repo.succeed(&claim, &json!({})).await.map(|_| ()),
                 _ => {
                     worker_repo
                         .fail_and_enqueue(&claim, "expired", &[], 3)

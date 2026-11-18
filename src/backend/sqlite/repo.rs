@@ -13,7 +13,6 @@ use crate::task::FanoutInstances;
 use crate::{Task, TaskRecord, TaskStatus};
 
 use crate::task::store::{LEASE_DURATION, merge_join_input};
-const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";
 
 /// Columns suitable for application queries against the same task table.
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, producer_task_id, name, instance_id, status, \
@@ -330,6 +329,7 @@ impl SqliteTaskRepo {
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
               AND status = 'running' AND claimed_by = ?4 AND attempt = ?5
+              AND attempt <= max_attempts
               AND julianday(lease_until) > julianday('now')
             RETURNING {ROW_COLS}
             "#
@@ -483,8 +483,9 @@ impl SqliteTaskRepo {
         .rows_affected())
     }
 
-    /// Claim a bounded batch in one workflow, including expired running tasks. The write transaction
-    /// serializes competing workers; each successful claim consumes one attempt.
+    /// Claim a bounded batch, including expired tasks that need final failure settlement.
+    /// Each claim advances the fencing generation. Claims above max_attempts may only settle failure;
+    /// they never execute the node again. The write transaction serializes competing workers.
     pub async fn claim_many(
         &self,
         workflow_id: &str,
@@ -495,30 +496,20 @@ impl SqliteTaskRepo {
             return Ok(Vec::new());
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(&format!(
-            r#"
-            UPDATE tasks AS wt
-            SET status = 'failed', error = ?2, lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE wt.workflow_id = ?1 AND {EXECUTABLE_WHERE}
-              AND wt.attempt >= wt.max_attempts
-            "#
-        ))
-        .bind(workflow_id)
-        .bind(BUDGET_EXHAUSTED_ERR)
-        .execute(&mut *tx)
-        .await?;
-
         let mut rows = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
             WITH candidate AS MATERIALIZED (
                 SELECT wt.task_id FROM tasks wt
                 WHERE wt.workflow_id = ?1 AND {EXECUTABLE_WHERE}
-                  AND wt.attempt < wt.max_attempts
                 ORDER BY wt.task_id LIMIT ?4
             )
             UPDATE tasks
             SET status = 'running', claimed_by = ?2,
+                error = CASE WHEN attempt >= max_attempts THEN COALESCE(error,
+                    CASE WHEN lease_until IS NOT NULL
+                         THEN 'task execution window expired; retry budget exhausted'
+                         ELSE 'task retry budget exhausted' END)
+                    ELSE error END,
                 lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?3 || ' seconds'),
                 attempt = attempt + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -547,34 +538,17 @@ impl SqliteTaskRepo {
         Ok(rows.into_iter().map(TaskRecord::from).collect())
     }
 
-    /// Workflows with claimable tasks, for the backend's periodic recovery scan.
+    /// Workflows with claimable execution or final failure settlement work.
     pub async fn executable_workflow_ids(&self) -> Result<Vec<String>, StorageError> {
         Ok(sqlx::query_scalar(&format!(
             r#"
             SELECT DISTINCT wt.workflow_id FROM tasks wt
-            WHERE {EXECUTABLE_WHERE} AND wt.attempt < wt.max_attempts
+            WHERE {EXECUTABLE_WHERE}
             ORDER BY wt.workflow_id
             "#
         ))
         .fetch_all(&self.pool)
         .await?)
-    }
-
-    /// Seal exhausted runnable tasks across workflows, including workflows that
-    /// cannot appear in recovery scans because none of their tasks have budget.
-    pub async fn seal_budget_exhausted(&self) -> Result<u64, StorageError> {
-        Ok(sqlx::query(&format!(
-            r#"
-            UPDATE tasks AS wt
-            SET status = 'failed', error = ?1, lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE {EXECUTABLE_WHERE} AND wt.attempt >= wt.max_attempts
-            "#
-        ))
-        .bind(BUDGET_EXHAUSTED_ERR)
-        .execute(&self.pool)
-        .await?
-        .rows_affected())
     }
 
     pub async fn get(
@@ -629,6 +603,7 @@ impl SqliteTaskRepo {
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
               AND status = 'running' AND claimed_by = ?5 AND attempt = ?6
+              AND (attempt <= max_attempts OR ?3 IN ('failed', 'superseded'))
               AND julianday(lease_until) > julianday('now')
             "#,
         )

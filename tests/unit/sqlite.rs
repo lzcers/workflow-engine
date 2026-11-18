@@ -158,9 +158,13 @@ async fn claims_require_all_dependencies_including_missing_ids() {
 }
 
 #[tokio::test]
-async fn released_and_expired_leases_retry_until_the_budget_is_exhausted() {
+async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
     let (pool, repo) = memory_repo().await;
     let task = repo.enqueue(&new_task("retry", "root")).await.unwrap();
+    let mut child = new_task("retry", "child");
+    child.run_id = task.run_id;
+    child.depends_on_ids = vec![task.task_id];
+    let child = repo.enqueue(&child).await.unwrap();
     let first = repo.claim_many("retry", "first", 1).await.unwrap();
     assert_eq!(first[0].attempt, 1);
     repo.release_claim(&first[0]).await.unwrap();
@@ -176,11 +180,6 @@ async fn released_and_expired_leases_retry_until_the_budget_is_exhausted() {
         .unwrap();
     let third = repo.claim_many("retry", "third", 1).await.unwrap();
     assert_eq!(third[0].attempt, 3);
-    assert_eq!(
-        repo.seal_budget_exhausted().await.unwrap(),
-        0,
-        "an active final attempt is protected"
-    );
     assert!(
         repo.claim_many("retry", "fourth", 1)
             .await
@@ -189,24 +188,83 @@ async fn released_and_expired_leases_retry_until_the_budget_is_exhausted() {
     );
     assert_eq!(get(&repo, &task).await.status, TaskStatus::Running);
 
-    repo.release_claim(&third[0]).await.unwrap();
-    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
-    assert_eq!(repo.seal_budget_exhausted().await.unwrap(), 1);
+    sqlx::query(
+        "UPDATE tasks SET lease_until = '2000-01-01T00:00:00Z' WHERE workflow_id = 'retry'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repo.executable_workflow_ids().await.unwrap(), ["retry"]);
+    let recovery = repo
+        .claim_many("retry", "recovery", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(recovery.attempt, 4);
+    assert_eq!(recovery.status, TaskStatus::Running);
+    assert_eq!(
+        recovery.error.as_deref(),
+        Some("task execution window expired; retry budget exhausted")
+    );
+    let mut forged_budget = recovery.clone();
+    forged_budget.max_attempts = 10;
+    for result in [
+        repo.succeed(&forged_budget, &json!("too late"))
+            .await
+            .map(|_| ()),
+        repo.skip(&recovery, "skip final failure").await,
+        repo.fail_and_enqueue(&third[0], "old worker", &[], 3).await,
+    ] {
+        assert!(matches!(result, Err(StorageError::ClaimLost { .. })));
+    }
+
+    // Recovery can itself be interrupted; it must retain the original failure reason.
+    repo.release_claim(&recovery).await.unwrap();
+    let next_recovery = repo
+        .claim_many("retry", "next-recovery", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(next_recovery.attempt, 5);
+    assert_eq!(next_recovery.error, recovery.error);
+    assert!(matches!(
+        repo.fail_and_enqueue(&recovery, "stale recovery", &[], 3)
+            .await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+    repo.fail_and_enqueue(
+        &next_recovery,
+        next_recovery.error.as_deref().unwrap(),
+        &[],
+        3,
+    )
+    .await
+    .unwrap();
     let exhausted = get(&repo, &task).await;
     assert_eq!(exhausted.status, TaskStatus::Failed);
-    assert_eq!(exhausted.attempt, 3);
+    assert_eq!(exhausted.attempt, 5);
     assert!(exhausted.lease_until.is_none());
-    assert!(exhausted.error.unwrap().contains("budget exhausted"));
+    assert_eq!(exhausted.error, recovery.error);
+    assert_eq!(get(&repo, &child).await.status, TaskStatus::Failed);
+    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
 
     let mut zero = new_task("zero", "root");
     zero.max_attempts = 0;
     let zero = repo.enqueue(&zero).await.unwrap();
-    assert!(
-        repo.claim_many("zero", "worker", 1)
-            .await
-            .unwrap()
-            .is_empty()
+    let recovery = repo
+        .claim_many("zero", "worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(recovery.attempt, 1);
+    assert_eq!(recovery.max_attempts, 0);
+    assert_eq!(
+        recovery.error.as_deref(),
+        Some("task retry budget exhausted")
     );
+    repo.fail_and_enqueue(&recovery, recovery.error.as_deref().unwrap(), &[], 3)
+        .await
+        .unwrap();
     assert_eq!(get(&repo, &zero).await.status, TaskStatus::Failed);
 }
 
@@ -544,19 +602,34 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
 
 #[tokio::test]
 async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_parent() {
-    let (_, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo().await;
     let mut input = new_task("atomic_failure", "root");
     input.run_id = Some(4);
+    input.max_attempts = 1;
     let task = repo.enqueue(&input).await.unwrap();
     let store = SqliteTaskStore::new(repo.clone());
-    let claimed = store
+    let expired = store
         .claim_many("atomic_failure", "worker", 1)
         .await
         .unwrap()
         .remove(0);
+    sqlx::query("UPDATE tasks SET lease_until = '2000-01-01T00:00:00Z' WHERE workflow_id = 'atomic_failure'")
+        .execute(&pool).await.unwrap();
+    let claimed = store
+        .claim_many("atomic_failure", "recovery-worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(claimed.attempt > claimed.max_attempts);
     let recovery = plan("recovery", "normal", vec![json!({"retry": true})]);
     let invalid = plan("invalid", "unsupported", vec![json!({})]);
-    let message = "execution failed";
+    let message = claimed.error.as_deref().unwrap();
+    assert!(matches!(
+        store
+            .settle_failure(&expired, message, std::slice::from_ref(&recovery))
+            .await,
+        Err(StorageError::ClaimLost { .. })
+    ));
     assert!(
         store
             .settle_failure(&claimed, message, &[recovery.clone(), invalid])
@@ -572,8 +645,13 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
         .unwrap();
     let settled = get(&repo, &task).await;
     assert_eq!(settled.status, TaskStatus::Superseded);
-    assert_eq!(settled.error.as_deref(), Some("execution failed"));
+    assert_eq!(settled.error.as_deref(), Some(message));
     assert!(settled.lease_until.is_none());
+    assert!(matches!(
+        store.settle_failure(&claimed, message, &[]).await,
+        Err(StorageError::ClaimLost { .. })
+    ));
+    assert_eq!(repo.list_all("atomic_failure").await.unwrap().len(), 2);
     let recovery = store
         .claim_many("atomic_failure", "worker", 10)
         .await
@@ -864,7 +942,6 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
     let store = SqliteTaskStore::new(repo.clone());
     let fanout = plan("forbidden", "normal", vec![json!("stale")]);
     for result in [
-        repo.renew_claim(&first).await,
         repo.release_claim(&first).await,
         store
             .settle_success(&first, &json!("stale"), std::slice::from_ref(&fanout))
@@ -890,7 +967,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
     let mut wrong_owner = second.clone();
     wrong_owner.claimed_by = first.claimed_by.clone();
     assert!(matches!(
-        repo.renew_claim(&wrong_owner).await,
+        repo.release_claim(&wrong_owner).await,
         Err(StorageError::ClaimLost { .. })
     ));
     assert_eq!(
@@ -905,47 +982,35 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
         .unwrap();
     assert_eq!(get(&repo, &second).await.output, Some(json!("current")));
     assert!(matches!(
-        repo.renew_claim(&second).await,
+        repo.release_claim(&second).await,
         Err(StorageError::ClaimLost { .. })
     ));
 }
 
 #[tokio::test]
-async fn renewal_extends_only_a_live_claim_without_consuming_an_attempt() {
+async fn fixed_window_expiry_rejects_settlement_even_without_takeover() {
     let (pool, repo) = memory_repo().await;
-    repo.enqueue(&new_task("renewal", "root")).await.unwrap();
+    repo.enqueue(&new_task("expiry", "root")).await.unwrap();
     let claim = repo
-        .claim_many("renewal", "worker", 1)
+        .claim_many("expiry", "worker", 1)
         .await
         .unwrap()
         .remove(0);
-    sqlx::query("UPDATE tasks SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 seconds') WHERE workflow_id = 'renewal'")
-        .execute(&pool).await.unwrap();
-    let shortened = get(&repo, &claim).await;
-    repo.renew_claim(&claim).await.unwrap();
-    let renewed = get(&repo, &claim).await;
-    assert_eq!(renewed.attempt, claim.attempt);
-    assert_eq!(renewed.claimed_by, claim.claimed_by);
-    assert_eq!(renewed.status, TaskStatus::Running);
     assert!(
-        renewed.lease_until.unwrap()
-            > shortened.lease_until.unwrap() + chrono::Duration::seconds(250)
-    );
-    assert!(
-        repo.claim_many("renewal", "other-worker", 1)
+        repo.claim_many("expiry", "other-worker", 1)
             .await
             .unwrap()
             .is_empty()
     );
+    assert_eq!(get(&repo, &claim).await.lease_until, claim.lease_until);
 
     sqlx::query(
-        "UPDATE tasks SET lease_until = '2000-01-01T00:00:00Z' WHERE workflow_id = 'renewal'",
+        "UPDATE tasks SET lease_until = '2000-01-01T00:00:00Z' WHERE workflow_id = 'expiry'",
     )
     .execute(&pool)
     .await
     .unwrap();
     for result in [
-        repo.renew_claim(&claim).await,
         repo.release_claim(&claim).await,
         repo.succeed(&claim, &json!("expired")).await.map(|_| ()),
         repo.fail_and_enqueue(&claim, "expired", &[], 3).await,
@@ -982,10 +1047,10 @@ async fn releasing_a_stopped_worker_does_not_release_another_workers_claims() {
         .remove(0);
     assert_eq!(repo.release_claims("worker-release", "a").await.unwrap(), 1);
     assert!(matches!(
-        repo.renew_claim(&first).await,
+        repo.release_claim(&first).await,
         Err(StorageError::ClaimLost { .. })
     ));
-    repo.renew_claim(&second).await.unwrap();
+    assert_eq!(get(&repo, &second).await.lease_until, second.lease_until);
     let reclaimed = repo.claim_many("worker-release", "c", 10).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].task_id, first.task_id);

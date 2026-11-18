@@ -88,15 +88,16 @@ RunHandle 保存 `workflow_id`、`run_id` 和入口任务的 `task_id`，`status
 
 进程重启后，连接同一持久化数据库并为相同 `workflow_id` 重新 `make(graph)`，即可恢复
 存量任务，无需新的 `submit`。遗留的 `running` 任务等待旧租约过期后重新认领并从节点
-开头执行；每次认领消耗一次尝试预算，预算耗尽则标记失败。引擎只调度已创建实例的图，
-不会从数据库自动发现并重建其他图。SQLite 内存及临时数据库不支持跨进程恢复。
+开头执行，最多执行业务节点 `max_attempts` 次。预算耗尽后取得的新认领只处理最终失败，
+通过失败边生成后继，或标记失败并传播依赖失败。引擎只调度已创建实例的图，不会从
+数据库自动发现并重建其他图。SQLite 内存及临时数据库不支持跨进程恢复。
 
 上述示例使用默认 SQLite 后端，PostgreSQL 使用 `pg` feature 和对应连接 URL。
 
 ## 关键机制
 
 完整调度流程见 [Scheduler 设计文档](docs/scheduler-design.md)，包含主循环与单任务流程图、
-执行槽分配、续租与原子结算，以及实例取消和恢复的责任边界。
+执行槽分配、固定执行窗口与原子结算，以及实例取消和恢复的责任边界。
 
 - **节点不携带名字**：节点名作为 `Graph` 的 `HashMap` key 在注册实例时外部绑定，同一节点
   实现可复用、可在不同名字下注册。
@@ -106,11 +107,18 @@ RunHandle 保存 `workflow_id`、`run_id` 和入口任务的 `task_id`，`status
   释放租约，任务下一轮被重认领（重执行一次的代价即引擎既有的 at-least-once 语义），杜绝
   「已成功但后继从未入队」的静默停摆。
   无失败后继时，源任务失败与已有直接依赖任务的失败级联也在同一事务内完成。
-- **认领归属与续租**：每次启动 Scheduler 都分配唯一 worker ID，认领时递增 `attempt`。
-  节点执行前先验证并续租，执行期间每 100 秒续一次 300 秒租约；续租失败或超过 100 秒
-  未响应时停止该节点 future。成功、失败、释放及续租均校验当前状态、worker、attempt
-  和数据库时间下的租约有效性，失效认领返回 `StorageError::ClaimLost`，不能修改新认领的任务。
-  续租覆盖上下文准备、节点执行与失败回调；成功提交后的回调不再续租。
+- **固定执行窗口**：每次启动 Scheduler 都分配唯一 worker ID，每次认领递增 `attempt`，
+  并设置固定 300 秒的 `lease_until`，执行期间不续租。上下文准备、业务执行、结算和回调
+  共用这次认领的截止时间；到期后取消本地 future，释放执行槽，未结算的任务允许重新认领。
+  调度等待也计入窗口，开始执行时不会重新计满 300 秒。成功、失败及释放均校验当前状态、
+  worker、attempt 和数据库时间下的租约有效性，过期结果即使尚未被接管也不能提交。
+- **统一最终失败**：`attempt` 是认领代次，`max_attempts` 限制业务执行次数；
+  `attempt > max_attempts` 的认领只进行最终失败处理，不调用 `on_start` 和 `execute`。
+  最后一次执行窗口过期时记录超时原因，提前释放或零预算记录预算耗尽原因；恢复认领保留原因。
+  调度器同步规划失败后继，再原子提交 `superseded` 与失败后继，或提交 `failed` 与依赖失败传播。
+  失败提交后才调用 `on_error`；正常业务失败沿用执行上下文，恢复处理此时才 `fork` 回调上下文，
+  避免上下文准备或回调卡住最终结算。恢复过程在提交前崩溃或结算失败后可重新认领继续处理，
+  不依赖原 worker 返回，也不会再次执行业务节点。
 - **并发汇合**：PostgreSQL 在同一次 run 的结算和后继入队事务前取得 advisory transaction lock，
   获锁后再查询、创建或合并 JOIN，避免并发首次创建重复记录。锁仅覆盖数据库结算阶段，
   节点业务执行仍可并行；不同 run 使用不同的运行锁。SQLite 使用已有的写事务锁。
@@ -140,7 +148,7 @@ PostgreSQL 使用最多 10 个连接和 5 秒连接池获取超时。
 两个后端均使用引擎自有的 `tasks` / `task_counters` 表，建表 SQL 分别位于
 [`migrations/pgsql/0001_workflow_tasks.sql`](migrations/pgsql/0001_workflow_tasks.sql) 和
 [`migrations/sqlite/0001_workflow_tasks.sql`](migrations/sqlite/0001_workflow_tasks.sql)，由 Engine 幂等执行。
-任务认领、租约续期、重试、后继入队及 JOIN 汇合由内部调度和存储实现负责。
+任务认领、固定窗口超时、重试、后继入队及 JOIN 汇合由内部调度和存储实现负责。
 
 ## 使用
 
@@ -162,7 +170,9 @@ workflow-engine = { path = "../workflow-engine", default-features = false, featu
 `graph.title()` 只读访问。`workflow_id` 是任务关联的稳定身份，标题只用于展示。`.node(name, instance)` 对应 DSL 的
 `name => instance`；节点与上下文类型由实例推导，unit struct 可直接写 `name => NodeType`。
 节点实例跨任务复用，单次执行的可变状态保存在局部变量或 `NodeContext::fork` 产生的任务上下文中。
-调度顺序为 `on_start → execute → on_success/on_error`；`Graph::execute` 单独调用时不触发事件钩子。
+正常执行顺序为 `on_start → execute → 原子结算 → on_success/on_error`；
+成功与错误回调都在提交后调用，不保证必达，也不构成后继任务的依赖屏障。
+回调失败或被执行窗口取消不会回滚已提交状态与后继。`Graph::execute` 单独调用时不触发事件钩子。
 
 `graph.describe()` 从同一个执行图导出可序列化的 `GraphDescription { workflow_id, title, nodes, edges }`，
 适合供应用注册表和前端画布读取。描述不执行节点、条件或转换闭包，也不包含上下文和任务载荷。

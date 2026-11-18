@@ -15,8 +15,9 @@ use crate::task::{
 };
 use crate::{Task, TaskRecord, TaskStatus};
 
-/// 任务行级重试预算耗尽时的封存错误信息（`attempt >= max_attempts` 不再被认领）。
-const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";
+/// 最终失败恢复认领保存的原因，重复恢复时保留第一次记录。
+const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted";
+const WINDOW_EXPIRED_ERR: &str = "task execution window expired; retry budget exhausted";
 
 /// 任务行 SELECT / RETURNING 列（顺序与表结构一致）。`pub`：消费方的业务查询
 /// 与同一张表交互时复用同一列序。
@@ -145,6 +146,7 @@ async fn settle_in_tx(
         WHERE workflow_id = $1 AND task_id = $2
           AND claimed_by = $3 AND attempt = $4
           AND status = 'running' AND lease_until > clock_timestamp()
+          AND ($5 IN ('failed', 'superseded') OR attempt <= max_attempts)
         RETURNING {ROW_COLS}
         "#
     ))
@@ -352,7 +354,7 @@ pub struct PgTaskRepo {
 /// 共用：pending/running、无租约或租约已过期、直接依赖全部存在且成功、JOIN 静态前驱等齐。
 /// 遍历依赖 ID 而非已有任务行，确保缺失依赖也会阻塞。
 /// 调用方需自行补 `wt.workflow_id = $1`（认领按工作流）或省略（恢复扫描跨工作流）。
-/// attempt 预算过滤由调用方补充。
+/// 预算耗尽行也须认领，以便调度器通过统一失败流程结算。
 const EXECUTABLE_WHERE: &str = r#"
     wt.status IN ('pending', 'running')
     AND (wt.lease_until IS NULL OR wt.lease_until <= NOW())
@@ -645,17 +647,11 @@ impl PgTaskRepo {
         .rows_affected())
     }
 
-    /// 从指定工作流认领一批可执行任务：pending 或已过期的 running 均视为可认领；同一批内互相无依赖
-    /// （`NOT EXISTS` 依赖闸门过滤掉依赖未成功的任务）。
-    /// 用 `FOR UPDATE SKIP LOCKED` 保证多 worker 不冲突，`LIMIT $n` 限制单批认领数量。
+    /// 认领当前工作流的就绪任务，使用固定租约和递增的 attempt 隔离执行者。
+    /// `FOR UPDATE SKIP LOCKED` 保证多 worker 不会同时认领同一行。
     ///
-    /// 任务级重试预算（`attempt`/`max_attempts`）在此作为**通用兜底**生效：
-    /// - `attempt < max_attempts` 的任务才被认领（每次认领 `attempt + 1`）；
-    /// - `attempt >= max_attempts` 的可执行任务不再认领，而是在同一事务内**封存为 `failed`**
-    ///   （写入 [`BUDGET_EXHAUSTED_ERR`]），避免它们永远停留在 `pending` 造成悬挂。
-    ///
-    /// 注意：这是**任务行级**的通用护栏（防同一任务被反复认领/超时重入），与消费方节点
-    /// 的业务级重试预算（经失败边入队**新任务行**）是两套独立计数。
+    /// 返回的 attempt <= max_attempts 时执行业务；超出预算的认领只负责最终失败结算。
+    /// 恢复认领保存首次失败原因，允许恢复结算本身在崩溃或事务失败后重试。
     pub async fn claim_many(
         &self,
         workflow_id: &str,
@@ -667,30 +663,6 @@ impl PgTaskRepo {
         }
         let mut tx = self.pool.begin().await?;
 
-        // 可执行任务的通用闸门（不含 attempt 预算过滤）见 [`EXECUTABLE_WHERE`]；
-        // 此处补上工作流过滤，seal / claim 两个 UPDATE 共用同一条闸门。
-
-        // 1) 封存：可执行但重试预算已耗尽（attempt >= max_attempts）的任务 → 置为 failed，
-        //    避免它们因预算满而不再被认领、却永远停留在 pending/running 造成悬挂。
-        let seal_sql = format!(
-            r#"
-            UPDATE tasks AS wt
-            SET status = 'failed',
-                error = $2,
-                lease_until = NULL,
-                updated_at = NOW()
-            WHERE wt.workflow_id = $1
-              AND {EXECUTABLE_WHERE}
-              AND wt.attempt >= wt.max_attempts
-            "#
-        );
-        sqlx::query(&seal_sql)
-            .bind(workflow_id)
-            .bind(BUDGET_EXHAUSTED_ERR)
-            .execute(&mut *tx)
-            .await?;
-
-        // 2) 认领：在可执行任务中，仅预算未耗尽（attempt < max_attempts）的进入认领。
         let sql = format!(
             r#"
             WITH candidate AS (
@@ -698,7 +670,6 @@ impl PgTaskRepo {
                 FROM tasks wt
                 WHERE wt.workflow_id = $1
                   AND {EXECUTABLE_WHERE}
-                  AND wt.attempt < wt.max_attempts
                 ORDER BY wt.task_id
                 LIMIT $4
                 FOR UPDATE SKIP LOCKED
@@ -706,6 +677,9 @@ impl PgTaskRepo {
             UPDATE tasks
             SET status = 'running',
                 claimed_by = $2,
+                error = CASE WHEN attempt >= max_attempts THEN
+                    COALESCE(error, CASE WHEN lease_until IS NOT NULL THEN $5 ELSE $6 END)
+                    ELSE error END,
                 lease_until = clock_timestamp() + make_interval(secs => $3),
                 attempt = attempt + 1,
                 updated_at = NOW()
@@ -719,6 +693,8 @@ impl PgTaskRepo {
             .bind(worker)
             .bind(LEASE_DURATION.as_secs() as f64)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(WINDOW_EXPIRED_ERR)
+            .bind(BUDGET_EXHAUSTED_ERR)
             .fetch_all(&mut *tx)
             .await?;
 
@@ -738,46 +714,17 @@ impl PgTaskRepo {
     }
 
     /// 存在可认领任务的工作流 id 列表，供应用恢复扫描（如启动时与监听重连后）：
-    /// 兜底 NOTIFY 丢失（监听断线窗口 / 进程重启）。
+    /// 包含需要最终失败结算的预算耗尽任务，兜底通知丢失和进程重启。
     pub async fn executable_workflow_ids(&self) -> Result<Vec<String>, StorageError> {
         let sql = format!(
             r#"
             SELECT DISTINCT wt.workflow_id
             FROM tasks wt
             WHERE {EXECUTABLE_WHERE}
-              AND wt.attempt < wt.max_attempts
             "#
         );
         let rows: Vec<(String,)> = sqlx::query_as(&sql).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|(workflow_id,)| workflow_id).collect())
-    }
-
-    /// 全量封存预算耗尽的可执行任务（`attempt >= max_attempts`），跨所有工作流。
-    ///
-    /// 与 [`PgTaskRepo::claim_many`] 内的封存步骤同一条闸门（依赖齐备、租约过期），
-    /// 只是不按工作流过滤。恢复扫描（启动 / 监听重连）先执行本方法：
-    /// 认领闸门与 [`PgTaskRepo::executable_workflow_ids`] 都要求 `attempt < max_attempts`，
-    /// 若某工作流只剩预算耗尽行，它既不会被认领、恢复扫描也找不到它——worker 永不
-    /// 拉起，`claim_many` 内的封存也就永远不执行，行会永久停留在 pending/running
-    /// （进程重启后尤其如此）。把封存提前到恢复阶段即可清扫这类残留，让消费方快照
-    /// （`operation`）尽快看到终态失败。
-    pub async fn seal_budget_exhausted(&self) -> Result<u64, StorageError> {
-        let sql = format!(
-            r#"
-            UPDATE tasks AS wt
-            SET status = 'failed',
-                error = $1,
-                lease_until = NULL,
-                updated_at = NOW()
-            WHERE {EXECUTABLE_WHERE}
-              AND wt.attempt >= wt.max_attempts
-            "#
-        );
-        let res = sqlx::query(&sql)
-            .bind(BUDGET_EXHAUSTED_ERR)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected())
     }
 
     pub async fn get(

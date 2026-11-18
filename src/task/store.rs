@@ -107,11 +107,11 @@ pub trait TaskStore: Sync {
     /// 依赖、实例编号和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
-    /// 在指定工作流的全部运行中认领一批可执行任务（互相无依赖），最多 `limit` 个；数量不足或无可认领
+    /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
     /// 时返回少于 `limit` 甚至空列表，按任务 ID 排序。`limit` 为 0 时直接返回空列表。
     ///
-    /// 可执行任务必须同时满足：
-    /// - 状态为 pending / running，未持有租约或租约已过期，且尝试次数未达到上限。
+    /// 待处理任务必须同时满足：
+    /// - 状态为 pending / running，未持有租约或租约已过期。
     /// - `depends_on_ids` 中每个 ID 在同一 workflow 内均存在且已成功；缺失依赖必须阻塞。
     /// - JOIN 还要求记录中 `depends_on_names` 的每个前驱，在同一 `workflow_id + run_id`
     ///   下至少存在一个实例，且全部实例均已成功；同为 NULL 的 run_id 视为同组。
@@ -120,6 +120,9 @@ pub trait TaskStore: Sync {
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
     /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入固定 300 秒租约。
+    /// 返回的 attempt <= max_attempts 时执行业务；超过上限时只做最终失败结算，不再执行节点。
+    /// 首次认领耗尽任务时必须持久化 error：末次租约过期记录执行窗口超时，无租约则记录预算耗尽。
+    /// 后续认领保留该原因，使最终失败处理在崩溃或结算失败后仍可恢复。
     fn claim_many<'a>(
         &'a self,
         workflow_id: &'a str,
@@ -129,7 +132,7 @@ pub trait TaskStore: Sync {
 
     /// 在同一事务内写入产物、标记成功并入队全部成功后继。
     ///
-    /// 必须校验当前有效认领，旧执行者不能提交结果或创建后继。
+    /// 必须校验当前有效认领且 attempt <= max_attempts；旧执行者和仅用于最终失败的认领不能提交成功。
     /// 成功后继依赖源任务，并继承结算时最新的任务身份（如 `run_id`）。
     /// 后继实例按 [`FanoutInstances::from`] 转换；单实例按同一 workflow、run、节点名
     /// 汇入已有 pending / running 任务，依赖 ID 取去重并集。JOIN 输入通过
