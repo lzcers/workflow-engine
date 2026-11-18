@@ -69,7 +69,7 @@ pub struct TaskRecord {
     /// 最近一次认领的执行器身份；Scheduler 每次启动生成新的 UUID。
     pub claimed_by: Option<String>,
     pub lease_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// 每次认领递增，作为认领代次参与写入校验；续租不会修改此值。
+    /// 每次认领递增，作为认领代次参与写入校验。
     pub attempt: i32,
     pub max_attempts: i32,
     /// 任务类型（`normal`/`join`）：由节点 `TASK_TYPE` 声明，决定存储的等齐前驱闸门。

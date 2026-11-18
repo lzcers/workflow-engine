@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{Task, TaskRecord};
 
-/// 认领与续租使用相同的租约时长；执行期间由调度器定期续租。
+/// 每次认领的固定租约时长，同时作为本次任务执行的时间预算。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
 
 /// 一条后继入队规划：由调度器从图规划结果（`Graph::plan_success` / `plan_failure`）
@@ -119,17 +119,13 @@ pub trait TaskStore: Sync {
     ///   （图规划的失败后继当前使用空集合）；普通任务不使用前驱名作认领闸门。
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
-    /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入租约。
+    /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入固定 300 秒租约。
     fn claim_many<'a>(
         &'a self,
         workflow_id: &'a str,
         worker_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>>;
-
-    /// 仅当前有效认领可以续租；校验状态、持有人、attempt 和未过期的租约。
-    /// 续租不增加 attempt；认领已失效时返回错误，调度器必须停止执行。
-    fn renew_claim<'a>(&'a self, task: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>>;
 
     /// 在同一事务内写入产物、标记成功并入队全部成功后继。
     ///

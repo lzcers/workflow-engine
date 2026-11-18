@@ -599,34 +599,6 @@ impl PgTaskRepo {
         Ok(())
     }
 
-    /// 为仍有效的当前认领续租，不改变认领代次；过期租约不能复活。
-    pub async fn renew_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
-        let mut tx = self.pool.begin().await?;
-        lock_task(&mut tx, task).await?;
-        let result = sqlx::query(
-            r#"
-            UPDATE tasks
-            SET lease_until = clock_timestamp() + make_interval(secs => $5),
-                updated_at = clock_timestamp()
-            WHERE workflow_id = $1 AND task_id = $2
-              AND claimed_by = $3 AND attempt = $4
-              AND status = 'running' AND lease_until > clock_timestamp()
-            "#,
-        )
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(&task.claimed_by)
-        .bind(task.attempt)
-        .bind(LEASE_DURATION.as_secs() as f64)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(claim_lost(task));
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// 仅释放当前有效认领；旧 worker 不能释放新 owner 的租约。
     pub async fn release_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;

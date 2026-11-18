@@ -461,31 +461,6 @@ impl SqliteTaskRepo {
         Ok(())
     }
 
-    /// Extend the current claim without consuming another attempt. Expired claims cannot renew.
-    pub async fn renew_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE tasks
-            SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?5 || ' seconds'),
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND task_id = ?2
-              AND status = 'running' AND claimed_by = ?3 AND attempt = ?4
-              AND julianday(lease_until) > julianday('now')
-            "#,
-        )
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(&task.claimed_by)
-        .bind(task.attempt)
-        .bind(LEASE_DURATION.as_secs() as i64)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(claim_lost(task));
-        }
-        Ok(())
-    }
-
     /// Release leases belonging to a stopped worker in this workflow.
     /// Stop and await that worker first; its old claim snapshots become invalid.
     pub async fn release_claims(

@@ -1,7 +1,7 @@
 //! 单图调度器：认领当前工作流所有运行的任务，执行节点并将图规划交给存储结算。
 //!
-//! 调度循环只负责补充执行槽；单个任务依次完成业务准备、原子结算和成功回调。
-//! 准备阶段持续续租，结算时由存储再次校验认领；所有 run 共享并发额度。
+//! 调度循环只负责补充执行槽；单个任务依次完成业务执行与后继规划、原子结算和成功回调。
+//! 执行阶段持续续租，结算时由存储再次校验认领；所有 run 共享并发额度。
 //! 调度循环随所属实例释放而取消，同时取消在途任务。
 
 use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
@@ -141,7 +141,7 @@ where
 }
 
 /// 业务执行与后继规划的结果。成功时保留上下文，供提交后的 on_success 使用。
-enum PreparedTask<Ctx> {
+enum ExecutionOutcome<Ctx> {
     Success {
         context: Ctx,
         output: Value,
@@ -171,10 +171,11 @@ where
     S: TaskStore + Send + ?Sized + 'static,
 {
     let work = async {
-        let prepared = prepare_with_lease(graph.as_ref(), store.as_ref(), &task)
+        let outcome = execute_with_lease(graph.as_ref(), store.as_ref(), &task)
             .await
             .ok_or(())?;
-        settle(graph.as_ref(), store.as_ref(), &task, prepared)
+
+        settle(graph.as_ref(), store.as_ref(), &task, outcome)
             .await
             .map_err(|error| {
                 error!(error = %error, "settle transaction failed; releasing claim");
@@ -199,12 +200,12 @@ where
     }
 }
 
-/// 只为业务准备续租；失去执行权返回 None，不生成业务失败后继。
-async fn prepare_with_lease<Ctx, S>(
+/// 执行节点并规划后继，期间持续续租；失去执行权返回 None，不生成业务失败后继。
+async fn execute_with_lease<Ctx, S>(
     graph: &Graph<Ctx>,
     store: &S,
     task: &TaskRecord,
-) -> Option<PreparedTask<Ctx>>
+) -> Option<ExecutionOutcome<Ctx>>
 where
     Ctx: NodeContext + Sync,
     S: TaskStore + ?Sized,
@@ -213,6 +214,7 @@ where
     if !renew_claim(store, task).await {
         return None;
     }
+    // 任务执行期间持续续租
     let heartbeat = async {
         loop {
             sleep(LEASE_DURATION / 3).await;
@@ -221,15 +223,15 @@ where
             }
         }
     };
-    // 同时就绪时优先处理续租失败。丢弃准备 future 不会撤回已有的外部副作用。
+    // 同时就绪时优先处理续租失败。丢弃执行 future 不会撤回已有的外部副作用。
     tokio::select! {
         biased;
         _ = heartbeat => None,
-        prepared = prepare(graph, task) => Some(prepared),
+        outcome = execute_and_plan(graph, task) => Some(outcome),
     }
 }
 
-/// 无法确认租约有效时停止准备；限制单次续租耗时，避免数据库阻塞后仍持续执行。
+/// 无法确认租约有效时停止执行；限制单次续租耗时，避免数据库阻塞后仍持续执行。
 async fn renew_claim<S: TaskStore + ?Sized>(store: &S, task: &TaskRecord) -> bool {
     match timeout(LEASE_DURATION / 3, store.renew_claim(task)).await {
         Ok(Ok(())) => true,
@@ -245,7 +247,7 @@ async fn renew_claim<S: TaskStore + ?Sized>(store: &S, task: &TaskRecord) -> boo
 }
 
 /// fork 独立上下文、执行节点并规划后继；此阶段不提交任务状态。
-async fn prepare<Ctx>(graph: &Graph<Ctx>, task: &TaskRecord) -> PreparedTask<Ctx>
+async fn execute_and_plan<Ctx>(graph: &Graph<Ctx>, task: &TaskRecord) -> ExecutionOutcome<Ctx>
 where
     Ctx: NodeContext + Sync,
 {
@@ -255,7 +257,7 @@ where
     let error = match graph.execute(name, &mut context, task.input.clone()).await {
         Ok(output) => match graph.plan_success(name, &output) {
             Ok(successors) => {
-                return PreparedTask::Success {
+                return ExecutionOutcome::Success {
                     context,
                     output,
                     successors: successors.into_iter().map(FanoutPlan::from).collect(),
@@ -275,7 +277,7 @@ where
             Vec::new()
         }
     };
-    PreparedTask::Failure {
+    ExecutionOutcome::Failure {
         message: error.to_string(),
         successors,
     }
@@ -286,14 +288,14 @@ async fn settle<Ctx, S>(
     graph: &Graph<Ctx>,
     store: &S,
     task: &TaskRecord,
-    prepared: PreparedTask<Ctx>,
+    outcome: ExecutionOutcome<Ctx>,
 ) -> Result<(), S::Error>
 where
     Ctx: NodeContext + Sync,
     S: TaskStore + ?Sized,
 {
-    match prepared {
-        PreparedTask::Success {
+    match outcome {
+        ExecutionOutcome::Success {
             mut context,
             output,
             successors,
@@ -303,7 +305,7 @@ where
             graph.on_success(&task.name, &mut context, &output).await;
             Ok(())
         }
-        PreparedTask::Failure {
+        ExecutionOutcome::Failure {
             message,
             successors,
         } => store.settle_failure(task, &message, &successors).await,

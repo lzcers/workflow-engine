@@ -14,7 +14,7 @@
 | 组件 | 职责 |
 | --- | --- |
 | `Workflow` | 构造时启动后台调度器、提交入口任务、唤醒认领、随实例释放取消后台任务 |
-| `Scheduler` | 计算空闲槽、批量认领、并发执行、准备阶段续租、调用存储结算及异常释放 |
+| `Scheduler` | 计算空闲槽、批量认领、并发执行、执行阶段续租、调用存储结算及异常释放 |
 | `Graph` | 提供节点与上下文，执行节点钩子和业务逻辑，规划成功或失败后继 |
 | `TaskStore` | 原子创建运行，筛选可认领任务，校验认领归属，原子提交状态与后继 |
 | 数据库后端 | 实现依赖与 JOIN 闸门、租约、尝试预算和并发事务控制 |
@@ -103,19 +103,20 @@ Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配�
 轮转的公平队列。后继通过结算事务入库，满足依赖后由下一次认领取得，不在当前任务里
 递归执行。其他槽可以继续推进快分支，慢分支保持在途。
 
-## 单个任务：准备、结算与回调
+## 单个任务：执行、结算与回调
 
-每个 `run_task` 分为 `prepare_with_lease` 和 `settle` 两阶段。
+每个 `run_task` 分为 `execute_with_lease` 和 `settle` 两阶段。
+`execute_with_lease` 在续租保护下调用 `execute_and_plan`，返回包含执行结果与后继计划的 `ExecutionOutcome`。
 
 ```mermaid
 flowchart TD
     Claim["收到已认领的 TaskRecord"] --> Renew{"首次续租成功？"}
     Renew -- 否 --> Release["尝试 release_claim，结束本次执行"]
-    Renew -- 是 --> Prepare
-    subgraph Preparing["准备阶段：持续续租"]
-        Prepare["fork → on_start → execute"]
-        Prepare -- "执行成功" --> PlanSuccess["plan_success"]
-        Prepare -- "节点返回错误" --> OnError["on_error → plan_failure"]
+    Renew -- 是 --> Execute
+    subgraph Executing["执行阶段：持续续租"]
+        Execute["fork → on_start → execute"]
+        Execute -- "执行成功" --> PlanSuccess["plan_success"]
+        Execute -- "节点返回错误" --> OnError["on_error → plan_failure"]
         PlanSuccess -- "规划失败，转永久错误" --> OnError
     end
     PlanSuccess -- "规划成功" --> Success["停止续租；settle_success 原子提交"]
@@ -123,12 +124,12 @@ flowchart TD
     Success -- "提交成功" --> Callback["on_success"]
     Callback --> Done["任务结束，槽位可回收"]
     Failure -- "提交成功" --> Done
-    Preparing -- "续租失败或超时" --> Release
+    Executing -- "续租失败或超时" --> Release
     Success -- "提交失败" --> Release
     Failure -- "提交失败" --> Release
 ```
 
-### 准备阶段
+### 执行阶段
 
 首次续租成功后，按顺序执行 `NodeContext::fork(task)`、`on_start` 和节点 `execute`。
 每个任务获得独立上下文，图和节点实例仍通过共享句柄复用。
@@ -138,22 +139,22 @@ flowchart TD
 
 执行或成功后继规划失败时，先调用 `on_error`，再用原始输入和错误调用
 `Graph::plan_failure`。失败后继规划本身出错时记录日志，使用空后继列表结算失败。
-准备阶段生成结果与入队计划，不提交任务状态。
+执行阶段生成结果与入队计划，不提交任务状态。
 
 续租规则如下：
 
 - 租约时长 `LEASE_DURATION` 为 300 秒，执行任何业务钩子前先续租一次。
-- 准备期间每等待 `LEASE_DURATION / 3`（100 秒）后续租，单次续租也以 100 秒为超时上限。
+- 执行期间每等待 `LEASE_DURATION / 3`（100 秒）后续租，单次续租也以 100 秒为超时上限。
 - 续租覆盖 `fork`、`on_start`、`execute`、后继规划和 `on_error`。
-- 续租失败或超时后丢弃准备 future；同时就绪时优先处理续租失败。
+- 续租失败或超时后丢弃执行 future；同时就绪时优先处理续租失败。
   此时不生成业务失败后继，而是进入认领释放路径。
 
 ### 结算阶段
 
-准备完成后续租停止。存储必须在结算事务中再次验证任务状态、`claimed_by`、`attempt`
+执行与后继规划完成后续租停止。存储必须在结算事务中再次验证任务状态、`claimed_by`、`attempt`
 以及数据库时间下的租约有效性；旧认领不能提交结果或创建后继。
 
-| 准备结果 | 原子存储操作 | 提交后的动作 |
+| 执行结果 | 原子存储操作 | 提交后的动作 |
 | --- | --- | --- |
 | 成功 | `settle_success` 写入输出、标记 `succeeded`、入队全部成功后继 | 调用 `on_success`，然后结束任务 |
 | 失败且后继计划非空 | `settle_failure` 标记 `superseded`，入队失败后继 | 结束任务 |
@@ -169,9 +170,9 @@ flowchart TD
 | 情况 | 当前处理 |
 | --- | --- |
 | 认领报错 | 记录错误，按主循环的事件或轮询机制再次尝试 |
-| 准备阶段失去租约 | 取消准备，尝试释放旧认领，不结算为业务失败 |
+| 执行阶段失去租约 | 取消执行，尝试释放旧认领，不结算为业务失败 |
 | 结算报错 | 记录错误，尝试释放认领，预算允许时可再次认领执行 |
-| 单任务准备、结算或成功回调 panic | `run_task` 捕获 panic，记录错误并尝试释放认领 |
+| 单任务执行、结算或成功回调 panic | `run_task` 捕获 panic，记录错误并尝试释放认领 |
 | 认领释放失败 | 记录警告；后续由存储的租约与恢复机制处理 |
 | 调度主循环 panic | 取消并等待 JoinSet 中的任务退出，再传播 panic |
 | Workflow 释放或 run future 被取消 | 取消在途任务，不等待结算，也不会自动执行异步认领释放 |
@@ -203,7 +204,7 @@ Scheduler 只轮询自己绑定的图。应用需要为要恢复的图创建并�
 | 实现位置 | 阅读重点 |
 | --- | --- |
 | [src/workflow.rs](../src/workflow.rs) | 构造时启动、`submit`、就绪通知、`Workflow::drop` |
-| [src/scheduler.rs](../src/scheduler.rs) | `run_loop` → `claim_and_spawn` → `run_task` → `prepare_with_lease` → `prepare` → `settle` |
+| [src/scheduler.rs](../src/scheduler.rs) | `run_loop` → `claim_and_spawn` → `run_task` → `execute_with_lease` → `execute_and_plan` → `settle` |
 | [src/task/store.rs](../src/task/store.rs) | 存储契约、`FanoutPlan`、租约时长 |
 | [src/graph/mod.rs](../src/graph/mod.rs) | 节点执行、成功与失败后继规划 |
 | [src/backend/pgsql/repo.rs](../src/backend/pgsql/repo.rs) | PostgreSQL 认领、结算、续租和恢复查询 |
