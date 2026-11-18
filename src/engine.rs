@@ -4,24 +4,20 @@ use std::sync::Arc;
 
 use crate::{Database, Graph, NodeContext, StorageError, TaskStore, Workflow};
 
-/// 引擎初始化、工作流提交或调度生命周期失败。
+/// 引擎初始化或工作流提交失败。
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("no node registered for name={0}")]
     UnknownNode(String),
-    #[error("workflow scheduler is already running")]
-    AlreadyRunning,
     #[error("serialize workflow input: {0}")]
     Input(#[from] serde_json::Error),
-    #[error("workflow scheduler failed: {0}")]
-    Scheduler(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
 
 /// 可复用的引擎，持有由数据库 URL 选择的共享任务存储。
 ///
-/// 每次 [`Self::make`] 根据图创建独立的 Workflow 和 Scheduler，不启动调度。
+/// 每次 [`Self::make`] 根据图创建独立的 Workflow 和 Scheduler，首次提交时自动启动调度。
 /// 需要启用 `pg` 或 `sqlite` feature。
 pub struct Engine {
     store: Arc<dyn TaskStore<Error = StorageError> + Send>,

@@ -13,8 +13,9 @@
 - 调度器使用统一的任务快照 `TaskRecord`，依赖任务存储 `TaskStore`、图引擎 `Graph`、
   节点上下文 `NodeContext`。不解读任务语义，只驱动 `claim → settle` 循环并把图规划结果
   交给存储落库。
-- worker 生命周期、任务就绪监听、恢复扫描、配置刷新与重启编排由宿主应用负责；
-  引擎提供 `Scheduler`、任务就绪通知与恢复查询、`release_claims` 等存储原语。
+- `Workflow` 在提交时自动启动调度；直接使用底层 `Scheduler` 时，worker 生命周期、
+  任务就绪监听、恢复扫描、配置刷新与重启编排由宿主应用负责。
+  引擎提供任务就绪通知与恢复查询、`release_claims` 等存储原语。
 
 ## 公共任务模型与连接入口
 
@@ -67,15 +68,16 @@ PostgreSQL 使用最多 10 个连接和 5 秒连接池获取超时。
 | [`database`](src/database.rs) | 统一连接、初始化、健康检查与关闭入口，内部按后端创建任务存储 |
 | [`scheduler`](src/scheduler.rs) | 通用单会话调度器 [`Scheduler`](src/scheduler.rs)：批量认领无依赖任务 → 多协程并发结算 |
 | [`engine`](src/engine.rs)（`pg` / `sqlite`） | 可复用的 `Engine`：按 URL 初始化共享存储，通过 `make` 为不同的图创建工作流实例 |
-| [`workflow`](src/workflow.rs)（`pg` / `sqlite`） | 单图 `Workflow<Ctx>`：持有调度器，提交独立运行，通过 `run` / `stop` 控制当前图所有运行的执行 |
+| [`workflow`](src/workflow.rs)（`pg` / `sqlite`） | 单图 `Workflow<Ctx>`：持有调度器，提交时创建独立运行并自动执行 |
 | [`backend::pgsql`](src/backend/pgsql)（`pg`） | PostgreSQL 通用实现：`PgTaskRepo` / `PgTaskStore` / 任务就绪通知与恢复查询 |
 | [`backend::sqlite`](src/backend/sqlite)（`sqlite`） | SQLite 通用实现：`SqliteTaskRepo` / `SqliteTaskStore` / 就绪工作流查询与租约恢复 |
 
 ## 引擎与工作流实例
 
 `Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享任务存储。
-`engine.make(graph)` 根据图定义创建 `Workflow<Ctx>`，内部已实例化该图的 Scheduler。
-同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自控制调度生命周期。
+`engine.make(graph)` 根据图定义创建 `Workflow<Ctx>`，内部已实例化该图的 Scheduler，
+首次成功提交时启动调度。同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，
+各自拥有独立的调度器。
 不同图定义应使用不同的 `workflow_id`。
 
 ```rust,no_run
@@ -91,14 +93,13 @@ where
 {
     let engine = Engine::new("sqlite://workflow.db").await?;
     let workflow = engine.make(graph);
+    // 创建 run_id 并启动后台执行，返回时不等待运行结束。
     let run = workflow.submit("entry", input).await?;
     // 当前为空方法，不返回实际运行状态。
     run.status().await;
 
-    // 启动后台调度器后立即返回；执行此图下所有 run_id 的任务。
-    workflow.run().await?;
+    // 执行期间保持 workflow 存活。
     tokio::signal::ctrl_c().await?;
-    workflow.stop().await?;
     Ok(())
 }
 ```
@@ -108,17 +109,12 @@ where
 `workflow_id + run_id` 确定运行身份，后继继承 `run_id`，不同运行的扇入与 JOIN 相互隔离。
 选定入口需要能触达后续 JOIN 所需的前驱；多次 submit 不能补齐同一次运行的多个入口。
 RunHandle 保存 `workflow_id`、`run_id` 和入口任务的 `task_id`，`status()` 暂为空实现。
-成功提交仅表示任务已持久化，尚未启动的工作流不会自行执行。
+首次成功提交自动启动当前实例的后台 Scheduler，后续提交立即唤醒认领，返回时不等待运行
+结束。调度器执行当前图下所有已提交及后续提交的运行，空闲时持续等待。每个 Workflow
+的所有运行共享 8 个执行槽和 1 秒轮询周期，并发提交也只启动一个调度器。
 
-`workflow.run().await` 启动当前实例的后台 Scheduler 并立即返回，不等待运行结束。
-它执行当前图下所有已提交及后续提交的运行，空闲时持续等待。每个 Workflow 默认共享
-8 个执行槽和 1 秒轮询周期，本进程提交会立即唤醒认领。同一实例重复启动返回
-`EngineError::AlreadyRunning`；不同实例可以独立启停。
-
-`workflow.stop().await` 停止认领并等待在途节点完成结算，之后可以再次 `run()`。
-已提交但未执行的任务、停止过程中产生的后继任务仍保留在数据库。停止不会取消正在执行的
-业务节点，因此长时间不返回的节点也会使停止持续等待。直接丢弃 Workflow 会取消后台任务，
-不能等待结算完成；需要完整停止时先等待 `stop()`。Engine 释放后 Workflow 仍可使用。
+执行期间需要保持 Workflow 存活。丢弃 Workflow 会取消后台调度器和在途节点，不能等待
+结算完成；已持久化的任务仍保留在数据库。Engine 释放后 Workflow 仍可使用。
 
 `TaskStore` 保留为底层 Scheduler 的扩展契约；异步方法返回 `BoxFuture`，可作为 trait object。
 `Database` 按 URL 选择后端并创建共享存储，使用 Engine 无需接触 TaskStore。
@@ -287,13 +283,13 @@ let description = graph.describe();
 
 直接使用调度器时，`Scheduler::new(graph, store, poll)` 接收 `Arc<Graph<Ctx>>`、
 `Arc<Store>` 和轮询周期，支持具体存储与 `dyn TaskStore`。
-`Scheduler::run(shutdown).await` 持续运行到停止信号完成，并等待已认领任务结算后返回；
-上层 Workflow 将这个循环放在后台任务中，并通过 `run()` / `stop()` 管理其生命周期。
+`Scheduler::run().await` 持续认领和执行任务，直到调用方取消该 future；
+上层 Workflow 在首次成功提交时将这个循环放在后台任务中，随实例释放而取消。
 有空闲执行槽时，即使其他节点仍在执行，就绪通知也会立即触发认领。
 
 图是固定的拓扑定义，易变依赖可在 `NodeContext::fork` 中按任务刷新。
 直接中止 Scheduler future 会取消在途节点，无法等待清理；调度循环 panic 时则会取消并
-等待在途任务退出后传播 panic，Workflow 的 `stop()` 会返回后台任务的错误。
+等待在途任务退出后传播 panic。
 
 ## 开发
 

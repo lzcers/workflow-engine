@@ -2,9 +2,9 @@
 //!
 //! 调度循环只负责补充执行槽；单个任务依次完成业务准备、原子结算和成功回调。
 //! 准备阶段持续续租，结算时由存储再次校验认领；所有 run 共享并发额度。
-//! 停止信号只停止认领，已认领任务仍会执行到结束。
+//! 调度循环随所属实例释放而取消，同时取消在途任务。
 
-use std::{future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use futures::FutureExt;
 use serde_json::Value;
@@ -65,43 +65,26 @@ where
         self
     }
 
-    /// 持续驱动当前图，shutdown 完成后停止认领并等待全部在途任务结算。
+    /// 持续驱动当前图，直到此 future 被取消。
     ///
-    /// 调用方负责确保只有一个运行循环；Workflow 对重复启动返回错误。
-    /// 正常停止不会取消业务节点；直接中止此 future 会取消在途节点且无法等待清理。
+    /// 调用方负责确保只有一个运行循环；Workflow 在首次提交时启动一次。
+    /// Workflow 释放时取消此 future；取消会中止在途节点，无法等待结算。
     /// 调度循环 panic 时取消并等待全部在途任务，再传播 panic。
-    pub async fn run(&self, shutdown: impl Future<Output = ()>) {
+    pub async fn run(&self) {
         // 每次启动都有独立身份，重启后不会沿用上一次的认领归属。
         let worker_id = uuid::Uuid::new_v4().to_string();
         let mut in_flight = JoinSet::new();
-        let outcome = AssertUnwindSafe(self.run_loop(&mut in_flight, &worker_id, shutdown))
+        let outcome = AssertUnwindSafe(self.run_loop(&mut in_flight, &worker_id))
             .catch_unwind()
             .await;
         if let Err(panic) = outcome {
             in_flight.shutdown().await;
             std::panic::resume_unwind(panic);
         }
-        while let Some(result) = in_flight.join_next().await {
-            if let Err(e) = result {
-                error!(error = %e, "settle task join failed");
-            }
-        }
     }
 
-    async fn run_loop(
-        &self,
-        in_flight: &mut JoinSet<()>,
-        worker_id: &str,
-        shutdown: impl Future<Output = ()>,
-    ) {
-        tokio::pin!(shutdown);
+    async fn run_loop(&self, in_flight: &mut JoinSet<()>, worker_id: &str) {
         loop {
-            // 即使一直有任务可认领，也先检查停止信号。
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => return,
-                _ = std::future::ready(()) => {}
-            }
             while let Some(result) = in_flight.try_join_next() {
                 if let Err(e) = result {
                     error!(error = %e, "settle task join failed");
@@ -109,29 +92,13 @@ where
             }
 
             let available = self.max_concurrency - in_flight.len();
-            if available > 0 {
-                // shutdown 可以包含异步工作，认领期间也要持续轮询它。
-                let claim = self.claim_and_spawn(in_flight, worker_id, available);
-                tokio::pin!(claim);
-                tokio::select! {
-                    biased;
-                    _ = &mut shutdown => {
-                        // 事务可能已提交，必须接收并启动本批任务，再由 run 等待结算。
-                        claim.await;
-                        return;
-                    }
-                    count = &mut claim => {
-                        if count > 0 {
-                            continue;
-                        }
-                    }
-                }
+            if available > 0 && self.claim_and_spawn(in_flight, worker_id, available).await > 0 {
+                continue;
             }
 
-            // 满槽时只等待任务结束或停止，不做无效轮询，也不消耗就绪通知。
+            // 满槽时只等待任务结束，不做无效轮询，也不消耗就绪通知。
             tokio::select! {
                 biased;
-                _ = &mut shutdown => return,
                 result = in_flight.join_next(), if !in_flight.is_empty() => {
                     if let Some(Err(e)) = result {
                         error!(error = %e, "settle task join failed");
@@ -143,7 +110,7 @@ where
         }
     }
 
-    /// 按空槽数认领并启动任务，返回本批数量；调用方必须完整等待此过程。
+    /// 按空槽数认领并启动任务，返回本批数量。
     async fn claim_and_spawn(
         &self,
         in_flight: &mut JoinSet<()>,
