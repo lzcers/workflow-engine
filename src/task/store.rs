@@ -1,4 +1,6 @@
-//! 引擎、工作流实例与调度器共用的任务存储契约。
+//! 引擎统一定义的任务存储契约与后继输入规则。
+//!
+//! 各数据库后端复用本模块的纯数据转换，并通过各自的 SQL、锁与事务落实 [`TaskStore`] 契约。
 
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -39,13 +41,62 @@ pub struct FanoutInstances {
     pub depends_on_names: Vec<String>,
 }
 
+impl From<&FanoutPlan> for FanoutInstances {
+    /// 单条输入参与扇入合并；多条输入按顺序编号为独立实例；空输入不创建实例。
+    fn from(plan: &FanoutPlan) -> Self {
+        let instances = if plan.inputs.len() == 1 {
+            vec![(None, plan.inputs[0].clone())]
+        } else {
+            plan.inputs
+                .iter()
+                .enumerate()
+                .map(|(i, input)| (Some(i as i32), input.clone()))
+                .collect()
+        };
+        Self {
+            name: plan.dst.to_string(),
+            task_type: plan.task_type.to_string(),
+            instances,
+            depends_on_names: plan.depends_on_names.clone(),
+        }
+    }
+}
+
+/// 将前驱贡献合并到 JOIN 的累积对象；同名 key 合为数组，已有数组及新贡献数组按元素追加。
+/// 任一输入不是对象时不合并。后端须在持锁事务内读取累积值、调用此函数并写回。
+pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) {
+    let Value::Object(acc_map) = acc else { return };
+    let Some(obj) = contribution.as_object() else {
+        return;
+    };
+    for (key, value) in obj {
+        match acc_map.get_mut(key) {
+            None => {
+                acc_map.insert(key.clone(), value.clone());
+            }
+            Some(existing) => {
+                let mut values = match existing.take() {
+                    Value::Array(values) => values,
+                    value => vec![value],
+                };
+                match value {
+                    Value::Array(items) => values.extend(items.clone()),
+                    value => values.push(value.clone()),
+                }
+                *existing = Value::Array(values);
+            }
+        }
+    }
+}
+
 /// 引擎与调度器共用的任务持久化抽象：提交、认领、原子结算和释放认领。
 ///
 /// 存储可供多个工作流共享；认领时显式传入工作流身份，提交与结算沿用任务的身份。
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
 /// 具体存储实现使用统一的 [`TaskRecord`] 快照，并将操作限制在任务所属的工作流内。
 ///
-/// 所有方法均由存储实现提供；结算必须原子提交任务状态与全部后继，失败则整体回滚。
+/// 认领资格与结算语义由本契约统一规定，后端负责事务实现；结算必须原子提交任务状态
+/// 与全部后继，失败则整体回滚。认领与恢复扫描必须使用一致的可执行性规则。
 pub trait TaskStore: Sync {
     /// 存储层错误类型：允许不同存储实现定义各自的错误，同时保证引擎层可统一传播
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。
@@ -64,6 +115,16 @@ pub trait TaskStore: Sync {
 
     /// 在指定工作流的全部运行中认领一批可执行任务（互相无依赖），最多 `limit` 个；数量不足或无可认领
     /// 时返回少于 `limit` 甚至空列表，按任务 ID 排序。`limit` 为 0 时直接返回空列表。
+    ///
+    /// 可执行任务必须同时满足：
+    /// - 状态为 pending / running，未持有租约或租约已过期，且尝试次数未达到上限。
+    /// - `depends_on_ids` 中每个 ID 在同一 workflow 内均存在且已成功；缺失依赖必须阻塞。
+    /// - JOIN 还要求记录中 `depends_on_names` 的每个前驱，在同一 `workflow_id + run_id`
+    ///   下至少存在一个实例，且全部实例均已成功；同为 NULL 的 run_id 视为同组。
+    ///   skipped / failed / superseded 均不算成功。前驱集合为空时不增加此项限制
+    ///   （图规划的失败后继当前使用空集合）；普通任务不使用前驱名作认领闸门。
+    ///
+    /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
     /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入租约。
     fn claim_many<'a>(
         &'a self,
@@ -80,6 +141,11 @@ pub trait TaskStore: Sync {
     ///
     /// 必须校验当前有效认领，旧执行者不能提交结果或创建后继。
     /// 成功后继依赖源任务，并继承结算时最新的任务身份（如 `run_id`）。
+    /// 后继实例按 [`FanoutInstances::from`] 转换；单实例按同一 workflow、run、节点名
+    /// 汇入已有 pending / running 任务，依赖 ID 取去重并集。JOIN 输入通过
+    /// [`merge_join_input`] 累积，普通任务保留首个输入。
+    /// 前驱成功、依赖累积、JOIN 输入合并与后继创建必须在同一事务提交，且并发首次
+    /// 汇入不能创建重复单实例。新建单实例 JOIN 如已有静态前驱永久 failed，应直接标记 failed。
     fn settle_success<'a>(
         &'a self,
         task: &'a TaskRecord,
@@ -104,3 +170,7 @@ pub trait TaskStore: Sync {
     /// 重入，不必等待租约过期。仅当前有效认领可以释放，不能释放新执行者的租约。
     fn release_claim<'a>(&'a self, task: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>>;
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/task_store.rs"]
+mod tests;

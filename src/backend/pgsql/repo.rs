@@ -9,7 +9,10 @@ use sqlx::PgPool;
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
-use crate::task::{FanoutInstances, store::LEASE_DURATION};
+use crate::task::{
+    FanoutInstances,
+    store::{LEASE_DURATION, merge_join_input},
+};
 use crate::{Task, TaskRecord, TaskStatus};
 
 /// 任务行级重试预算耗尽时的封存错误信息（`attempt >= max_attempts` 不再被认领）。
@@ -20,35 +23,6 @@ const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, name, instance_id, status, \
      claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_ids, depends_on_names, \
      input_json, output_json, error, created_at, updated_at";
-
-/// 把一份 `{前驱名: 贡献}` 单键对象并入 JOIN 任务的累积 Map；同名 key 合并为数组。
-///
-/// `contribution` 通常来自单键输出（如 `json!({ src: value })`）。仅 JOIN 任务在扇入合并时调用。
-fn merge_join_input(acc: &mut Value, contribution: &Value) {
-    let Value::Object(acc_map) = acc else { return };
-    let Some(obj) = contribution.as_object() else {
-        return;
-    };
-    for (k, v) in obj {
-        match acc_map.get_mut(k) {
-            None => {
-                acc_map.insert(k.clone(), v.clone());
-            }
-            Some(existing) => {
-                // 同名 key 已存在：把既有值与新贡献并入同一数组。
-                let mut arr = match existing.take() {
-                    Value::Array(a) => a,
-                    other => vec![other],
-                };
-                match v {
-                    Value::Array(items) => arr.extend(items.clone()),
-                    other => arr.push(other.clone()),
-                }
-                acc_map.insert(k.clone(), Value::Array(arr));
-            }
-        }
-    }
-}
 
 /// 任务就绪通知通道：任务变为可认领时（入队 / 扇出 / 释放租约）在**同一事务**内
 /// `pg_notify` 本通道，payload 为 `workflow_id`；PG 事务性 NOTIFY 只在 COMMIT 时投递，
@@ -369,20 +343,25 @@ pub struct PgTaskRepo {
     pool: PgPool,
 }
 
-/// 任务「可执行」闸门（不含 session 过滤与 attempt 预算过滤），`wt` 为 `tasks` 别名。
+/// 实现 [`crate::task::TaskStore::claim_many`] 的可执行契约，`wt` 为 `tasks` 别名。
 ///
 /// 由认领（[`PgTaskRepo::claim_many`]）与恢复扫描（[`PgTaskRepo::executable_workflow_ids`]）
-/// 共用：pending/running、租约未过期、直接依赖已全部成功、JOIN 静态前驱等齐。
+/// 共用：pending/running、无租约或租约已过期、直接依赖全部存在且成功、JOIN 静态前驱等齐。
+/// 遍历依赖 ID 而非已有任务行，确保缺失依赖也会阻塞。
 /// 调用方需自行补 `wt.workflow_id = $1`（认领按工作流）或省略（恢复扫描跨工作流）。
+/// attempt 预算过滤由调用方补充。
 const EXECUTABLE_WHERE: &str = r#"
     wt.status IN ('pending', 'running')
     AND (wt.lease_until IS NULL OR wt.lease_until <= NOW())
     AND NOT EXISTS (
         SELECT 1
-        FROM tasks dep
-        WHERE dep.workflow_id = wt.workflow_id
-          AND dep.task_id = ANY(wt.depends_on_ids)
-          AND dep.status <> 'succeeded'
+        FROM unnest(wt.depends_on_ids) AS dependency(task_id)
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tasks dep
+            WHERE dep.workflow_id = wt.workflow_id
+              AND dep.task_id = dependency.task_id
+              AND dep.status = 'succeeded'
+        )
     )
     AND (
         wt.task_type <> 'join'

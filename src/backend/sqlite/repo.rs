@@ -12,7 +12,7 @@ use crate::error::StorageError;
 use crate::task::FanoutInstances;
 use crate::{Task, TaskRecord, TaskStatus};
 
-use crate::task::store::LEASE_DURATION;
+use crate::task::store::{LEASE_DURATION, merge_join_input};
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted (attempt >= max_attempts)";
 
 /// Columns suitable for application queries against the same task table.
@@ -53,33 +53,8 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
     }
 }
 
-fn merge_join_input(acc: &mut Value, contribution: &Value) {
-    let Value::Object(acc_map) = acc else { return };
-    let Some(obj) = contribution.as_object() else {
-        return;
-    };
-    for (key, value) in obj {
-        match acc_map.get_mut(key) {
-            None => {
-                acc_map.insert(key.clone(), value.clone());
-            }
-            Some(existing) => {
-                let mut values = match existing.take() {
-                    Value::Array(values) => values,
-                    value => vec![value],
-                };
-                match value {
-                    Value::Array(items) => values.extend(items.clone()),
-                    value => values.push(value.clone()),
-                }
-                *existing = Value::Array(values);
-            }
-        }
-    }
-}
-
-// Both claim and recovery use the same dependency/lease gate. Iterating dependency
-// IDs, rather than existing task rows, also blocks references to missing tasks.
+/// Implements the dependency/lease gate in [`crate::task::TaskStore::claim_many`]
+/// for both claim and recovery. Iterating dependency IDs also blocks missing tasks.
 const EXECUTABLE_WHERE: &str = r#"
     wt.status IN ('pending', 'running')
     AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))

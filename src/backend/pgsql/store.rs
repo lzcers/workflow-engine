@@ -1,7 +1,7 @@
 //! [`PgTaskStore`]：通用引擎 [`crate::task::TaskStore`] 的 pgsql 实现。
 //!
-//! 通过 [`PgTaskRepo`] 供多个工作流共享，收编通用引擎的
-//! [`crate::task::FanoutPlan`] → [`crate::task::FanoutInstances`] 折叠，不感知任何业务字段。
+//! 通过 [`PgTaskRepo`] 供多个工作流共享，复用任务模块定义的后继实例转换规则，
+//! 不感知任何业务字段。
 
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -31,31 +31,6 @@ impl PgTaskStore {
     pub fn with_max_attempts(mut self, n: i32) -> Self {
         self.max_attempts = n;
         self
-    }
-}
-
-/// 把 `inputs` 折叠为 `(instance_id, input)` 实例列表：`len == 1` → 单实例（`None`，
-/// 扇入合并）；`len > 1` → map 边扇出的多实例（各占一个独立 `instance_id`）。
-/// 成功后继和失败后继共用此实例模型。
-fn fold_instances(inputs: &[Value]) -> Vec<(Option<i32>, Value)> {
-    if inputs.len() == 1 {
-        vec![(None, inputs[0].clone())]
-    } else {
-        inputs
-            .iter()
-            .enumerate()
-            .map(|(i, input)| (Some(i as i32), input.clone()))
-            .collect()
-    }
-}
-
-/// 把引擎侧 [`FanoutPlan`] 折叠为仓储层入队计划。
-fn to_fanout_instances(f: &FanoutPlan) -> FanoutInstances {
-    FanoutInstances {
-        name: f.dst.to_string(),
-        task_type: f.task_type.to_string(),
-        instances: fold_instances(&f.inputs),
-        depends_on_names: f.depends_on_names.clone(),
     }
 }
 
@@ -100,7 +75,7 @@ impl TaskStore for PgTaskStore {
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let fanouts: Vec<FanoutInstances> =
-                successors.iter().map(to_fanout_instances).collect();
+                successors.iter().map(FanoutInstances::from).collect();
             self.repo
                 .succeed_and_enqueue(task, output, &fanouts, self.max_attempts)
                 .await
@@ -117,7 +92,7 @@ impl TaskStore for PgTaskStore {
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let fanouts: Vec<FanoutInstances> =
-                successors.iter().map(to_fanout_instances).collect();
+                successors.iter().map(FanoutInstances::from).collect();
             self.repo
                 .fail_and_enqueue(task, message, &fanouts, self.max_attempts)
                 .await

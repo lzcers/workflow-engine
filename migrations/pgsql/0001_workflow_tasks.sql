@@ -54,8 +54,8 @@ COMMENT ON COLUMN tasks.lease_until IS '认领租约的到期时间；NULL 表�
 COMMENT ON COLUMN tasks.attempt IS '该任务行已被认领的次数；初始为 0，每次认领加 1，包括首次执行及租约回收后的重新执行。';
 COMMENT ON COLUMN tasks.max_attempts IS '该任务行允许被认领的总次数，默认 3（含首次执行）；预算耗尽且再次满足执行条件时封存为 failed，失败边新建任务单独计数。';
 COMMENT ON COLUMN tasks.depends_on_ids IS '直接依赖的任务 ID 数组，引用同一 workflow_id 下的 task_id；用于依赖就绪判定、扇入合并、溯源及失败级联，空数组表示无直接依赖。';
-COMMENT ON COLUMN tasks.task_type IS '节点声明的任务类型：normal 为普通节点，join 为汇合节点；join 额外检查 depends_on_names 中的静态前驱是否全部就绪。';
 COMMENT ON COLUMN tasks.depends_on_names IS '静态前驱节点名数组；join 认领时要求同一 workflow_id、run_id 下每个前驱至少有一个实例且全部实例成功，同时用于血缘记录及失败级联。';
+COMMENT ON COLUMN tasks.task_type IS '节点声明的任务类型：normal 为普通节点，join 为汇合节点；join 额外检查 depends_on_names 中的静态前驱是否全部就绪。';
 COMMENT ON COLUMN tasks.input_json IS '节点输入的 JSON 值；结构由节点输入类型决定，JOIN 输入按前驱节点名汇聚。';
 COMMENT ON COLUMN tasks.output_json IS '节点成功输出的 JSON 值；结构由节点输出类型决定，尚未写入输出时为 SQL NULL。';
 COMMENT ON COLUMN tasks.error IS '失败、跳过或被后继接管的原因文本，也记录重试预算耗尽及依赖失败原因；成功结算时清空。';

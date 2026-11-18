@@ -5,7 +5,7 @@ use sqlx::postgres::PgListener;
 
 use super::super::test_support::connect_test;
 use super::BUDGET_EXHAUSTED_ERR;
-use super::{PgTaskRepo, TASK_READY_CHANNEL, merge_join_input};
+use super::{PgTaskRepo, TASK_READY_CHANNEL};
 use crate::error::StorageError;
 use crate::task::FanoutInstances;
 use crate::{Task, TaskRecord, TaskStatus};
@@ -377,6 +377,96 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
         .unwrap();
     assert_eq!(untouched.status, TaskStatus::Running);
     assert!(untouched.lease_until.is_some());
+}
+
+#[tokio::test]
+async fn claims_require_all_dependencies_including_missing_ids() {
+    let Some(database) = connect_test().await else {
+        return;
+    };
+    let repo = PgTaskRepo::new(database.pool().clone());
+    let instances = [(Some(0), json!(null)), (Some(1), json!(null))];
+    // 另一个工作流的同 ID 成功记录不能满足本工作流的依赖。
+    let other = repo
+        .enqueue_fanout(
+            "other_dependencies",
+            None,
+            "source",
+            &[
+                (Some(0), json!(null)),
+                (Some(1), json!(null)),
+                (Some(2), json!(null)),
+            ],
+            &[],
+            "normal",
+            &[],
+            3,
+        )
+        .await
+        .unwrap();
+    for claim in repo
+        .claim_many("other_dependencies", "worker", 10)
+        .await
+        .unwrap()
+    {
+        repo.succeed(&claim, &json!(null)).await.unwrap();
+    }
+    let dependency_ids = vec![other[1].task_id, other[2].task_id];
+    let workflow_id = "missing_dependencies";
+    let child = repo
+        .enqueue(&Task {
+            workflow_id: workflow_id.to_string(),
+            run_id: None,
+            name: "child".to_string(),
+            instance_id: None,
+            max_attempts: 3,
+            depends_on_ids: dependency_ids.clone(),
+            depends_on_names: vec![],
+            input: json!(null),
+        })
+        .await
+        .unwrap();
+    assert!(
+        repo.claim_many(workflow_id, "worker", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
+
+    let sources = repo
+        .enqueue_fanout(
+            workflow_id,
+            None,
+            "source",
+            &instances,
+            &[],
+            "normal",
+            &[],
+            3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sources.iter().map(|task| task.task_id).collect::<Vec<_>>(),
+        dependency_ids
+    );
+    let claims = repo.claim_many(workflow_id, "worker", 10).await.unwrap();
+    assert_eq!(claims.len(), 2);
+    repo.succeed(&claims[0], &json!(null)).await.unwrap();
+    assert!(
+        repo.claim_many(workflow_id, "worker", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
+
+    repo.succeed(&claims[1], &json!(null)).await.unwrap();
+    assert_eq!(repo.executable_workflow_ids().await.unwrap(), [workflow_id]);
+    let claims = repo.claim_many(workflow_id, "worker", 10).await.unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].task_id, child.task_id);
 }
 
 /// 恢复扫描只返回「存在可认领任务」的工作流（与 `claim_many` 同款闸门）：
@@ -924,20 +1014,4 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
         assert_eq!(rows[0].status, TaskStatus::Running);
         assert!(rows[0].output.is_none());
     }
-}
-
-#[test]
-fn join_input_merges_same_key_into_array() {
-    // 同名前驱多次贡献（多实例扇入）→ 合并为数组。
-    let mut acc = json!({"image": {"prompt": "a"}});
-    merge_join_input(&mut acc, &json!({"image": {"prompt": "b"}}));
-    assert_eq!(
-        acc,
-        json!({
-            "image": [
-                {"prompt": "a"},
-                {"prompt": "b"},
-            ]
-        })
-    );
 }
