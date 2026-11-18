@@ -71,7 +71,7 @@ pub struct TaskRecord {
     pub attempt: i32,
     /// 业务执行的最大尝试次数；最终失败的恢复认领不再执行业务。
     pub max_attempts: i32,
-    /// 任务类型（`normal`/`join`）：由节点 `TASK_TYPE` 声明，决定存储的等齐前驱闸门。
+    /// 节点声明的任务类型（`normal`/`join`/`event`）；仅 JOIN 额外检查静态前驱。
     pub task_type: String,
     /// 血缘/溯源链路：父任务 id 集合（空集 = 无依赖）。
     pub depends_on_ids: Vec<i64>,
@@ -95,6 +95,8 @@ pub struct Task {
     /// 父任务 ID；独立入口为 None，不替代执行依赖 depends_on_ids。
     pub parent_task_id: Option<i64>,
     pub name: String,
+    /// 节点声明的任务类型（`normal`/`join`/`event`），入队时原样保存。
+    pub task_type: String,
     pub max_attempts: i32,
     pub depends_on_ids: Vec<i64>,
     /// JOIN 静态前驱节点名全集（普通节点默认空集）。
@@ -103,13 +105,14 @@ pub struct Task {
 }
 
 impl Task {
-    /// 创建无依赖的独立运行入口；可在入队前设置 run_id、父任务、依赖和尝试预算。
+    /// 创建普通类型、无依赖的独立运行入口；入队前可设置节点类型、运行、父任务、依赖和尝试预算。
     pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             workflow_id: workflow_id.into(),
             run_id: None,
             parent_task_id: None,
             name: name.into(),
+            task_type: "normal".to_owned(),
             max_attempts: 3,
             depends_on_ids: Vec::new(),
             depends_on_names: Vec::new(),

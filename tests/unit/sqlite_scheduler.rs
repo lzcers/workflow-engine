@@ -357,6 +357,7 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     migrate(&db).await.unwrap();
     let repo = SqliteTaskRepo::new(db.clone());
     let mut task = Task {
+        task_type: "normal".into(),
         workflow_id: "scheduler-wake".into(),
         run_id: None,
         parent_task_id: None,

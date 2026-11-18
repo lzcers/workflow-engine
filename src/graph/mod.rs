@@ -18,7 +18,7 @@ pub use crate::edge::{
     EdgeError, EdgeImpl, ErrorWhenBuilder, FailureEdge, FailureEdgeImpl, SuccessEdge, WhenBuilder,
     map, on_error, when, when_error,
 };
-pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType};
+pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
 pub use builder::GraphBuilder;
 pub use description::{EdgeDescription, EdgeKind, GraphDescription, NodeDescription};
 
@@ -84,9 +84,21 @@ impl<Ctx> Graph<Ctx> {
         &self.context
     }
 
-    /// 控制平面在入队前检查任务引用的节点。
-    pub(crate) fn contains_node(&self, name: &str) -> bool {
-        self.nodes.contains_key(name)
+    /// 入队时使用目标节点声明的任务类型；不存在的入口由调用方报告。
+    pub(crate) fn task_type_of(&self, name: &str) -> Option<TaskType> {
+        self.nodes.get(name).map(|entry| entry.node.task_type())
+    }
+
+    /// 按节点名排序的外部触发声明。节点名可直接作为 Workflow::submit 的入口。
+    /// 只读取声明，不注册触发器或创建任务。
+    pub fn triggers(&self) -> Vec<(&str, Trigger)> {
+        let mut triggers: Vec<_> = self
+            .nodes
+            .iter()
+            .filter_map(|(&name, entry)| entry.node.trigger().map(|trigger| (name, trigger)))
+            .collect();
+        triggers.sort_by(|left, right| left.0.cmp(right.0));
+        triggers
     }
 
     /// 执行节点前发布任务开始事件。
@@ -156,7 +168,7 @@ impl<Ctx> Graph<Ctx> {
                 Some(Successor {
                     dst,
                     inputs,
-                    task_type: self.task_type_of(dst),
+                    task_type: self.task_type_of(dst).expect("validated edge destination"),
                     depends_on_names: self.predecessors_of(dst),
                 })
             })
@@ -206,7 +218,7 @@ impl<Ctx> Graph<Ctx> {
                     dst,
                     inputs,
                     // task_type 如实反映 dst 节点类型：失败后继可能汇聚到 JOIN/错误处理节点，
-                    task_type: self.task_type_of(dst),
+                    task_type: self.task_type_of(dst).expect("validated edge destination"),
                     // 保持为空（当前约束）：认领闸门只支持「等齐前驱成功」，不支持「等齐失败」；
                     // 填入失败源名会让后继因前驱已失败而永久悬挂。详见方法级注释。
                     depends_on_names: Vec::new(),
@@ -214,13 +226,6 @@ impl<Ctx> Graph<Ctx> {
             })
             .collect())
     }
-    /// 目标节点的任务类型（普通节点 / JOIN 门）。JOIN 门由 [`crate::node::Node::TASK_TYPE`] 声明。
-    fn task_type_of(&self, dst: &'static str) -> TaskType {
-        self.nodes
-            .get(dst)
-            .map_or(TaskType::Normal, |n| n.node.task_type())
-    }
-
     /// 节点的静态前驱节点名集合：返回所有成功边汇入 `dst` 的源节点名全集。
     ///
     /// 通用血缘语义：普通节点也记录自己的静态前驱；是否用其做「等齐前驱」闸门
@@ -234,7 +239,7 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 静态校验：节点名唯一、边两端节点存在、边类型接线指纹一致、success 子图无环、
-    /// failure 回边不自环。
+    /// failure 回边不自环，Event 触发声明一致且无入边。
     ///
     /// 类型接线指纹校验是命令式建图（非 DSL）的兜底：DSL 边有编译期检查，命令式边只有
     /// 闭包自洽的类型参数，与注册节点 `In`/`Out` 的错线此前要到任务结算时才以 serde 错误
@@ -246,6 +251,17 @@ impl<Ctx> Graph<Ctx> {
         if self.title.trim().is_empty() {
             return Err("workflow title must not be empty".into());
         }
+        for (name, entry) in &self.nodes {
+            match (entry.node.task_type(), entry.node.trigger()) {
+                (TaskType::Event, None) => {
+                    return Err(format!("event node {name} must declare a trigger"));
+                }
+                (TaskType::Normal | TaskType::Join, Some(_)) => {
+                    return Err(format!("non-event node {name} must not declare a trigger"));
+                }
+                _ => {}
+            }
+        }
         // 节点名与边引用一致性 + 边类型接线指纹（成功边）
         for e in self.success_edges.iter() {
             let Some(src) = self.nodes.get(e.src()) else {
@@ -254,6 +270,12 @@ impl<Ctx> Graph<Ctx> {
             let Some(dst) = self.nodes.get(e.dst()) else {
                 return Err(format!("edge dst={} not registered", e.dst()));
             };
+            if dst.node.task_type() == TaskType::Event {
+                return Err(format!(
+                    "success edge must not target event node {}",
+                    e.dst()
+                ));
+            }
             // 边把源节点输出反序列化为 SrcOut：要求与源节点 Out 一致（或边载荷为 Value）
             if !readable(e.src_out_type(), src.node.out_type()) {
                 return Err(format!(
@@ -285,6 +307,12 @@ impl<Ctx> Graph<Ctx> {
             let Some(dst) = self.nodes.get(e.dst()) else {
                 return Err(format!("edge dst={} not registered", e.dst()));
             };
+            if dst.node.task_type() == TaskType::Event {
+                return Err(format!(
+                    "failure edge must not target event node {}",
+                    e.dst()
+                ));
+            }
             // 边把失败节点输入反序列化为 SrcIn：要求与源节点 In 一致（或边载荷为 Value）
             if !readable(e.src_in_type(), src.node.in_type()) {
                 return Err(format!(

@@ -220,8 +220,8 @@ impl SqliteTaskRepo {
             INSERT INTO tasks
                 (workflow_id, task_id, run_id, name, status,
                  attempt, max_attempts, depends_on_ids, depends_on_names, input_json,
-                 parent_task_id)
-            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)
+                 parent_task_id, task_type)
+            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10)
             RETURNING {ROW_COLS}
             "#
         ))
@@ -234,6 +234,7 @@ impl SqliteTaskRepo {
         .bind(Json(&task.depends_on_names))
         .bind(&task.input)
         .bind(task.parent_task_id)
+        .bind(&task.task_type)
         .fetch_one(&mut **tx)
         .await?;
         Ok(row.into())

@@ -41,8 +41,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 用于依赖就绪判定、JOIN 合并、溯源及失败级联；空数组表示无直接依赖。
     depends_on_ids TEXT NOT NULL DEFAULT '[]'
         CHECK (json_valid(depends_on_ids) AND json_type(depends_on_ids) = 'array'),
-    -- 节点声明的任务类型：normal 普通节点；join 汇合节点，额外检查静态前驱是否全部就绪。
-    task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join')),
+    -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；join 汇合节点，额外检查静态前驱。
+    task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event')),
     -- 静态前驱节点名的 JSON 数组，用于血缘记录及 JOIN 失败级联。
     -- join 认领时要求同一 workflow_id、run_id 下每个前驱至少有一个实例且全部实例成功。
     depends_on_names TEXT NOT NULL DEFAULT '[]'

@@ -69,7 +69,7 @@ pub trait TaskStore: Sync {
 
     /// 原子入队任务并确定运行身份，返回已持久化的任务快照。
     /// run_id 为 None 时，以新分配的 task_id 创建独立运行；Some(id) 则保留指定运行。
-    /// 父任务、依赖和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
+    /// 节点类型、父任务、依赖和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领

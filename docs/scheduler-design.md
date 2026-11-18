@@ -34,11 +34,15 @@ UUID 作为 `worker_id`，可以处理同一 `workflow_id` 下多个不同 `run_
 每次 `Workflow::submit(entry, input)` 按以下顺序执行：
 
 1. 检查入口节点存在，将输入序列化为 JSON。节点 `In` 类型的反序列化检查留到实际执行阶段。
-2. 构造未指定 `run_id` 的 Task，调用 `TaskStore::enqueue`，在同一事务内分配运行身份并保存入口任务。
+2. 构造未指定 `run_id`、携带入口节点 `task_type` 的 Task，调用 `TaskStore::enqueue`，在同一事务内分配运行身份并保存入口任务。
 3. 调用共享 `Notify::notify_one()` 唤醒认领，返回包含 `workflow_id`、`run_id` 和入口 `task_id` 的 `RunHandle`。
 
 成功返回表示入口任务已持久化并安排执行，不等待节点完成。提交不会创建调度器，
 提交失败也不影响已经启动的调度器。所有运行共享构造时启动的同一个后台任务。
+
+外部事件入口声明 `TaskType::Event`，通过 `Node::trigger()` 提供注册配置。
+宿主从 `Workflow::triggers()` 获取节点名及声明，自行注册触发器并在事件到达时调用 `submit`。
+Scheduler 不注册或监听触发源；已入队的 Event 任务按普通任务认领、执行与结算。
 
 存储统一使用 `enqueue(Task)` 入队：`run_id = None` 时以新任务的 `task_id` 创建独立运行，
 `Some(id)` 时加入指定运行，父任务、依赖和尝试预算沿用 Task 的字段。

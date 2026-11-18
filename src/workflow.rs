@@ -8,7 +8,7 @@ use tokio::{sync::Notify, task::JoinHandle};
 use crate::error::StorageError;
 use crate::scheduler::Scheduler;
 use crate::task::TaskStore;
-use crate::{EngineError, Graph, NodeContext, Task};
+use crate::{EngineError, Graph, NodeContext, Task, Trigger};
 
 /// 一张固定图的工作流实例，由 [`crate::Engine::make`] 创建。
 ///
@@ -57,7 +57,15 @@ where
         }
     }
 
-    /// 从指定节点创建并执行一次独立运行；原子分配 run_id 并持久化入口任务。
+    /// 获取全部外部触发节点的名称与注册声明，按节点名排序。
+    ///
+    /// 宿主负责解释配置、注册和注销触发器，事件到达时调用 submit(name, input)。
+    /// 此方法不会注册监听或创建运行。
+    pub fn triggers(&self) -> Vec<(&str, Trigger)> {
+        self.graph.triggers()
+    }
+
+    /// 从指定节点创建并执行一次独立运行；原子分配 run_id 并持久化入口任务及节点类型。
     ///
     /// input 必须能被该节点的 In 类型反序列化。成功提交立即唤醒认领；
     /// 所有 run 共享 8 个执行槽和 1 秒轮询周期。
@@ -67,14 +75,16 @@ where
         entry: &str,
         input: impl Serialize,
     ) -> Result<RunHandle, EngineError> {
-        if !self.graph.contains_node(entry) {
-            return Err(EngineError::UnknownNode(entry.to_owned()));
-        }
-        let task = Task::new(
+        let task_type = self
+            .graph
+            .task_type_of(entry)
+            .ok_or_else(|| EngineError::UnknownNode(entry.to_owned()))?;
+        let mut task = Task::new(
             self.graph.workflow_id(),
             entry,
             serde_json::to_value(input)?,
         );
+        task.task_type = task_type.as_str().to_owned();
         let record = self.store.enqueue(&task).await?;
         self.wake.notify_one();
         Ok(RunHandle {

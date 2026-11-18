@@ -31,7 +31,7 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
 `Task::new(workflow_id, name, input)` 默认创建无依赖的独立运行入口，尝试预算为 3；
-入队前可设置 `run_id`、`parent_task_id`、`depends_on_ids`、`depends_on_names` 和 `max_attempts`。
+入队前可设置 `run_id`、`parent_task_id`、`depends_on_ids`、`depends_on_names`、`task_type` 和 `max_attempts`。
 存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
 业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
 
@@ -75,7 +75,8 @@ where
 }
 ```
 
-`submit(entry, input)` 检查节点名并序列化输入，在同一事务内分配 `run_id` 和保存入口任务。
+`submit(entry, input)` 检查节点名并序列化输入，在同一事务内分配 `run_id` 和保存入口任务，
+任务的 `task_type` 使用入口节点声明的类型。
 入口由每次提交指定，输入需要符合该节点的 `In` 类型。每次提交都是独立运行：
 `workflow_id + run_id` 确定运行身份，后继继承 `run_id`，不同运行的 JOIN 汇合相互隔离。
 选定入口需要能触达后续 JOIN 所需的前驱；多次 submit 不能补齐同一次运行的多个入口。
@@ -177,7 +178,8 @@ workflow-engine = { path = "../workflow-engine", default-features = false, featu
 
 `graph.describe()` 从同一个执行图导出可序列化的 `GraphDescription { workflow_id, title, nodes, edges }`，
 适合供应用注册表和前端画布读取。描述不执行节点、条件或转换闭包，也不包含上下文和任务载荷。
-节点按注册名排序，`id` 与任务的 `name` 对应；`task_type` 为 `normal` 或 `join`，
+节点按注册名排序，`id` 与任务的 `name` 对应；`task_type` 为 `normal`、`join` 或 `event`，
+`trigger` 为 Event 节点的外部注册声明，其他节点为 `null`。
 `input_type` / `output_type` 是 Rust 类型名，不是字段级 JSON Schema。
 
 节点默认以注册名为标题、说明为空。DSL 可在节点实例前声明展示信息：
@@ -218,6 +220,56 @@ let description = graph.describe();
 
 图是固定的拓扑定义，易变依赖可在 `NodeContext::fork` 中按任务刷新。
 有空闲执行槽时，即使其他节点仍在执行，当前 Workflow 的新提交也会立即触发认领。
+
+## 外部事件入口
+
+Event 节点仍实现 `Node` 并使用相同的 nodes/edges 注册方式。通过
+`TASK_TYPE = TaskType::Event` 声明入口角色，`trigger()` 返回 `Trigger { kind, config }`。
+`kind` 和 JSON 配置的含义由宿主定义；引擎不解析 cron、不注册 HTTP 路由或订阅消息。
+
+```rust
+use serde_json::{Value, json};
+use workflow_engine::{Node, NodeError, Trigger, graph::TaskType};
+
+struct CronEntry {
+    expression: String,
+    timezone: String,
+}
+
+impl<Ctx: Send> Node<Ctx> for CronEntry {
+    type In = Value;
+    type Out = Value;
+    const TASK_TYPE: TaskType = TaskType::Event;
+
+    fn trigger(&self) -> Option<Trigger> {
+        Some(Trigger {
+            kind: "cron".into(),
+            config: json!({
+                "expression": self.expression,
+                "timezone": self.timezone,
+            }),
+        })
+    }
+
+    async fn execute(&self, _ctx: &mut Ctx, input: Value) -> Result<Value, NodeError> {
+        Ok(input)
+    }
+}
+```
+
+`workflow.triggers()` 返回按节点名排序的 `Vec<(&str, Trigger)>`，构图后也可通过
+`graph.triggers()` 读取相同声明。宿主遍历 `(node_id, trigger)` 并完成注册；事件到达后
+调用 `workflow.submit(node_id, payload).await?`，输入需要符合该节点的 `In`。
+每次提交创建独立运行，入口任务保存 `task_type = "event"`，沿现有调度与结算路径执行后继。
+普通节点仍可通过 `submit` 手动启动。
+
+`trigger()` 只读取固定配置，必须无副作用；构图、描述和查询都不会建立监听。
+Event 节点必须返回声明，其他节点必须返回 `None`，成功边和失败边都不能指向 Event 节点。
+这些规则在 `build()` 时校验；具体触发配置的有效性由宿主注册器校验。
+触发器注册、注销、消息确认和事件去重由宿主管理，`submit` 不提供外部事件去重。
+多个入口的事件各自启动运行，不能用多次提交补齐同一次运行的 JOIN。
+
+SQLite 的 `event` 类型约束适用于新建表；已有数据库中的旧类型约束不会自动升级。
 
 ## 开发
 

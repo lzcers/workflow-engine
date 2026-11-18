@@ -353,13 +353,13 @@ impl PgTaskRepo {
                 (
                     workflow_id, task_id, run_id, name, status,
                     claimed_by, lease_until, attempt, max_attempts, depends_on_ids, depends_on_names,
-                    input_json, output_json, error, created_at, updated_at, parent_task_id
+                    input_json, output_json, error, created_at, updated_at, parent_task_id, task_type
                 )
             VALUES
                 (
                     $1, $2, $3, $4, 'pending',
                     NULL, NULL, 0, $5, $6, $7,
-                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9
+                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9, $10
                 )
             RETURNING {ROW_COLS}
             "#
@@ -374,6 +374,7 @@ impl PgTaskRepo {
             .bind(&task.depends_on_names)
             .bind(&task.input)
             .bind(task.parent_task_id)
+            .bind(&task.task_type)
             .fetch_one(&mut **tx)
             .await?;
         Ok(row.into())

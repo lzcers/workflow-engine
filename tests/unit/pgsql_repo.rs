@@ -35,12 +35,15 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     };
     let repo = PgTaskRepo::new(database.pool().clone());
     let workflow_id = "enqueue-runs";
-    let task = Task::new(workflow_id, "root", json!({"input": 1}));
+    let mut task = Task::new(workflow_id, "root", json!({"input": 1}));
+    task.task_type = "event".into();
     let first = repo.enqueue(&task).await.unwrap();
     let second = repo.enqueue(&task).await.unwrap();
     assert_eq!(first.run_id, Some(first.task_id));
     assert_eq!(second.run_id, Some(second.task_id));
     assert_ne!(first.run_id, second.run_id);
+    assert_eq!(first.task_type, "event");
+    assert_eq!(second.task_type, "event");
     assert_eq!(first.max_attempts, 3);
 
     let child = Task {
@@ -59,6 +62,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
         .unwrap();
     assert_eq!(stored.run_id, first.run_id);
     assert_eq!(stored.name, child.name);
+    assert_eq!(stored.task_type, "normal");
     assert_eq!(stored.parent_task_id, child.parent_task_id);
     assert_eq!(stored.max_attempts, child.max_attempts);
     assert_eq!(stored.depends_on_ids, child.depends_on_ids);
@@ -78,6 +82,7 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     let repo = PgTaskRepo::new(database.pool().clone());
     let workflow_id = "succeed_and_enqueue_atomic";
     repo.enqueue(&Task {
+        task_type: "normal".into(),
         workflow_id: workflow_id.to_string(),
         run_id: None,
         name: "image_prompt".to_string(),
@@ -274,6 +279,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     let workflow_id = "fail_and_enqueue_atomic";
     // 有后继：superseded + 后继入队（depends_on_ids 为空）。
     repo.enqueue(&Task {
+        task_type: "normal".into(),
         workflow_id: workflow_id.to_string(),
         run_id: None,
         name: "commit_scene".to_string(),
@@ -323,6 +329,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     // 无后继：failed。
     let failed = repo
         .enqueue(&Task {
+            task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "audio_generate".to_string(),
@@ -349,6 +356,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     ] {
         let dependent = repo
             .enqueue(&Task {
+                task_type: "normal".into(),
                 workflow_id: workflow_id.to_string(),
                 run_id,
                 name: name.to_string(),
@@ -433,6 +441,7 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
     let repo = PgTaskRepo::new(database.pool().clone());
     async fn enqueue(repo: &PgTaskRepo, workflow_id: &str) -> TaskRecord {
         repo.enqueue(&Task {
+            task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "narration".to_string(),
@@ -525,6 +534,7 @@ async fn claims_require_all_dependencies_including_missing_ids() {
     let workflow_id = "missing_dependencies";
     let child = repo
         .enqueue(&Task {
+            task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "child".to_string(),
@@ -595,6 +605,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
         deps: Vec<i64>,
     ) -> TaskRecord {
         repo.enqueue(&Task {
+            task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: name.to_string(),
@@ -784,6 +795,7 @@ async fn task_ready_notifications_carry_workflow_id() {
     // 1) 入队（HTTP 推进根任务）。
     let root = repo
         .enqueue(&Task {
+            task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
             name: "scene_proposal".to_string(),
@@ -825,6 +837,7 @@ async fn task_ready_notifications_carry_workflow_id() {
 
 async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i64>) -> TaskRecord {
     repo.enqueue(&Task {
+        task_type: "normal".into(),
         workflow_id: workflow_id.into(),
         run_id,
         name: name.into(),
@@ -894,6 +907,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         .unwrap()
         .remove(0);
     let mut dependent = Task {
+        task_type: "normal".into(),
         workflow_id: workflow_id.into(),
         run_id: Some(7),
         name: "dependent".into(),

@@ -15,7 +15,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use super::task::TaskRecord;
@@ -23,6 +23,15 @@ use super::task::TaskRecord;
 mod join;
 
 pub use join::JoinNode;
+
+/// 外部触发器的注册声明。种类与配置由宿主解释，引擎只负责描述和提交后的任务执行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trigger {
+    /// 宿主识别的触发器种类，例如 `cron` 或 `webhook`。
+    pub kind: String,
+    /// 对应种类的注册配置，例如 cron 表达式与时区。
+    pub config: Value,
+}
 
 /// `Node` 的上下文类型参数：`Ctx` 业务侧实例化为 `NodeContext`。
 /// 错误统一为 [`NodeError`]。
@@ -37,6 +46,15 @@ pub trait Node<Ctx>: Send + Sync {
     type Out: Serialize + DeserializeOwned + 'static;
     /// 该节点产出的任务类型。默认普通节点；[`JoinNode`] 覆盖为 [`TaskType::Join`]。
     const TASK_TYPE: TaskType = TaskType::Normal;
+
+    /// 外部触发器的注册信息。Event 节点必须返回 Some，其他节点必须返回 None。
+    ///
+    /// 此方法仅描述固定的节点配置，必须无副作用，不注册监听或依赖单次任务上下文。
+    /// 宿主通过 Workflow::triggers 获取声明，注册后调用 Workflow::submit 投递事件。
+    fn trigger(&self) -> Option<Trigger> {
+        None
+    }
+
     /// 异步执行：消费输入，产出序列化输出。失败返回 [`NodeError`]。
     ///
     /// 返回 `impl Future + Send` 以便擦除后可在 tokio 任务中跨线程移动。
@@ -132,6 +150,7 @@ impl TypeFingerprint {
 /// 图直接持有构造完成的节点实例。
 pub trait AnyNode<Ctx>: Send + Sync {
     fn task_type(&self) -> TaskType;
+    fn trigger(&self) -> Option<Trigger>;
     fn in_type(&self) -> TypeFingerprint;
     fn out_type(&self) -> TypeFingerprint;
     fn on_start<'a>(&'a self, ctx: &'a mut Ctx, input: &'a Value) -> BoxFuture<'a, ()>;
@@ -165,6 +184,9 @@ where
 {
     fn task_type(&self) -> TaskType {
         N::TASK_TYPE
+    }
+    fn trigger(&self) -> Option<Trigger> {
+        N::trigger(self)
     }
     fn in_type(&self) -> TypeFingerprint {
         TypeFingerprint::of::<N::In>()
@@ -237,7 +259,8 @@ impl From<String> for NodeError {
     }
 }
 
-/// 节点产出的任务类型。该类型决定存储层如何调度该任务（如 JOIN 门需等齐静态前驱）。
+/// 节点声明的任务类型：Event 为外部事件入口，JOIN 需等齐静态前驱。
+/// Event 入队后的认领与执行沿用普通任务规则，监听和注册由宿主负责。
 ///
 /// 由节点经 [`Node::TASK_TYPE`] 常量声明，作为**类型级自描述**（编译期确定），
 /// 而非运行时询问。DB `tasks.task_type` 列以 [`TaskType::as_str`] 的字符串承载。
@@ -245,6 +268,8 @@ impl From<String> for NodeError {
 pub enum TaskType {
     /// 普通节点：无需等齐前驱，fan-in 任一前驱成功即触发。
     Normal,
+    /// 外部事件入口：声明触发配置，不允许成功边或失败边指向此节点。
+    Event,
     /// JOIN 汇聚门：需等全部静态前驱（`depends_on_names`）成功后才放行。
     Join,
 }
@@ -254,6 +279,7 @@ impl TaskType {
     pub const fn as_str(self) -> &'static str {
         match self {
             TaskType::Normal => "normal",
+            TaskType::Event => "event",
             TaskType::Join => "join",
         }
     }

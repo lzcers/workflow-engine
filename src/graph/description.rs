@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use super::Graph;
+use super::{Graph, Trigger};
 
 /// 已构建执行图的可序列化拓扑。节点按 ID 排序，边按成功/失败及各自注册顺序输出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -21,6 +21,8 @@ pub struct NodeDescription {
     pub title: String,
     pub description: String,
     pub task_type: String,
+    /// Event 节点的外部触发声明；其他节点为 None。
+    pub trigger: Option<Trigger>,
     pub input_type: String,
     pub output_type: String,
 }
@@ -54,6 +56,7 @@ impl<Ctx> Graph<Ctx> {
                 title: entry.title.clone(),
                 description: entry.description.clone(),
                 task_type: entry.node.task_type().as_str().to_owned(),
+                trigger: entry.node.trigger(),
                 input_type: entry.node.in_type().name().to_owned(),
                 output_type: entry.node.out_type().name().to_owned(),
             })

@@ -1,5 +1,5 @@
 use std::future::Future;
-use workflow_engine::{Graph, Node, NodeError, workflow};
+use workflow_engine::{Graph, Node, NodeError, Trigger, graph::TaskType, workflow};
 
 struct Ctx;
 
@@ -14,6 +14,140 @@ impl Node<Ctx> for PassThrough {
     ) -> impl Future<Output = Result<Self::Out, NodeError>> + Send {
         async move { Ok(input) }
     }
+}
+
+struct EventNode(Option<Trigger>);
+
+impl Node<Ctx> for EventNode {
+    type In = serde_json::Value;
+    type Out = serde_json::Value;
+    const TASK_TYPE: TaskType = TaskType::Event;
+
+    fn trigger(&self) -> Option<Trigger> {
+        self.0.clone()
+    }
+
+    async fn execute(&self, _: &mut Ctx, input: Self::In) -> Result<Self::Out, NodeError> {
+        Ok(input)
+    }
+}
+
+fn cron_trigger() -> Trigger {
+    Trigger {
+        kind: "cron".into(),
+        config: serde_json::json!({"expression": "0 9 * * *", "timezone": "Asia/Shanghai"}),
+    }
+}
+
+#[test]
+fn event_nodes_are_discovered_and_described_through_existing_dsl() {
+    let graph = workflow! {
+        workflow_id: "event-description";
+        title: "Event description";
+        context: Ctx;
+        nodes {
+            z_tick => EventNode(Some(cron_trigger())),
+            process => PassThrough,
+            #[title = "支付回调"]
+            a_payment => EventNode(Some(Trigger {
+                kind: "payment.webhook".into(),
+                config: serde_json::json!({"path": "/payments"}),
+            })),
+        }
+        edges {
+            z_tick -> process,
+            a_payment -> process,
+        }
+    }
+    .unwrap();
+
+    let triggers = graph.triggers();
+    assert_eq!(
+        triggers.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        ["a_payment", "z_tick"]
+    );
+    assert_eq!(triggers[0].1.kind, "payment.webhook");
+    assert_eq!(
+        triggers[0].1.config,
+        serde_json::json!({"path": "/payments"})
+    );
+    assert_eq!(triggers[1].1, cron_trigger());
+
+    let description = graph.describe();
+    assert_eq!(description.nodes[0].id, "a_payment");
+    assert_eq!(description.nodes[0].title, "支付回调");
+    assert_eq!(description.nodes[0].task_type, "event");
+    assert_eq!(description.nodes[0].trigger.as_ref(), Some(&triggers[0].1));
+    assert_eq!(description.nodes[1].id, "process");
+    assert!(description.nodes[1].trigger.is_none());
+    let serialized = serde_json::to_value(&description).unwrap();
+    assert_eq!(
+        serialized["nodes"][2]["trigger"]["config"],
+        cron_trigger().config
+    );
+    assert!(serialized["nodes"][1]["trigger"].is_null());
+}
+
+#[test]
+fn event_nodes_require_consistent_trigger_metadata() {
+    struct OrdinaryNodeWithTrigger;
+
+    impl Node<Ctx> for OrdinaryNodeWithTrigger {
+        type In = serde_json::Value;
+        type Out = serde_json::Value;
+
+        fn trigger(&self) -> Option<Trigger> {
+            Some(cron_trigger())
+        }
+
+        async fn execute(&self, _: &mut Ctx, input: Self::In) -> Result<Self::Out, NodeError> {
+            Ok(input)
+        }
+    }
+
+    assert!(
+        Graph::builder("missing-trigger", "Missing trigger", Ctx)
+            .node("event", EventNode(None))
+            .build()
+            .is_err()
+    );
+    assert!(
+        Graph::builder("unexpected-trigger", "Unexpected trigger", Ctx)
+            .node("ordinary", OrdinaryNodeWithTrigger)
+            .build()
+            .is_err()
+    );
+}
+
+#[test]
+fn event_nodes_reject_incoming_success_and_failure_edges() {
+    let success = workflow! {
+        workflow_id: "event-success-edge";
+        title: "Event success edge";
+        context: Ctx;
+        nodes {
+            source => PassThrough,
+            event => EventNode(Some(cron_trigger())),
+        }
+        edges {
+            source -> event,
+        }
+    };
+    assert!(success.is_err());
+
+    let failure = workflow! {
+        workflow_id: "event-failure-edge";
+        title: "Event failure edge";
+        context: Ctx;
+        nodes {
+            source => PassThrough,
+            event => EventNode(Some(cron_trigger())),
+        }
+        edges {
+            source -> event on_error |input, _| vec![input.clone()],
+        }
+    };
+    assert!(failure.is_err());
 }
 
 /// `on_error fn`（无条件）/ `when_error(cond) |> fn`（条件）失败边 DSL 语法：都能展开并规划。

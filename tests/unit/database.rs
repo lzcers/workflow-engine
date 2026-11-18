@@ -18,6 +18,7 @@ fn repository(database: &Database) -> SqliteTaskRepo {
 
 fn task() -> Task {
     Task {
+        task_type: "normal".into(),
         workflow_id: "connection-check".into(),
         run_id: Some(1),
         parent_task_id: None,

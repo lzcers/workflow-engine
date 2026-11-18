@@ -5,8 +5,8 @@ use std::{sync::Arc, time::Duration};
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use workflow_engine::{
-    Engine, EngineError, Graph, TaskRecord, TaskStatus,
-    graph::{Node, NodeContext, NodeError},
+    Engine, EngineError, Graph, TaskRecord, TaskStatus, Trigger,
+    graph::{Node, NodeContext, NodeError, TaskType},
 };
 
 #[derive(Default)]
@@ -47,6 +47,112 @@ impl Node<Context> for AddOne {
                 .unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn event_discovery_and_external_submissions_preserve_type_and_independent_runs() {
+    struct ScheduledInput;
+
+    impl Node<Context> for ScheduledInput {
+        type In = i32;
+        type Out = i32;
+        const TASK_TYPE: TaskType = TaskType::Event;
+
+        fn trigger(&self) -> Option<Trigger> {
+            Some(Trigger {
+                kind: "cron".into(),
+                config: json!({"expression": "0 9 * * *", "timezone": "Asia/Shanghai"}),
+            })
+        }
+
+        async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
+            Ok(input + 10)
+        }
+
+        async fn on_success(ctx: &mut Context, output: &Value) {
+            <AddOne as Node<Context>>::on_success(ctx, output).await;
+        }
+    }
+
+    let engine = Engine::new("sqlite::memory:").await.unwrap();
+    let (completed, mut results) = mpsc::unbounded_channel();
+    let graph = workflow_engine::workflow! {
+        workflow_id: "external-events";
+        title: "External events";
+        context: Context { completed: Some(completed), ..Context::default() };
+        nodes {
+            tick => ScheduledInput,
+            process => AddOne,
+        }
+        edges {
+            tick -> process,
+        }
+    }
+    .unwrap();
+    let workflow = engine.make(graph);
+    let triggers = workflow.triggers();
+    assert_eq!(triggers.len(), 1);
+    let (entry, trigger) = &triggers[0];
+    assert_eq!(*entry, "tick");
+    assert_eq!(trigger.kind, "cron");
+    assert_eq!(trigger.config["expression"], "0 9 * * *");
+
+    // The external registration uses the discovered entry for each delivered event.
+    let first = workflow.submit(entry, 10).await.unwrap();
+    let second = workflow.submit(entry, 20).await.unwrap();
+    let manual = workflow.submit("process", 30).await.unwrap();
+    assert_ne!(first.run_id, second.run_id);
+    assert_ne!(manual.run_id, first.run_id);
+    assert_ne!(manual.run_id, second.run_id);
+
+    let mut observed = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut observed = Vec::new();
+        for _ in 0..5 {
+            let (task, output) = results.recv().await.unwrap();
+            observed.push((
+                task.run_id.unwrap(),
+                task.name,
+                task.task_type,
+                task.parent_task_id,
+                task.input.as_i64().unwrap(),
+                output.as_i64().unwrap(),
+            ));
+        }
+        observed
+    })
+    .await
+    .expect("each event executes its entry and successor, alongside a manual submission");
+    observed.sort();
+    let mut expected = vec![
+        (first.run_id, "tick".into(), "event".into(), None, 10, 20),
+        (
+            first.run_id,
+            "process".into(),
+            "normal".into(),
+            Some(first.task_id),
+            20,
+            21,
+        ),
+        (second.run_id, "tick".into(), "event".into(), None, 20, 30),
+        (
+            second.run_id,
+            "process".into(),
+            "normal".into(),
+            Some(second.task_id),
+            30,
+            31,
+        ),
+        (
+            manual.run_id,
+            "process".into(),
+            "normal".into(),
+            None,
+            30,
+            31,
+        ),
+    ];
+    expected.sort();
+    assert_eq!(observed, expected);
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # 外部事件触发：一手资料研究
 
-研究日期：2026-11-17。本文是设计依据和建议，不代表本项目已经实现触发器、定时调度或运行恢复消息。
+研究日期：2026-11-17；实现方案更新于 2026-11-18。项目支持图内触发声明及外部提交，具体触发器注册、定时调度与监听由宿主实现。
 
 ## 已核对的成熟产品模式
 
@@ -15,28 +15,24 @@
 
 Temporal 还将重叠执行策略和迟到补发窗口作为 Schedule 行为显式定义；例如 Skip、BufferOne 和 AllowAll 是不同的业务语义，而非底层任务并发数。[Schedule policies](https://docs.temporal.io/schedule#policies)
 
-## 与当前代码的对应
+## 当前实现
 
-- 本项目把节点定义为一次 `execute(input) -> output`，Scheduler 从存储认领任务后执行；因此长时间监听外部事件会占用一个在途任务槽位。[Node](../src/node/mod.rs)、[Scheduler](../src/scheduler.rs)
-- 宿主已经负责 worker 生命周期、唤醒与恢复扫描；触发源的 HTTP 路由和 cron 驱动可延续这个责任边界。[README](../README.md)
-- SQLite 后端已经提供 `insert_task(tx, NewTask)`，可在宿主事务中插入入口任务；独立 `enqueue()` 只是插入并提交，不等同于事件去重。[SqliteTaskRepo](../src/backend/sqlite/repo.rs)
-- 当前 `run_id` 是可承载业务血缘的分组键，JOIN 汇合与等齐前驱都依赖它；并不是已定义好的不可变工作流执行身份。每个新事件必须获得隔离的分组范围，不能让所有触发事件都落入相同的 `run_id = NULL` 分组；若业务会改变血缘，应先确定独立执行身份的边界。[TaskRecord](../src/task/record.rs)
-- 已有 Tokio、serde、SQLx 和可选 chrono；当前依赖中没有专门的 cron 解析器或 HTTP 服务框架。应用已有 HTTP 服务时，应直接接入其路由；cron 计算应选成熟库，具体包需要另行核对维护情况。[Cargo.toml](../Cargo.toml)
+图负责声明触发条件，宿主负责具体触发器的注册、注销与监听，引擎通过现有提交路径执行事件。
 
-## 建议的最小闭环
+- Event 节点实现同一个 `Node`，声明 `TASK_TYPE = TaskType::Event`，使用原来的 nodes/edges 注册方式。[Node](../src/node/mod.rs)
+- `Node::trigger()` 返回 `Option<Trigger>`，普通节点默认返回 `None`。`Trigger { kind: String, config: Value }` 是描述数据，不具有独立身份或运行生命周期。种类和具体配置由宿主解释。
+- Event 节点必须有触发声明，其他节点必须没有；成功边和失败边都不能指向 Event 节点。构图时验证这些规则。[Graph](../src/graph/mod.rs)
+- `Graph::describe()` 的节点包含 `task_type` 与 `trigger`。`Graph::triggers()` 和 `Workflow::triggers()` 返回按节点名排序的 `(node_id, Trigger)` 列表，供宿主注册；这些查询均不会建立监听。[Description](../src/graph/description.rs)、[Workflow](../src/workflow.rs)
+- `trigger()` 只读取固定的节点配置，不依赖任务上下文。图中不保存注册句柄，也不提供 `activate` 或 `events` 接口。
 
-保持现有任务调度核心：外部触发源接收事件 → 验证与确定目标入口 → 在同一事务内完成事件去重与入口任务插入 → 提交后唤醒现有 Scheduler → 按既有图执行后继。
+完整路径：宿主读取触发声明 → 注册触发器 → 接收并验证事件 → `workflow.submit(node_id, input)` → 持久化入口任务并唤醒 Scheduler → 执行 Event 节点及其后继。
 
-若图上需要显示 Cron/Webhook 开始节点，它可以代表入口声明及事件载荷的短暂处理。监听和定时计划由宿主管理，不放进普通 `Node::execute` 中等待。统一的是一次触发的启动边界，传输适配保持各自实现。
+`Workflow::submit` 在同一事务内确定独立 `run_id`、保存输入及节点声明的 `task_type`。Event 任务创建后按普通任务执行，`execute` 可以透传或处理事件；Scheduler 不等待外部事件。`Workflow` 管理自身调度器生命周期，宿主管理外部触发源生命周期。[TaskStore](../src/task/store.rs)、[Scheduler](../src/scheduler.rs)
 
-先明确三个契约：每次触发的隔离身份、重复事件的幂等键、cron 迟到与重叠的固定行为。只有实际出现图中间等待需求时，再引入持久化等待和关联恢复语义。以上均为针对本项目的设计推论，而非外部产品必须照搬的实现。
+## 责任边界
 
-## 当前讨论范围的收敛
+每次成功提交创建独立运行，普通节点仍允许手动提交。多个触发入口的事件不能通过多次 `submit` 合并成同一次运行，也不能补齐同一次运行的 JOIN。
 
-根据本轮讨论，暂不设计持久化，不引入独立 Trigger 实体、TriggerSpec 或注册体系。上面的持久化内容仅保留为研究背景，不是当前实施范围。
+cron 表达式校验、时区处理、迟到和重叠策略、消息确认、注册所有权及事件去重均由宿主负责。`submit` 返回成功表示入口已持久化，不表示工作流完成，也不提供外部事件去重。上面的可靠调度研究是宿主实现的参考，不代表引擎提供了这些保证。
 
-建议在现有 `TaskType` 中增加 `Event`，表示节点的输入来自外部事件。CronNode、WebhookNode 仍实现同一个 `Node`，使用原来的 nodes/edges 注册方式。为让节点自行提供事件，在 Node 上增加可选 `events()` 方法，使用已有 futures 的 `BoxStream` 输出该节点的强类型输入；Event 节点必须提供事件流，否则启用时报告装配错误。默认方法返回 None，普通节点和 JoinNode 不订阅事件流。
-
-调度器启用时订阅 Event 节点，等待事件不占普通任务并发槽。事件到达后创建入口任务，再经过现有 `NodeContext::fork(task)`、`execute` 和后继规划。Node 的事件流使用构造时注入的依赖，不需要虚构一个尚未发生的任务上下文。Graph 只允许 Event 节点作为入口，不允许成功边或失败边指向它；描述继续使用 task_type。订阅在运行期创建，不在 build/describe 时创建，并随所属调度器停止而释放。
-
-现有 TaskStore 没有通用的根任务入队方法，落地时需要补齐这个操作；该缺口独立于是否选择数据库持久化。当前建议仍是设计，未实现这些接口。
+本次只实现启动新运行，不引入图中间等待、关联恢复或消息投递到既有运行的语义。HTTP 服务、cron 库和消息客户端由宿主选用，无需向引擎增加这些依赖。
