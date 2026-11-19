@@ -15,7 +15,7 @@ use crate::{Task, TaskRecord, TaskStatus};
 use crate::task::store::{LEASE_DURATION, merge_join_input};
 
 /// Columns suitable for application queries against the same task table.
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_ids, name, status, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
     claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
     input_json, output_json, error, created_at, updated_at";
 
@@ -66,6 +66,7 @@ const EXECUTABLE_WHERE: &str = r#"
                     SELECT 1 FROM tasks st
                     WHERE st.workflow_id = wt.workflow_id
                       AND st.run_id IS wt.run_id
+                      AND st.scope_id IS wt.scope_id
                       AND st.name = predecessor.value
                       AND st.status = 'succeeded'
                 )
@@ -73,6 +74,7 @@ const EXECUTABLE_WHERE: &str = r#"
                     SELECT 1 FROM tasks st
                     WHERE st.workflow_id = wt.workflow_id
                       AND st.run_id IS wt.run_id
+                      AND st.scope_id IS wt.scope_id
                       AND st.name = predecessor.value
                       AND st.status <> 'succeeded'
                 )
@@ -87,13 +89,20 @@ async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
+    scope_id: Option<i64>,
     parent_task_ids: &[i64],
     name: &str,
     inputs: &[Value],
     task_type: &str,
+    creates_scope: bool,
     depends_on_names: &[String],
     max_attempts: i32,
 ) -> Result<Vec<TaskRecord>, StorageError> {
+    if creates_scope && task_type == "join" {
+        return Err(StorageError::InvalidFanout {
+            detail: "foreach cannot target a JOIN node".into(),
+        });
+    }
     let mut rows = Vec::with_capacity(inputs.len());
     for input in inputs {
         let existing = if task_type == "join" {
@@ -101,6 +110,7 @@ async fn enqueue_fanout_in_tx(
                 r#"
                 SELECT {ROW_COLS} FROM tasks
                 WHERE workflow_id = ?1 AND name = ?2 AND run_id IS ?3
+                  AND scope_id IS ?4
                   AND task_type = 'join' AND status IN ('pending', 'running')
                 ORDER BY task_id LIMIT 1
                 "#
@@ -108,6 +118,7 @@ async fn enqueue_fanout_in_tx(
             .bind(workflow_id)
             .bind(name)
             .bind(run_id)
+            .bind(scope_id)
             .fetch_optional(&mut **tx)
             .await?
         } else {
@@ -145,6 +156,7 @@ async fn enqueue_fanout_in_tx(
                     SELECT EXISTS (
                         SELECT 1 FROM tasks
                         WHERE workflow_id = ?1 AND run_id IS ?2
+                          AND scope_id IS ?4
                           AND name IN (SELECT value FROM json_each(?3))
                           AND status = 'failed'
                     )
@@ -153,6 +165,7 @@ async fn enqueue_fanout_in_tx(
                 .bind(workflow_id)
                 .bind(run_id)
                 .bind(Json(depends_on_names))
+                .bind(scope_id)
                 .fetch_one(&mut **tx)
                 .await?
             } else {
@@ -163,8 +176,9 @@ async fn enqueue_fanout_in_tx(
                 r#"
                 INSERT INTO tasks
                     (workflow_id, task_id, run_id, name, status,
-                     attempt, max_attempts, task_type, parent_task_ids, depends_on_names, input_json)
-                VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10)
+                     attempt, max_attempts, task_type, parent_task_ids, depends_on_names, input_json,
+                     scope_id)
+                VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)
                 RETURNING {ROW_COLS}
                 "#
             ))
@@ -182,6 +196,11 @@ async fn enqueue_fanout_in_tx(
             .bind(Json(parent_task_ids))
             .bind(Json(depends_on_names))
             .bind(input)
+            .bind(if creates_scope || task_type == "scope" {
+                Some(task_id)
+            } else {
+                scope_id
+            })
             .fetch_one(&mut **tx)
             .await?
         };
@@ -207,8 +226,9 @@ impl SqliteTaskRepo {
             r#"
             INSERT INTO tasks
                 (workflow_id, task_id, run_id, name, status,
-                 attempt, max_attempts, parent_task_ids, depends_on_names, input_json, task_type)
-            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)
+                 attempt, max_attempts, parent_task_ids, depends_on_names, input_json, task_type,
+                 scope_id)
+            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10)
             RETURNING {ROW_COLS}
             "#
         ))
@@ -221,6 +241,11 @@ impl SqliteTaskRepo {
         .bind(Json(&task.depends_on_names))
         .bind(&task.input)
         .bind(&task.task_type)
+        .bind(if task.task_type == "scope" {
+            Some(task_id)
+        } else {
+            task.scope_id
+        })
         .fetch_one(&mut **tx)
         .await?;
         Ok(row.into())
@@ -235,16 +260,19 @@ impl SqliteTaskRepo {
     }
 
     /// Enqueue inputs atomically. Ordinary inputs each create a task; JOIN inputs
-    /// merge parent IDs and input across all contributors.
+    /// merge parent IDs and input within the same run and scope. Scope tasks and
+    /// foreach inputs start a fresh scope using their allocated task ID.
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_fanout(
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
+        scope_id: Option<i64>,
         parent_task_ids: &[i64],
         name: &str,
         inputs: &[Value],
         task_type: &str,
+        creates_scope: bool,
         depends_on_names: &[String],
         max_attempts: i32,
     ) -> Result<Vec<TaskRecord>, StorageError> {
@@ -253,10 +281,12 @@ impl SqliteTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
+            scope_id,
             parent_task_ids,
             name,
             inputs,
             task_type,
+            creates_scope,
             depends_on_names,
             max_attempts,
         )
@@ -266,7 +296,7 @@ impl SqliteTaskRepo {
     }
 
     /// Settle only the current, unexpired claim and enqueue successors in the same commit.
-    /// Successors inherit the current database run_id, including business updates.
+    /// Successors inherit the current database run_id and scope_id, including business updates.
     pub async fn succeed_and_enqueue(
         &self,
         task: &TaskRecord,
@@ -300,10 +330,12 @@ impl SqliteTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                settled.scope_id,
                 &[task.task_id],
                 fanout.dst,
                 &fanout.inputs,
                 fanout.task_type,
+                fanout.creates_scope,
                 &fanout.depends_on_names,
                 max_attempts,
             )
@@ -353,10 +385,12 @@ impl SqliteTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                settled.scope_id,
                 &[task.task_id],
                 fanout.dst,
                 &fanout.inputs,
                 fanout.task_type,
+                fanout.creates_scope,
                 &fanout.depends_on_names,
                 max_attempts,
             )
@@ -373,6 +407,7 @@ impl SqliteTaskRepo {
                       SELECT 1 FROM tasks source
                       WHERE source.workflow_id = tasks.workflow_id AND source.task_id = ?2
                         AND source.run_id IS tasks.run_id
+                        AND source.scope_id IS tasks.scope_id
                         AND tasks.task_type = 'join'
                         AND source.name IN (SELECT value FROM json_each(tasks.depends_on_names))
                   )
@@ -386,6 +421,35 @@ impl SqliteTaskRepo {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Renew only a live claim without advancing its generation. Acquire the write lock
+    /// before evaluating database time so a lease that expired while waiting stays expired.
+    pub async fn renew_claim(
+        &self,
+        task: &TaskRecord,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let lease_until = sqlx::query_scalar(
+            r#"
+            UPDATE tasks
+            SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?5 || ' seconds'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE workflow_id = ?1 AND task_id = ?2
+              AND claimed_by = ?3 AND attempt = ?4
+              AND status = 'running' AND julianday(lease_until) > julianday('now')
+            RETURNING lease_until
+            "#,
+        )
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
+        .bind(LEASE_DURATION.as_secs() as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(lease_until)
     }
 
     /// Release only this still-valid claim so another worker may reclaim the task.
@@ -457,7 +521,7 @@ impl SqliteTaskRepo {
             SET status = 'running', claimed_by = ?2,
                 error = CASE WHEN attempt >= max_attempts THEN COALESCE(error,
                     CASE WHEN lease_until IS NOT NULL
-                         THEN 'task execution window expired; retry budget exhausted'
+                         THEN 'task lease expired; retry budget exhausted'
                          ELSE 'task retry budget exhausted' END)
                     ELSE error END,
                 lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?3 || ' seconds'),

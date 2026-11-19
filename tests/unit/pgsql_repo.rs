@@ -4,7 +4,7 @@ use serde_json::json;
 use sqlx::postgres::PgListener;
 
 use super::super::test_support::connect_test;
-use super::{BUDGET_EXHAUSTED_ERR, WINDOW_EXPIRED_ERR};
+use super::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR};
 use super::{PgTaskRepo, TASK_READY_CHANNEL};
 use crate::error::StorageError;
 use crate::task::FanoutPlan;
@@ -48,6 +48,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
 
     let child = Task {
         run_id: first.run_id,
+        scope_id: Some(first.task_id),
         max_attempts: 7,
         parent_task_ids: vec![first.task_id],
         depends_on_names: vec![first.name.clone()],
@@ -60,6 +61,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.run_id, first.run_id);
+    assert_eq!(stored.scope_id, child.scope_id);
     assert_eq!(stored.name, child.name);
     assert_eq!(stored.task_type, "normal");
     assert_eq!(stored.max_attempts, child.max_attempts);
@@ -68,6 +70,18 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     assert_eq!(stored.input, child.input);
     assert_eq!(stored.status, TaskStatus::Pending);
     assert_eq!(stored.attempt, 0);
+
+    let scoped = repo
+        .enqueue(&Task {
+            task_type: "scope".into(),
+            run_id: first.run_id,
+            scope_id: child.scope_id,
+            ..Task::new(workflow_id, "scope", json!("item"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(scoped.run_id, first.run_id);
+    assert_eq!(scoped.scope_id, Some(scoped.task_id));
 }
 
 /// 原子成功结算：succeed + 全部后继（单条及批量输入）在同一事务内落库，
@@ -83,6 +97,7 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
         task_type: "normal".into(),
         workflow_id: workflow_id.to_string(),
         run_id: None,
+        scope_id: None,
         name: "image_prompt".to_string(),
         max_attempts: 3,
         parent_task_ids: vec![],
@@ -103,15 +118,24 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
             &json!({"prompts": ["a", "b"]}),
             &[
                 FanoutPlan {
+                    creates_scope: false,
                     dst: "finalize_node",
                     task_type: "normal",
                     inputs: vec![json!({})],
                     depends_on_names: vec![],
                 },
                 FanoutPlan {
+                    creates_scope: false,
                     dst: "image_generate",
                     task_type: "normal",
                     inputs: vec![json!({"prompt": "a"}), json!({"prompt": "b"})],
+                    depends_on_names: vec![],
+                },
+                FanoutPlan {
+                    creates_scope: true,
+                    dst: "image_generate",
+                    task_type: "normal",
+                    inputs: vec![json!({"prompt": "c"})],
                     depends_on_names: vec![],
                 },
             ],
@@ -126,18 +150,26 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     assert!(settled.lease_until.is_none());
     reject_stale_writes(&repo, &source).await;
 
-    // 三个后继全部落库，来源均指向源任务。
+    // 同一目标的普通 map 与 foreach 分别继承作用域和创建作用域。
     let rows = repo.list_all(workflow_id).await.unwrap();
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     assert_eq!(source.run_id, Some(source.task_id));
     assert!(rows.iter().all(|task| task.run_id == source.run_id));
     let finalize: Vec<_> = rows.iter().filter(|t| t.name == "finalize_node").collect();
     assert_eq!(finalize.len(), 1);
     assert_eq!(finalize[0].parent_task_ids, vec![source.task_id]);
     let generates: Vec<_> = rows.iter().filter(|t| t.name == "image_generate").collect();
-    assert_eq!(generates.len(), 2);
+    assert_eq!(generates.len(), 3);
     for g in &generates {
         assert_eq!(g.parent_task_ids, vec![source.task_id]);
+        assert_eq!(
+            g.scope_id,
+            if g.input["prompt"] == "c" {
+                Some(g.task_id)
+            } else {
+                source.scope_id
+            }
+        );
     }
 }
 
@@ -151,51 +183,81 @@ async fn normal_fanout_creates_each_input_independently() {
     let workflow_id = "normal-fanout";
     for run_id in [None, Some(42)] {
         for parent_task_ids in [vec![], vec![7], vec![8]] {
-            let inputs = [
-                json!({"parents": parent_task_ids, "item": "a"}),
-                json!({"parents": parent_task_ids, "item": "b"}),
-            ];
-            let first = repo
-                .enqueue_fanout(
-                    workflow_id,
-                    run_id,
-                    &parent_task_ids,
-                    "image_generate",
-                    &inputs,
-                    "normal",
-                    &[],
-                    3,
-                )
-                .await
-                .unwrap();
-            assert_eq!(first.len(), 2);
-            for (row, input) in first.iter().zip(&inputs) {
-                assert_eq!(row.run_id, run_id);
-                assert_eq!(row.parent_task_ids, parent_task_ids);
-                assert_eq!(&row.input, input);
+            for (creates_scope, count) in [(false, 2), (true, 0), (true, 1), (true, 3)] {
+                let inputs: Vec<_> = (0..count)
+                    .map(|item| json!({"parents": parent_task_ids, "item": item}))
+                    .collect();
+                let first = repo
+                    .enqueue_fanout(
+                        workflow_id,
+                        run_id,
+                        None,
+                        &parent_task_ids,
+                        "image_generate",
+                        &inputs,
+                        "normal",
+                        creates_scope,
+                        &[],
+                        3,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(first.len(), count);
+                for (row, input) in first.iter().zip(&inputs) {
+                    assert_eq!(row.run_id, run_id);
+                    assert_eq!(row.parent_task_ids, parent_task_ids);
+                    assert_eq!(&row.input, input);
+                    assert_eq!(row.scope_id, creates_scope.then_some(row.task_id));
+                }
+                let repeated = repo
+                    .enqueue_fanout(
+                        workflow_id,
+                        run_id,
+                        None,
+                        &parent_task_ids,
+                        "image_generate",
+                        &inputs,
+                        "normal",
+                        creates_scope,
+                        &[],
+                        3,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(repeated.len(), count);
+                assert!(
+                    repeated
+                        .iter()
+                        .all(|task| task.scope_id == creates_scope.then_some(task.task_id))
+                );
+                assert!(
+                    repeated
+                        .iter()
+                        .all(|task| first.iter().all(|old| old.task_id != task.task_id))
+                );
             }
-            let repeated = repo
-                .enqueue_fanout(
-                    workflow_id,
-                    run_id,
-                    &parent_task_ids,
-                    "image_generate",
-                    &inputs,
-                    "normal",
-                    &[],
-                    3,
-                )
-                .await
-                .unwrap();
-            assert_eq!(repeated.len(), 2);
-            assert!(
-                repeated
-                    .iter()
-                    .all(|task| first.iter().all(|old| old.task_id != task.task_id))
-            );
         }
     }
-    assert_eq!(repo.list_all(workflow_id).await.unwrap().len(), 24);
+    assert_eq!(repo.list_all(workflow_id).await.unwrap().len(), 72);
+    for inputs in [vec![], vec![json!({})]] {
+        assert!(matches!(
+            repo.enqueue_fanout(
+                workflow_id,
+                Some(42),
+                None,
+                &[],
+                "collect",
+                &inputs,
+                "join",
+                true,
+                &[],
+                3,
+            )
+            .await,
+            Err(StorageError::InvalidFanout { .. })
+        ));
+    }
+    assert_eq!(repo.list_all(workflow_id).await.unwrap().len(), 72);
 }
 
 #[tokio::test]
@@ -215,6 +277,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
             source,
             &contribution,
             &[FanoutPlan {
+                creates_scope: false,
                 dst: "collect",
                 task_type: "join",
                 inputs: vec![contribution.clone(), json!({"extra": source.task_id})],
@@ -274,6 +337,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         task_type: "normal".into(),
         workflow_id: workflow_id.to_string(),
         run_id: None,
+        scope_id: None,
         name: "commit_scene".to_string(),
         max_attempts: 3,
         parent_task_ids: vec![],
@@ -291,6 +355,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         &retried,
         "validation failed",
         &[FanoutPlan {
+            creates_scope: false,
             dst: "scene_proposal",
             task_type: "normal",
             inputs: vec![json!({"Retry": {}})],
@@ -322,6 +387,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
             task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
+            scope_id: None,
             name: "audio_generate".to_string(),
             max_attempts: 3,
             parent_task_ids: vec![],
@@ -348,6 +414,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
                 task_type: if is_join { "join" } else { "normal" }.into(),
                 workflow_id: workflow_id.to_string(),
                 run_id,
+                scope_id: None,
                 name: name.to_string(),
                 max_attempts: 3,
                 parent_task_ids: if is_join {
@@ -428,6 +495,7 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
             task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
+            scope_id: None,
             name: "narration".to_string(),
             max_attempts: 3,
             parent_task_ids: vec![],
@@ -578,7 +646,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     assert_eq!(recovery.task_id, root.task_id);
     assert_eq!(recovery.attempt, 2);
     assert_eq!(recovery.status, TaskStatus::Running);
-    assert_eq!(recovery.error.as_deref(), Some(WINDOW_EXPIRED_ERR));
+    assert_eq!(recovery.error.as_deref(), Some(LEASE_EXPIRED_ERR));
     reject_stale_writes(&repo, &old).await;
     assert!(matches!(
         repo.succeed(&recovery, &json!("forbidden")).await,
@@ -592,6 +660,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     ));
 
     let fanout = FanoutPlan {
+        creates_scope: false,
         dst: "handle_failure",
         task_type: "normal",
         inputs: vec![json!({"reason": "timeout"})],
@@ -606,7 +675,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     .await
     .unwrap();
     assert!(
-        repo.fail_and_enqueue(&recovery, WINDOW_EXPIRED_ERR, &[fanout.clone(), invalid], 3)
+        repo.fail_and_enqueue(&recovery, LEASE_EXPIRED_ERR, &[fanout.clone(), invalid], 3)
             .await
             .is_err()
     );
@@ -628,15 +697,15 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
         .unwrap()
         .remove(0);
     assert_eq!(next.attempt, 3);
-    assert_eq!(next.error.as_deref(), Some(WINDOW_EXPIRED_ERR));
+    assert_eq!(next.error.as_deref(), Some(LEASE_EXPIRED_ERR));
     reject_stale_writes(&repo, &recovery).await;
-    repo.fail_and_enqueue(&next, WINDOW_EXPIRED_ERR, &[fanout], 3)
+    repo.fail_and_enqueue(&next, LEASE_EXPIRED_ERR, &[fanout], 3)
         .await
         .unwrap();
     let rows = repo.list_all(workflow_id).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].status, TaskStatus::Superseded);
-    assert_eq!(rows[0].error.as_deref(), Some(WINDOW_EXPIRED_ERR));
+    assert_eq!(rows[0].error.as_deref(), Some(LEASE_EXPIRED_ERR));
     assert!(rows[0].lease_until.is_none());
     assert_eq!(rows[1].status, TaskStatus::Pending);
     assert_eq!(rows[1].parent_task_ids, [root.task_id]);
@@ -684,6 +753,7 @@ async fn task_ready_notifications_carry_workflow_id() {
             task_type: "normal".into(),
             workflow_id: workflow_id.to_string(),
             run_id: None,
+            scope_id: None,
             name: "scene_proposal".to_string(),
             max_attempts: 3,
             parent_task_ids: vec![],
@@ -698,10 +768,12 @@ async fn task_ready_notifications_carry_workflow_id() {
     repo.enqueue_fanout(
         workflow_id,
         root.run_id,
+        root.scope_id,
         &[root.task_id],
         "commit_scene",
         &[json!({})],
         "normal",
+        false,
         &[],
         3,
     )
@@ -724,6 +796,7 @@ async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i
         task_type: "normal".into(),
         workflow_id: workflow_id.into(),
         run_id,
+        scope_id: None,
         name: name.into(),
         max_attempts: 5,
         parent_task_ids: vec![],
@@ -736,11 +809,13 @@ async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i
 
 async fn reject_stale_writes(repo: &PgTaskRepo, task: &TaskRecord) {
     let fanouts = [FanoutPlan {
+        creates_scope: false,
         dst: "must-not-exist",
         task_type: "normal",
         inputs: vec![json!({})],
         depends_on_names: vec![],
     }];
+    assert!(repo.renew_claim(task).await.unwrap().is_none());
     assert!(matches!(
         repo.release_claim(task).await,
         Err(StorageError::ClaimLost { .. })
@@ -777,6 +852,60 @@ async fn reject_stale_writes(repo: &PgTaskRepo, task: &TaskRecord) {
 }
 
 #[tokio::test]
+async fn renewal_extends_the_live_claim_without_changing_its_generation() {
+    let Some(database) = connect_test().await else {
+        return;
+    };
+    let repo = PgTaskRepo::new(database.pool().clone());
+    for max_attempts in [3, 0] {
+        let workflow_id = format!("renew-{max_attempts}");
+        let mut task = Task::new(&workflow_id, "root", json!({}));
+        task.max_attempts = max_attempts;
+        let pending = repo.enqueue(&task).await.unwrap();
+        assert!(repo.renew_claim(&pending).await.unwrap().is_none());
+        let claim = repo
+            .claim_many(&workflow_id, "worker", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let shortened: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "UPDATE tasks SET lease_until = clock_timestamp() + interval '10 seconds' WHERE workflow_id = $1 RETURNING lease_until"
+        ).bind(&workflow_id).fetch_one(database.pool()).await.unwrap();
+        let renewed = repo.renew_claim(&claim).await.unwrap().unwrap();
+        assert!(renewed > shortened + chrono::Duration::seconds(280));
+        let current = repo
+            .get(&workflow_id, claim.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.lease_until, Some(renewed));
+        assert_eq!(current.attempt, claim.attempt);
+        assert_eq!(current.claimed_by, claim.claimed_by);
+        assert_eq!(current.error, claim.error);
+        assert!(
+            repo.claim_many(&workflow_id, "other", 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut wrong_workflow = claim.clone();
+        wrong_workflow.workflow_id = "missing".into();
+        assert!(repo.renew_claim(&wrong_workflow).await.unwrap().is_none());
+        let mut wrong_task = claim.clone();
+        wrong_task.task_id += 1;
+        assert!(repo.renew_claim(&wrong_task).await.unwrap().is_none());
+        if max_attempts == 0 {
+            repo.fail_and_enqueue(&claim, "budget exhausted", &[], 3)
+                .await
+                .unwrap();
+        } else {
+            repo.succeed(&claim, &json!("done")).await.unwrap();
+        }
+        assert!(repo.renew_claim(&claim).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
 async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     let Some(database) = connect_test().await else {
         return;
@@ -793,6 +922,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         task_type: "join".into(),
         workflow_id: workflow_id.into(),
         run_id: Some(7),
+        scope_id: None,
         name: "dependent".into(),
         max_attempts: 3,
         parent_task_ids: vec![],
@@ -953,6 +1083,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
             let fanouts: Vec<_> = targets
                 .into_iter()
                 .map(|name| FanoutPlan {
+                    creates_scope: false,
                     dst: name,
                     task_type: "join",
                     inputs: vec![json!({ source.name.clone(): source.task_id })],
@@ -999,7 +1130,7 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
         return;
     };
     let repo = PgTaskRepo::new(database.pool().clone());
-    for operation in 0..3 {
+    for operation in 0..4 {
         let workflow_id = format!("lease-lock-wait-{operation}");
         seed(&repo, &workflow_id, "root", None).await;
         let claim = repo
@@ -1017,25 +1148,176 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
             .unwrap();
         let worker_repo = repo.clone();
         let worker = tokio::spawn(async move {
-            match operation {
+            let result = match operation {
                 0 => worker_repo.release_claim(&claim).await,
                 1 => worker_repo.succeed(&claim, &json!({})).await.map(|_| ()),
-                _ => {
+                2 => {
                     worker_repo
                         .fail_and_enqueue(&claim, "expired", &[], 3)
                         .await
                 }
-            }
+                _ => return worker_repo.renew_claim(&claim).await.unwrap().is_none(),
+            };
+            matches!(result, Err(StorageError::ClaimLost { .. }))
         });
         wait_for_lock_waiters(database.pool(), 1).await;
         tokio::time::sleep(Duration::from_millis(350)).await;
         blocker.commit().await.unwrap();
-        assert!(matches!(
-            worker.await.unwrap(),
-            Err(StorageError::ClaimLost { .. })
-        ));
+        assert!(worker.await.unwrap());
         let rows = repo.list_all(&workflow_id).await.unwrap();
         assert_eq!(rows[0].status, TaskStatus::Running);
         assert!(rows[0].output.is_none());
+    }
+}
+
+#[tokio::test]
+async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
+    for (task_type, creates_scope) in [("scope", false), ("normal", true)] {
+        let Some(database) = connect_test().await else {
+            return;
+        };
+        let repo = PgTaskRepo::new(database.pool().clone());
+        let workflow_id = "scoped-join";
+        let scopes = repo
+            .enqueue_fanout(
+                workflow_id,
+                Some(42),
+                None,
+                &[],
+                "scope",
+                &[json!("a"), json!("b"), json!("c")],
+                task_type,
+                creates_scope,
+                &[],
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(
+            scopes
+                .iter()
+                .all(|task| task.scope_id == Some(task.task_id))
+        );
+        let scopes = repo.claim_many(workflow_id, "worker", 3).await.unwrap();
+        for scope in &scopes {
+            let fanouts = ["left", "right"].map(|dst| FanoutPlan {
+                creates_scope: false,
+                dst,
+                task_type: "normal",
+                inputs: vec![scope.input.clone()],
+                depends_on_names: vec![],
+            });
+            repo.succeed_and_enqueue(scope, &scope.input, &fanouts, 3)
+                .await
+                .unwrap();
+        }
+        let branches = repo.claim_many(workflow_id, "worker", 6).await.unwrap();
+        assert_eq!(branches.len(), 6);
+        assert!(branches.iter().all(|task| task.run_id == Some(42)));
+        for scope in &scopes {
+            assert_eq!(
+                branches
+                    .iter()
+                    .filter(|task| task.scope_id == scope.scope_id)
+                    .count(),
+                2,
+            );
+        }
+        let branch = |item: &str, name: &str| {
+            branches
+                .iter()
+                .find(|task| task.input == json!(item) && task.name == name)
+                .unwrap()
+        };
+        let contribution = |task: &TaskRecord| FanoutPlan {
+            creates_scope: false,
+            dst: "join",
+            task_type: "join",
+            inputs: vec![json!({task.name.clone(): task.input})],
+            depends_on_names: vec!["left".into(), "right".into()],
+        };
+        for item in ["a", "b"] {
+            let left = branch(item, "left");
+            repo.succeed_and_enqueue(left, &left.input, &[contribution(left)], 3)
+                .await
+                .unwrap();
+        }
+        assert!(
+            repo.claim_many(workflow_id, "join-worker", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Reclaiming the same task must retain its branch, including after a restart.
+        let right_a = branch("a", "right");
+        repo.release_claim(right_a).await.unwrap();
+        let reclaimed = repo
+            .claim_many(workflow_id, "restarted-worker", 10)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        let right_a = &reclaimed[0];
+        assert_eq!(right_a.task_id, branch("a", "right").task_id);
+        assert_eq!(right_a.scope_id, branch("a", "right").scope_id);
+        repo.succeed_and_enqueue(right_a, &right_a.input, &[contribution(right_a)], 3)
+            .await
+            .unwrap();
+        let ready = repo
+            .claim_many(workflow_id, "join-worker", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.len(),
+            1,
+            "branch a must run while branches b and c are unfinished"
+        );
+        assert_eq!(ready[0].scope_id, right_a.scope_id);
+        assert_eq!(ready[0].input, json!({"left": "a", "right": "a"}));
+        repo.succeed_and_enqueue(
+            &ready[0],
+            &ready[0].input,
+            &[FanoutPlan {
+                creates_scope: false,
+                dst: "report",
+                task_type: "normal",
+                inputs: vec![ready[0].input.clone()],
+                depends_on_names: vec![],
+            }],
+            3,
+        )
+        .await
+        .unwrap();
+
+        // Branch b already has a waiting JOIN; branch c's JOIN arrives after failure.
+        for item in ["b", "c"] {
+            repo.fail_and_enqueue(branch(item, "right"), "failed signal", &[], 3)
+                .await
+                .unwrap();
+        }
+        let left_c = branch("c", "left");
+        repo.succeed_and_enqueue(left_c, &left_c.input, &[contribution(left_c)], 3)
+            .await
+            .unwrap();
+        let rows = repo.list_all(workflow_id).await.unwrap();
+        let joins: Vec<_> = rows.iter().filter(|task| task.name == "join").collect();
+        assert_eq!(joins.len(), 3);
+        for join in joins {
+            let expected = if join.scope_id == scopes[0].scope_id {
+                TaskStatus::Succeeded
+            } else {
+                TaskStatus::Failed
+            };
+            assert_eq!(join.status, expected);
+        }
+        let report = rows.iter().find(|task| task.name == "report").unwrap();
+        assert_eq!(report.scope_id, scopes[0].scope_id);
+        assert_eq!(report.input, json!({"left": "a", "right": "a"}));
+        let ready = repo
+            .claim_many(workflow_id, "report-worker", 10)
+            .await
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].task_id, report.task_id);
     }
 }

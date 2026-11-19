@@ -16,6 +16,84 @@ impl Node<Ctx> for PassThrough {
     }
 }
 
+struct Values;
+impl Node<Ctx> for Values {
+    type In = Vec<serde_json::Value>;
+    type Out = Vec<serde_json::Value>;
+
+    async fn execute(&self, _: &mut Ctx, input: Self::In) -> Result<Self::Out, NodeError> {
+        Ok(input)
+    }
+}
+
+#[test]
+fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
+    let graph = workflow! {
+        workflow_id: "foreach";
+        title: "Foreach";
+        context: Ctx;
+        nodes {
+            source => Values,
+            destination => PassThrough,
+        }
+        edges {
+            source -> destination |> |items| items.clone(),
+            source -> destination foreach,
+            destination -> source on_error |input, _| vec![vec![input.clone()]],
+        }
+    }
+    .unwrap();
+
+    let description = graph.describe();
+    assert!(!description.edges[0].creates_scope);
+    assert!(description.edges[1].creates_scope);
+    assert!(!description.edges[2].creates_scope);
+    assert_eq!(
+        serde_json::to_value(description).unwrap()["edges"][1]["creates_scope"],
+        true
+    );
+    for input in [serde_json::json!([1]), serde_json::json!([1, 2, 3])] {
+        let plans = graph.plan_success("source", &input).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert!(!plans[0].creates_scope);
+        assert!(plans[1].creates_scope);
+        for plan in plans {
+            assert_eq!(plan.dst, "destination");
+            assert_eq!(plan.task_type, TaskType::Normal);
+            assert_eq!(&plan.inputs, input.as_array().unwrap());
+        }
+    }
+    assert!(
+        graph
+            .plan_success("source", &serde_json::json!([]))
+            .unwrap()
+            .is_empty()
+    );
+    let failure = graph
+        .plan_failure(
+            "destination",
+            &serde_json::json!(1),
+            &NodeError::retryable("retry"),
+        )
+        .unwrap();
+    assert!(!failure[0].creates_scope);
+}
+
+#[test]
+fn foreach_rejects_join_targets() {
+    let graph = Graph::builder("foreach-join", "Foreach JOIN", Ctx)
+        .node("source", Values)
+        .node("join", workflow_engine::JoinNode)
+        .edge(workflow_engine::graph::foreach::<serde_json::Value>(
+            "source", "join",
+        ))
+        .build();
+    assert_eq!(
+        graph.err().as_deref(),
+        Some("foreach edge must not target join node join")
+    );
+}
+
 struct EventNode(Option<Trigger>);
 
 impl Node<Ctx> for EventNode {

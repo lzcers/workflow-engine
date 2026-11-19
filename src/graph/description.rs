@@ -43,6 +43,8 @@ pub struct EdgeDescription {
     pub source: String,
     pub target: String,
     pub kind: EdgeKind,
+    /// 成功边是否逐项建立执行作用域；普通边与失败边为 false。
+    pub creates_scope: bool,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -72,6 +74,7 @@ impl<Ctx> Graph<Ctx> {
                 source: edge.src().to_owned(),
                 target: edge.dst().to_owned(),
                 kind: EdgeKind::Success,
+                creates_scope: edge.creates_scope(),
             })
             .chain(
                 self.failure_edges
@@ -82,6 +85,7 @@ impl<Ctx> Graph<Ctx> {
                         source: edge.src().to_owned(),
                         target: edge.dst().to_owned(),
                         kind: EdgeKind::Failure,
+                        creates_scope: false,
                     }),
             )
             .collect();

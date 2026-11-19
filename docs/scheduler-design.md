@@ -14,14 +14,17 @@
 | 组件 | 职责 |
 | --- | --- |
 | `Workflow` | 构造时启动后台调度器、提交入口任务、唤醒认领、随实例释放取消后台任务 |
-| `Scheduler` | 计算空闲槽、批量认领、按固定窗口执行或处理最终失败、调用存储结算及异常释放 |
+| `Scheduler` | 计算空闲槽、批量认领、执行期间续租、调用存储结算及异常释放 |
 | `Graph` | 提供节点与上下文，执行节点钩子和业务逻辑，规划成功或失败后继 |
-| `TaskStore` | 原子创建运行，筛选可认领任务，校验认领归属，原子提交状态与后继 |
+| `TaskStore` | 原子创建运行，筛选可认领任务，续租并校验认领归属，原子提交状态与后继 |
 | 数据库后端 | 实现依赖与 JOIN 闸门、租约、尝试预算和并发事务控制 |
 
 `run_id` 标识一次提交产生的运行，`worker_id` 标识一次调度循环。一次调度循环生成一个
 UUID 作为 `worker_id`，可以处理同一 `workflow_id` 下多个不同 `run_id` 的任务。
-不同运行的 JOIN 汇合与前驱判定由存储隔离。
+不同运行的 JOIN 汇合与前驱判定由存储隔离。同一运行内，`scope_id` 进一步隔离分支：
+Scope 任务以及 foreach 边逐项创建的目标任务以自身 ID 开组，其余后继继承组；
+JOIN 的查找、前驱判断与失败级联只作用于同组。foreach 是边的入队行为，不改变目标节点类型。
+重试和恢复使用持久化的组身份，不重新分组。
 
 并发上限属于 Scheduler 实例。一个 Workflow 的所有运行共享默认 8 个槽；若为同一个
 `workflow_id` 创建多个实例，每个实例都有自己的额度，8 不是跨实例或跨进程的全局上限。
@@ -100,16 +103,16 @@ Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配�
 
 调度器把 `workflow_id`、`worker_id` 和数量上限交给 `TaskStore::claim_many`。
 当前 PostgreSQL / SQLite 后端负责筛选待执行或租约已过期的任务、检查依赖和 JOIN
-是否就绪，再原子写入 `running`、持有人、固定 300 秒租约及递增后的 `attempt`。
+是否就绪，再原子写入 `running`、持有人、初始 300 秒租约及递增后的 `attempt`。
 
 `attempt` 是参与写入校验的认领代次，每次认领都递增。`max_attempts` 限制业务执行次数：
 
 - 认领返回的 `attempt <= max_attempts`：执行节点及其生命周期钩子。
 - 认领返回的 `attempt > max_attempts`：只处理最终失败，跳过 `on_start` 和节点 `execute`。
-  这类认领同样有独立执行窗口和有效持有人，以便安全规划、提交失败后继。
+  这类认领同样持有可续期的租约，以便安全规划、提交失败后继。
 - `max_attempts = 0`：首次认领即进入最终失败处理，不执行业务节点。
 
-认领事务首次发现预算耗尽时记录最终失败原因：旧租约已到期则记录执行窗口超时；
+认领事务首次发现预算耗尽时记录最终失败原因：旧租约已到期则记录租约失效；
 提前释放的认领或零预算任务记录预算耗尽。后续恢复认领保留该原因。
 预算耗尽的行继续参与认领和恢复查询，由统一失败结算处理，不直接封存为 `failed`。
 
@@ -119,20 +122,20 @@ Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配�
 
 ## 单个任务：执行、结算与回调
 
-每个 `run_task` 在本次认领的固定窗口内完成执行、后继规划、结算和回调。
+每个 `run_task` 在执行、后继规划和结算期间维护租约；终态提交后停止续租，再执行回调。
+引擎不限制业务执行或回调时长。
 正常执行通过 `execute_and_plan` 返回包含执行结果与后继计划的 `ExecutionOutcome`；
 预算耗尽的认领直接进入同一 `plan_failure` 辅助函数，复用同步失败边规划。
 失败结果保留 `NodeError` 和可选上下文：正常业务失败沿用执行上下文，恢复处理在失败提交后才创建回调上下文。
 
 ```mermaid
 flowchart TD
-    Claim["收到已认领的 TaskRecord"] --> Deadline{"固定窗口仍有效？"}
-    Deadline -- 否 --> Expired["结束本次尝试，释放执行槽"]
-    Deadline -- 是 --> Budget
-    subgraph Window["共用原 lease_until 截止时间"]
+    Claim["收到已认领的 TaskRecord"] --> Valid{"租约仍有效？"}
+    Valid -- 否 --> Stop["停止本地执行，释放槽位"]
+    Valid -- 是 --> Budget
+    subgraph Leased["执行和结算期间每 100 秒续租"]
         Budget{"attempt 超过 max_attempts？"}
-        Budget -- 否 --> Execute
-        Execute["fork → on_start → execute"]
+        Budget -- 否 --> Execute["fork → on_start → execute"]
         Execute -- "执行成功" --> PlanSuccess["plan_success"]
         Execute -- "节点返回错误" --> PlanFailure["plan_failure"]
         PlanSuccess -- "规划失败，转永久错误" --> PlanFailure
@@ -140,22 +143,22 @@ flowchart TD
         Recover --> PlanFailure
         PlanSuccess -- "规划成功" --> Success["settle_success 原子提交"]
         PlanFailure --> Failure["settle_failure 原子提交"]
-        Success -- "提交成功" --> Callback["on_success"]
-        Failure -- "提交成功" --> ErrorCallback["复用上下文或 fork → on_error"]
         Success -- "提交失败" --> Release["尝试 release_claim"]
         Failure -- "提交失败" --> Release
     end
+    Success -- "提交成功，停止续租" --> Callback["on_success"]
+    Failure -- "提交成功，停止续租" --> ErrorCallback["复用上下文或 fork → on_error"]
     Callback --> Done["任务结束，槽位可回收"]
     ErrorCallback --> Done
     Release --> Done
-    Window -- "窗口到期" --> Expired
-    Expired --> Reclaim["未结算任务等待下一次认领"]
+    Leased -- "失去租约" --> Stop
+    Stop --> Reclaim["未结算任务等待后续认领"]
     Reclaim --> Claim
 ```
 
 ### 执行阶段
 
-窗口有效且还有执行预算时，按顺序执行 `NodeContext::fork(task)`、`on_start` 和节点 `execute`。
+租约有效且仍有执行次数时，按顺序执行 `NodeContext::fork(task)`、`on_start` 和节点 `execute`。
 每个任务获得独立上下文，图和节点实例仍通过共享句柄复用。
 
 执行成功后，`Graph::plan_success` 生成后继，并转换为存储使用的 `FanoutPlan`。
@@ -165,21 +168,29 @@ flowchart TD
 保留执行上下文供失败提交后的 `on_error` 使用。失败后继规划本身出错时记录日志，使用空后继列表结算失败。
 执行阶段生成结果与入队计划，不提交任务状态。
 
-固定窗口规则如下：
+### 租约与运行时长
 
-- 认领时按数据库时间设置 `lease_until = 当前时间 + LEASE_DURATION`，时长为 300 秒，不续租。
-- 本地等待使用这次认领的剩余窗口，调度等待与进程暂停已经消耗的时间不会重置。
-- 窗口覆盖 `fork`、`on_start`、`execute`、后继规划、`on_error`、结算、`on_success` 和异常认领释放。
-- 到期后取消本地 future 并释放执行槽；未提交结算的任务由后续认领继续处理。
-  即使所有执行槽都在等待永不完成的异步操作，到期后也能腾出槽位进行恢复。
-- 本地计时负责停止执行，存储使用数据库当前时间作最终权限校验；到期结果不会被接受。
+- 认领时按数据库时间设置 `lease_until = 当前时间 + LEASE_DURATION`，租约时长为 300 秒。
+- `fork`、`on_start`、`execute`、后继规划和结算期间，调度器每 100 秒调用一次 `renew_claim`。
+  续租成功后，租约截止时间延长到数据库当前时间后的 300 秒，不增加 `attempt`。
+- 续租必须匹配 `workflow_id`、`task_id`、`claimed_by`、`attempt`、`running` 状态及仍有效的租约。
+  过期租约不能被旧执行者续期；重新认领会分配新的执行代次。
+- 续租确认失权时停止本地执行；数据库暂时出错时，每 5 秒重试一次，且不超过最后确认
+  有效的租约。租约到期前未能确认续租成功，也会取消本地 future 并释放执行槽。
+- 本地以认领或续租请求发出时的单调时钟 `Instant + 300 秒` 保守估计有效期，
+  续租成功才更新本地截止时间；请求等待和调度等待均消耗这段时间。数据库按自己的时间
+  写入和校验租约，不依赖应用主机与数据库的时钟同步。
+  终态提交后不再续租，回调不受租约截止时间限制。
+- 引擎没有业务执行超时。节点需要限制运行时长时，应自行使用超时或取消机制，并清理
+  自己启动的外部工作。续租只确认执行器存活，不能证明节点仍有进展；卡住但持续续租的
+  节点会一直占用执行槽，直到节点自己结束或 Workflow 被取消。
 
 当返回的认领代次超过 `max_attempts`，调度器在 `fork` 之前转入恢复处理，
 将持久化的最终失败原因作为 `NodeError::Permanent` 交给 `Graph::plan_failure`，使用同一
 `settle_failure` 原子提交最终结果。只有提交成功后才 `fork` 回调上下文并调用 `on_error`，
 因此上下文准备或错误回调卡住不会阻止最终状态与失败后继落库。
-最后一次执行者已崩溃也不影响这条恢复路径。恢复处理本身受新认领的固定窗口约束，
-提交前未完成时可再次认领，仅重复失败处理，业务执行次数不再增加。
+最后一次执行者已崩溃也不影响这条恢复路径。恢复处理也由调度器维护续租；
+提交前失去租约时可再次认领，仅重复失败处理，业务执行次数不再增加。
 
 ### 结算阶段
 
@@ -196,26 +207,32 @@ flowchart TD
 状态变更和后继入队在同一事务内提交，任一步失败整体回滚。
 `on_error` 和 `on_success` 都在对应结算提交成功之后调用。
 正常业务失败沿用执行时的上下文；恢复处理没有执行上下文，因此失败提交后才调用 `fork`。
-回调仍占执行槽，并受原执行窗口限制；后继已经入库，可能由其他空槽或其他 worker
-在回调结束前执行。因此两个回调都不构成后继任务的依赖屏障，回调失败或超时也不会撤回
-已经提交的状态与后继。
+终态提交后停止续租。回调仍占执行槽，引擎不限制回调时长；后继已经入库，可能由其他
+空槽或其他 worker 在回调结束前执行。因此两个回调都不构成后继任务的依赖屏障，
+回调失败或被取消也不会撤回已经提交的状态与后继。
 
 ## 异常、取消与恢复
 
 | 情况 | 当前处理 |
 | --- | --- |
 | 认领报错 | 记录错误，按主循环的事件或轮询机制再次尝试 |
-| 执行窗口到期 | 取消本地 future、释放槽位，未结算任务由后续认领重试或处理最终失败 |
+| 续租确认失权 | 取消本地 future、释放槽位，不提交旧执行者的结果 |
+| 续租数据库错误 | 每 5 秒重试，且不超过最后确认有效的租约；到期仍未确认续租成功则停止本地执行 |
+| 租约到期 | 取消本地 future、释放槽位，未结算任务由后续认领重试或处理最终失败 |
 | 预算耗尽 | 取得新认领，规划失败后继并原子结算，提交后再创建回调上下文并调用错误钩子 |
 | 结算报错 | 记录错误并尝试释放认领，再次认领后按剩余预算执行或处理最终失败 |
-| 单任务执行、结算或回调 panic | `run_task` 捕获 panic，记录错误并尝试释放认领 |
+| 单任务执行或结算 panic | `run_task` 捕获 panic，记录错误并尝试释放认领 |
+| 提交后的回调 panic | 单独捕获并记录错误，不再释放已结算任务的认领 |
 | 认领释放失败 | 记录警告；后续由存储的租约与恢复机制处理 |
 | 调度主循环 panic | 取消并等待 JoinSet 中的任务退出，再传播 panic |
 | Workflow 释放或 run future 被取消 | 取消在途任务，不等待结算，也不会自动执行异步认领释放 |
 
 释放认领同样校验当前有效持有人和 `attempt`。已经过期、被接管或结算到终态的任务，
 不会被旧执行者的清理操作改回待执行。回调 panic 时，已提交的状态和后继不会回滚。
-结算与回调之间可能发生进程退出或窗口到期，因此 `on_success` 和 `on_error` 都不保证必达，
+本地轮询优先处理租约失效，再推进业务 future。提交已经在数据库生效、但客户端还未收到
+提交确认时，并发续租可能先发现任务已到终态并返回失权；这时停止本地 future，可能跳过
+回调，但不把已提交的任务改为失败，也不撤销终态或后继。
+结算与回调之间还可能发生进程退出或实例取消，因此 `on_success` 和 `on_error` 都不保证必达，
 也没有独立的补发机制。
 
 `NodeError::Retryable` 不会在当前调度器里自动触发退避或重新执行同一任务；业务错误会
@@ -229,7 +246,7 @@ flowchart TD
 
 进程重启后，连接同一持久化数据库并为相同 `workflow_id` 重新调用 `Engine::make(graph)`，
 新调度器即可处理该图的存量任务，无需新的 `submit`。遗留的 `running` 任务保持原状态，
-旧租约过期后由认领事务更新持有人、创建新的固定窗口并递增 `attempt`。有执行预算则
+旧租约过期后由认领事务更新持有人、建立新租约并递增 `attempt`。仍有执行次数则
 从节点开头重新执行，预算已耗尽则进入最终失败处理。恢复时不会提前释放其他 worker 的
 有效租约，旧 worker 返回后也无权修改新认领或已经结算的任务。
 
@@ -242,9 +259,9 @@ Scheduler 只轮询自己绑定的图。应用需要为要恢复的图创建并�
 | 实现位置 | 阅读重点 |
 | --- | --- |
 | [src/workflow.rs](../src/workflow.rs) | 构造时启动、`submit`、就绪通知、`Workflow::drop` |
-| [src/scheduler.rs](../src/scheduler.rs) | `run_loop` → `claim_and_spawn` → `run_task`，固定窗口内 `execute_and_plan` / `plan_failure` → `settle` |
-| [src/task/store.rs](../src/task/store.rs) | 存储契约、`FanoutPlan`、租约时长 |
+| [src/scheduler.rs](../src/scheduler.rs) | `run_loop` → `claim_and_spawn` → `run_task`，续租期间执行、规划及结算，提交后调用回调 |
+| [src/task/store.rs](../src/task/store.rs) | 存储契约、`renew_claim`、`FanoutPlan`、租约时长 |
 | [src/graph/mod.rs](../src/graph/mod.rs) | 节点执行、成功与失败后继规划 |
-| [src/backend/pgsql/repo.rs](../src/backend/pgsql/repo.rs) | PostgreSQL 认领、结算与恢复查询 |
-| [src/backend/sqlite/repo.rs](../src/backend/sqlite/repo.rs) | SQLite 认领、结算与恢复查询 |
+| [src/backend/pgsql/repo.rs](../src/backend/pgsql/repo.rs) | PostgreSQL 认领、续租、结算与恢复查询 |
+| [src/backend/sqlite/repo.rs](../src/backend/sqlite/repo.rs) | SQLite 认领、续租、结算与恢复查询 |
 | [tests/sqlite_backend.rs](../tests/sqlite_backend.rs) | 提交自动执行、共享槽、通知唤醒、扇出与 JOIN 的现有验证 |

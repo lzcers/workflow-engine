@@ -1,7 +1,7 @@
 //! 单图调度器：认领当前工作流所有运行的任务，执行节点并将图规划交给存储结算。
 //!
 //! 调度循环只负责补充执行槽；单个任务依次完成业务执行与后继规划、原子结算和成功回调。
-//! 认领租约限定本次处理窗口，结算时由存储再次校验认领；所有 run 共享并发额度。
+//! 执行及结算期间自动续租，存储校验认领归属；节点自行控制运行超时，所有 run 共享并发额度。
 //! 调度循环随所属实例释放而取消，同时取消在途任务。
 
 use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
@@ -18,10 +18,12 @@ use tracing::{error, info, warn};
 use crate::{
     graph::{Graph, Successor},
     node::{NodeContext, NodeError},
-    task::{FanoutPlan, TaskRecord, TaskStore},
+    task::{FanoutPlan, TaskRecord, TaskStore, store::LEASE_DURATION},
 };
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(LEASE_DURATION.as_secs() / 3);
+const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 当前图的调度器，负责认领、并发执行与结算，依赖关系由存储过滤。
 pub struct Scheduler<Ctx, Store>
@@ -117,6 +119,8 @@ where
         worker_id: &str,
         limit: usize,
     ) -> usize {
+        // 从请求发出时计时，比数据库真正写入租约更早，不受应用与数据库时钟偏差影响。
+        let lease_deadline = Instant::now() + LEASE_DURATION;
         match self
             .store
             .claim_many(self.graph.workflow_id(), worker_id, limit)
@@ -128,7 +132,12 @@ where
                     info!(count, "claim tasks");
                 }
                 for task in tasks {
-                    in_flight.spawn(run_task(self.graph.clone(), self.store.clone(), task));
+                    in_flight.spawn(run_task(
+                        self.graph.clone(),
+                        self.store.clone(),
+                        task,
+                        lease_deadline,
+                    ));
                 }
                 count
             }
@@ -154,7 +163,7 @@ enum ExecutionOutcome<Ctx> {
     },
 }
 
-/// 单个认领的完整生命周期；固定窗口覆盖执行、结算、回调和异常释放。
+/// 执行和结算期间维持认领，终态提交后停止续租并调用回调。
 #[tracing::instrument(
     name = "settle",
     skip_all,
@@ -166,59 +175,103 @@ enum ExecutionOutcome<Ctx> {
         name = task.name.as_str(),
     )
 )]
-async fn run_task<Ctx, S>(graph: Arc<Graph<Ctx>>, store: Arc<S>, task: TaskRecord)
-where
+async fn run_task<Ctx, S>(
+    graph: Arc<Graph<Ctx>>,
+    store: Arc<S>,
+    task: TaskRecord,
+    lease_deadline: Instant,
+) where
     Ctx: NodeContext + Sync + 'static,
     S: TaskStore + Send + ?Sized + 'static,
 {
-    // 认领到开始处理之间的等待也消耗窗口；过期快照不能再进入业务代码。
-    let started_at = Instant::now();
-    let Some(remaining) = task
-        .lease_until
-        .and_then(|until| (until - chrono::Utc::now()).to_std().ok())
-        .filter(|remaining| !remaining.is_zero())
-    else {
-        warn!("claim has no remaining processing window");
+    if lease_deadline <= Instant::now() {
+        warn!("claim lease elapsed before execution");
         return;
-    };
-    let deadline = started_at + remaining;
-
+    }
     let work = async {
         let outcome = execute_and_plan(graph.as_ref(), &task).await;
-
-        settle(graph.as_ref(), store.as_ref(), &task, outcome)
-            .await
-            .map_err(|error| {
-                error!(error = %error, "settle transaction failed; releasing claim");
-            })
+        settle(store.as_ref(), &task, &outcome).await?;
+        Ok::<_, S::Error>(outcome)
     };
     let lifecycle = async {
         match AssertUnwindSafe(work).catch_unwind().await {
-            Ok(Ok(())) => return,
-            Ok(Err(())) => {}
+            Ok(Ok(outcome)) => return Some(outcome),
+            Ok(Err(error)) => {
+                error!(error = %error, "settle transaction failed; releasing claim");
+            }
             Err(panic) => {
-                let detail = panic
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("(non-string panic payload)");
-                error!(panic = %detail, "settle task panicked; releasing claim");
+                error!(panic = %panic_detail(&panic), "task panicked; releasing claim");
             }
         }
-
-        // 释放也校验认领凭据；已过期、被接管或已结算的任务不会被这次清理修改。
+        // 释放校验认领代次；不能释放其他执行者的租约或修改已提交的终态。
         if let Err(error) = store.release_claim(&task).await {
             warn!(error = %error, "could not release task claim");
         }
+        None
     };
-    // 截止时间优先：到期丢弃本地 future、释放执行槽，由下一次认领重试或处理最终失败。
-    // 已提交的结算不会回滚，已发生的外部副作用不会撤回。
-    tokio::select! {
+    let outcome = tokio::select! {
         biased;
-        _ = sleep_until(deadline) => {
-            warn!("claim processing window elapsed; stopping local work");
+        // 失权优先，避免租约到期后再次推进业务。若提交已生效，保留数据库终态；
+        // 提交确认与续租失权同时返回时可能跳过 best-effort 回调，不另行结算失败。
+        _ = maintain_claim(store.as_ref(), &task, lease_deadline) => None,
+        outcome = lifecycle => outcome,
+    };
+    if let Some(outcome) = outcome {
+        // 任务已提交，回调不再占用租约，也没有引擎施加的执行时限。
+        if let Err(panic) = AssertUnwindSafe(notify_outcome(graph.as_ref(), &task, outcome))
+            .catch_unwind()
+            .await
+        {
+            error!(panic = %panic_detail(&panic), "task callback panicked after settlement");
         }
-        _ = lifecycle => {}
+    }
+}
+
+fn panic_detail(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(non-string panic payload)")
+}
+
+/// 失权或最后确认的租约到期时返回，使调用方丢弃未结算的业务 future。
+async fn maintain_claim<S: TaskStore + ?Sized>(
+    store: &S,
+    task: &TaskRecord,
+    mut deadline: Instant,
+) {
+    let mut renew_at = deadline - LEASE_DURATION + LEASE_RENEW_INTERVAL;
+    loop {
+        let renewal = async {
+            sleep_until(renew_at).await;
+            let requested_at = Instant::now();
+            (requested_at, store.renew_claim(task).await)
+        };
+        tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => {
+                warn!("claim lease elapsed; stopping local work");
+                return;
+            }
+            (requested_at, result) = renewal => {
+                match result {
+                    Ok(Some(_)) => {
+                        // 续租在数据库写入后才成功；请求起点提供保守的单调时钟期限。
+                        deadline = requested_at + LEASE_DURATION;
+                        renew_at = requested_at + LEASE_RENEW_INTERVAL;
+                    }
+                    Ok(None) => {
+                        warn!("claim no longer owned; stopping local work");
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "could not renew claim; retrying within current lease");
+                        renew_at = Instant::now() + LEASE_RETRY_INTERVAL;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -280,12 +333,11 @@ where
     }
 }
 
-/// 原子提交任务状态与后继；存储再次校验 owner、attempt 和固定租约期限。
+/// 原子提交任务状态与后继；存储再次校验 owner、attempt 和当前有效租约。
 async fn settle<Ctx, S>(
-    graph: &Graph<Ctx>,
     store: &S,
     task: &TaskRecord,
-    outcome: ExecutionOutcome<Ctx>,
+    outcome: &ExecutionOutcome<Ctx>,
 ) -> Result<(), S::Error>
 where
     Ctx: NodeContext + Sync,
@@ -293,30 +345,37 @@ where
 {
     match outcome {
         ExecutionOutcome::Success {
-            mut context,
-            output,
-            successors,
-        } => {
-            store.settle_success(task, &output, &successors).await?;
-            // 成功提交后任务已是终态；成功钩子仍受本次处理窗口限制。
-            graph.on_success(&task.name, &mut context, &output).await;
-            Ok(())
-        }
+            output, successors, ..
+        } => store.settle_success(task, output, successors).await,
         ExecutionOutcome::Failure {
-            context,
-            error,
-            successors,
+            error, successors, ..
         } => {
             store
-                .settle_failure(task, &error.to_string(), &successors)
-                .await?;
+                .settle_failure(task, &error.to_string(), successors)
+                .await
+        }
+    }
+}
+
+async fn notify_outcome<Ctx>(graph: &Graph<Ctx>, task: &TaskRecord, outcome: ExecutionOutcome<Ctx>)
+where
+    Ctx: NodeContext + Sync,
+{
+    match outcome {
+        ExecutionOutcome::Success {
+            mut context,
+            output,
+            ..
+        } => {
+            graph.on_success(&task.name, &mut context, &output).await;
+        }
+        ExecutionOutcome::Failure { context, error, .. } => {
             // 恢复结算不依赖业务上下文；即使 fork 或错误钩子卡住，终态与后继已经持久化。
             let mut context = match context {
                 Some(context) => context,
                 None => graph.context().fork(task).await,
             };
             graph.on_error(&task.name, &mut context, &error).await;
-            Ok(())
         }
     }
 }
@@ -327,6 +386,7 @@ impl From<Successor> for FanoutPlan {
         FanoutPlan {
             dst: s.dst,
             task_type: s.task_type.as_str(),
+            creates_scope: s.creates_scope,
             inputs: s.inputs,
             depends_on_names: s.depends_on_names,
         }

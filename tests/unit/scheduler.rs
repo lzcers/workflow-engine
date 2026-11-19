@@ -1,23 +1,31 @@
-//! Fixed processing windows release slots and recover through the graph's failure path.
+//! Lease renewal keeps long-running work alive and fences off lost claims.
 
 use std::{
+    collections::VecDeque,
     future::pending,
+    io,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
+use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
-use tokio::{sync::mpsc, task::JoinSet, time::timeout};
+use tokio::{
+    sync::{Notify, mpsc},
+    task::{JoinHandle, JoinSet},
+    time::{Instant, advance, sleep, timeout},
+};
 
 use super::{Scheduler, run_task};
 use crate::{
     Graph, Node, NodeContext, NodeError, Task, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
     edge::on_error,
+    task::{FanoutPlan, TaskStore, store::LEASE_DURATION},
 };
 
 struct Context {
@@ -123,7 +131,7 @@ async fn set_deadline(
 }
 
 #[tokio::test]
-async fn expired_full_slot_recovers_through_failure_edge_without_executing_again() {
+async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() {
     let (pool, repo) = memory_repo().await;
     let (events, mut receiver) = mpsc::unbounded_channel();
     let graph = Arc::new(
@@ -139,7 +147,7 @@ async fn expired_full_slot_recovers_through_failure_edge_without_executing_again
         .node("pending", PendingNode)
         .node("recovery", SuccessNode)
         .error_edge(on_error("pending", "recovery", |input: &i32, error| {
-            assert!(error.to_string().contains("execution window expired"));
+            assert!(error.to_string().contains("lease expired"));
             vec![*input]
         }))
         .build()
@@ -157,14 +165,19 @@ async fn expired_full_slot_recovers_through_failure_edge_without_executing_again
         &pool,
         &repo,
         &claim,
-        chrono::Utc::now() + chrono::Duration::milliseconds(100),
+        chrono::Utc::now() - chrono::Duration::seconds(1),
     )
     .await;
     let store = Arc::new(SqliteTaskStore::new(repo.clone()));
     let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_millis(2))
         .with_max_concurrency(1);
     let mut in_flight = JoinSet::new();
-    in_flight.spawn(run_task(graph, store, claim.clone()));
+    in_flight.spawn(run_task(
+        graph,
+        store,
+        claim.clone(),
+        Instant::now() + Duration::from_millis(100),
+    ));
     let seen = timeout(Duration::from_secs(5), async {
         tokio::select! {
             _ = scheduler.run_loop(&mut in_flight, "worker") => panic!("scheduler exited"),
@@ -182,20 +195,22 @@ async fn expired_full_slot_recovers_through_failure_edge_without_executing_again
         }
     })
     .await
-    .expect("the full slot must expire so recovery and its successor can execute");
+    .expect("the lost claim must release the slot so recovery can execute");
     in_flight.shutdown().await;
 
-    assert_eq!(
+    // The first attempt can enter business while the renewal query is in flight;
+    // the recovery claim must not start business again after the budget is exhausted.
+    assert!(
         seen.iter()
             .filter(|event| **event == ("execute", "pending".to_owned()))
-            .count(),
-        1
+            .count()
+            <= 1
     );
-    assert_eq!(
+    assert!(
         seen.iter()
             .filter(|event| **event == ("start", "pending".to_owned()))
-            .count(),
-        1
+            .count()
+            <= 1
     );
     assert_eq!(seen.iter().filter(|event| event.0 == "error").count(), 1);
     let tasks = repo.list_all("timeout").await.unwrap();
@@ -248,6 +263,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
             graph,
             Arc::new(SqliteTaskStore::new(repo.clone())),
             claim.clone(),
+            Instant::now() - Duration::from_secs(1),
         ),
     )
     .await
@@ -260,167 +276,347 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
     );
     pool.close().await;
 }
-
-#[tokio::test]
-async fn success_hook_timeout_keeps_committed_success_and_ends_local_work() {
-    struct PendingSuccess;
-
-    impl Node<Context> for PendingSuccess {
-        type In = i32;
-        type Out = i32;
-
-        async fn execute(&self, ctx: &mut Context, input: i32) -> Result<i32, NodeError> {
-            ctx.record("execute");
-            Ok(input)
-        }
-
-        async fn on_success(ctx: &mut Context, _: &Value) {
-            ctx.record("success");
-            pending().await
-        }
-    }
-
-    let (pool, repo) = memory_repo().await;
-    let (events, mut receiver) = mpsc::unbounded_channel();
-    let graph = Arc::new(
-        Graph::builder(
-            "callback",
-            "Slow callback",
-            Context {
-                task: None,
-                events,
-                repo: repo.clone(),
-            },
-        )
-        .node("success", PendingSuccess)
-        .build()
-        .unwrap(),
-    );
-    repo.enqueue(&Task::new("callback", "success", json!(7)))
-        .await
-        .unwrap();
-    let claim = repo
-        .claim_many("callback", "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    let claim = set_deadline(
-        &pool,
-        &repo,
-        &claim,
-        chrono::Utc::now() + chrono::Duration::milliseconds(100),
-    )
-    .await;
-    timeout(
-        Duration::from_secs(2),
-        run_task(
-            graph,
-            Arc::new(SqliteTaskStore::new(repo.clone())),
-            claim.clone(),
-        ),
-    )
-    .await
-    .expect("a pending success hook must not hold the slot beyond the claim deadline");
-    let mut seen = Vec::new();
-    while let Ok(event) = receiver.try_recv() {
-        seen.push(event);
-    }
-    assert!(seen.contains(&("success", "success".to_owned())));
-    let stored = repo.get("callback", claim.task_id).await.unwrap().unwrap();
-    assert_eq!(stored.status, TaskStatus::Succeeded);
-    assert_eq!(stored.output, Some(json!(7)));
-    assert_eq!(stored.attempt, 1);
-    assert!(
-        repo.claim_many("callback", "next-worker", 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    pool.close().await;
+#[derive(Clone, Copy)]
+enum Renewal {
+    Healthy,
+    Error,
+    Lost,
+    Hanging,
 }
 
-#[tokio::test]
-async fn blocked_context_fork_does_not_prevent_final_failure_recovery() {
-    struct BlockedContext {
-        forks: Arc<AtomicUsize>,
-        executions: Arc<AtomicUsize>,
+struct Store {
+    renewals: AtomicUsize,
+    script: Mutex<VecDeque<Renewal>>,
+    settlement_delay: Duration,
+    settlements: AtomicUsize,
+    committed: AtomicBool,
+    releases: AtomicUsize,
+}
+
+impl Store {
+    fn new(script: impl IntoIterator<Item = Renewal>, settlement_delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            renewals: AtomicUsize::new(0),
+            script: Mutex::new(script.into_iter().collect()),
+            settlement_delay,
+            settlements: AtomicUsize::new(0),
+            committed: AtomicBool::new(false),
+            releases: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl TaskStore for Store {
+    type Error = io::Error;
+
+    fn enqueue<'a>(&'a self, _: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>> {
+        Box::pin(async { unreachable!("run_task does not enqueue directly") })
     }
 
-    impl NodeContext for BlockedContext {
-        async fn fork(&self, _: &TaskRecord) -> Self {
-            self.forks.fetch_add(1, Ordering::SeqCst);
-            pending().await
+    fn claim_many<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: usize,
+    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>> {
+        Box::pin(async { unreachable!("run_task receives an existing claim") })
+    }
+
+    fn renew_claim<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error>> {
+        Box::pin(async move {
+            assert_eq!(task.attempt, 1, "renewal must not create another attempt");
+            assert_eq!(task.claimed_by.as_deref(), Some("worker"));
+            self.renewals.fetch_add(1, Ordering::SeqCst);
+            if self.committed.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            let result = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Renewal::Healthy);
+            match result {
+                Renewal::Healthy => Ok(Some(chrono::Utc::now() + chrono::Duration::seconds(300))),
+                Renewal::Error => Err(io::Error::other("database unavailable")),
+                Renewal::Lost => Ok(None),
+                Renewal::Hanging => pending().await,
+            }
+        })
+    }
+
+    fn settle_success<'a>(
+        &'a self,
+        _: &'a TaskRecord,
+        _: &'a Value,
+        _: &'a [FanoutPlan],
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.settlements.fetch_add(1, Ordering::SeqCst);
+            if !self.settlement_delay.is_zero() {
+                sleep(self.settlement_delay).await;
+            }
+            self.committed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    fn settle_failure<'a>(
+        &'a self,
+        _: &'a TaskRecord,
+        _: &'a str,
+        _: &'a [FanoutPlan],
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { panic!("lease loss must not be recorded as a business failure") })
+    }
+
+    fn release_claim<'a>(&'a self, _: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async move {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Default)]
+struct Probe {
+    started: Notify,
+    executions: AtomicUsize,
+    completed_executions: AtomicUsize,
+    cancelled: AtomicBool,
+    hooks: AtomicUsize,
+}
+
+struct Cancellation {
+    probe: Arc<Probe>,
+    completed: bool,
+}
+
+impl Drop for Cancellation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.probe.cancelled.store(true, Ordering::SeqCst);
         }
     }
+}
 
-    struct NodeAfterFork;
+struct TimedNode {
+    execution: Duration,
+}
 
-    impl Node<BlockedContext> for NodeAfterFork {
-        type In = i32;
-        type Out = i32;
+#[derive(Clone)]
+struct TimedContext {
+    probe: Arc<Probe>,
+    callback: Duration,
+}
 
-        async fn execute(&self, ctx: &mut BlockedContext, input: i32) -> Result<i32, NodeError> {
-            ctx.executions.fetch_add(1, Ordering::SeqCst);
-            Ok(input)
-        }
+impl NodeContext for TimedContext {
+    async fn fork(&self, _: &TaskRecord) -> Self {
+        self.clone()
+    }
+}
+
+impl Node<TimedContext> for TimedNode {
+    type In = i32;
+    type Out = i32;
+
+    async fn execute(&self, ctx: &mut TimedContext, input: i32) -> Result<i32, NodeError> {
+        let mut cancellation = Cancellation {
+            probe: ctx.probe.clone(),
+            completed: false,
+        };
+        ctx.probe.executions.fetch_add(1, Ordering::SeqCst);
+        ctx.probe.started.notify_one();
+        sleep(self.execution).await;
+        ctx.probe
+            .completed_executions
+            .fetch_add(1, Ordering::SeqCst);
+        cancellation.completed = true;
+        Ok(input)
     }
 
-    let (pool, repo) = memory_repo().await;
-    let forks = Arc::new(AtomicUsize::new(0));
-    let executions = Arc::new(AtomicUsize::new(0));
+    async fn on_success(ctx: &mut TimedContext, _: &Value) {
+        ctx.probe.hooks.fetch_add(1, Ordering::SeqCst);
+        if !ctx.callback.is_zero() {
+            sleep(ctx.callback).await;
+        }
+    }
+}
+
+fn claim() -> TaskRecord {
+    let now = chrono::Utc::now();
+    TaskRecord {
+        workflow_id: "renewal".into(),
+        task_id: 1,
+        run_id: Some(1),
+        scope_id: None,
+        parent_task_ids: vec![],
+        name: "node".into(),
+        status: TaskStatus::Running,
+        claimed_by: Some("worker".into()),
+        lease_until: Some(now + chrono::Duration::seconds(300)),
+        attempt: 1,
+        max_attempts: 1,
+        task_type: "normal".into(),
+        depends_on_names: vec![],
+        input: json!(7),
+        output: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+async fn start_probe(
+    store: Arc<Store>,
+    execution_seconds: u64,
+    callback_seconds: u64,
+) -> (JoinHandle<()>, Arc<Probe>) {
+    let probe = Arc::new(Probe::default());
+    let callback = Duration::from_secs(callback_seconds);
     let graph = Arc::new(
         Graph::builder(
-            "blocked-fork",
-            "Blocked context",
-            BlockedContext {
-                forks: forks.clone(),
-                executions: executions.clone(),
+            "renewal",
+            "Lease renewal",
+            TimedContext {
+                probe: probe.clone(),
+                callback,
             },
         )
-        .node("root", NodeAfterFork)
+        .node(
+            "node",
+            TimedNode {
+                execution: Duration::from_secs(execution_seconds),
+            },
+        )
         .build()
         .unwrap(),
     );
-    let mut task = Task::new("blocked-fork", "root", json!(0));
-    task.max_attempts = 1;
-    repo.enqueue(&task).await.unwrap();
-    let claim = repo
-        .claim_many("blocked-fork", "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    let claim = set_deadline(
-        &pool,
-        &repo,
-        &claim,
-        chrono::Utc::now() + chrono::Duration::milliseconds(100),
-    )
-    .await;
-    let store = Arc::new(SqliteTaskStore::new(repo.clone()));
-    let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_millis(2))
-        .with_max_concurrency(1);
-    let mut in_flight = JoinSet::new();
-    in_flight.spawn(run_task(graph, store, claim.clone()));
-    let failed = timeout(Duration::from_secs(5), async {
-        tokio::select! {
-            _ = scheduler.run_loop(&mut in_flight, "worker") => panic!("scheduler exited"),
-            failed = async {
-                loop {
-                    let task = repo.get("blocked-fork", claim.task_id).await.unwrap().unwrap();
-                    if task.status == TaskStatus::Failed {
-                        return task;
-                    }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            } => failed,
-        }
-    })
-    .await
-    .expect("failure recovery must commit even when context creation never returns");
-    in_flight.shutdown().await;
-    assert_eq!(failed.attempt, 2);
-    assert!(failed.error.unwrap().contains("execution window expired"));
-    assert!(forks.load(Ordering::SeqCst) >= 1);
-    assert_eq!(executions.load(Ordering::SeqCst), 0);
-    pool.close().await;
+    let handle = tokio::spawn(run_task(
+        graph,
+        store,
+        claim(),
+        Instant::now() + LEASE_DURATION,
+    ));
+    probe.started.notified().await;
+    (handle, probe)
+}
+
+async fn elapse(seconds: u64) {
+    advance(Duration::from_secs(seconds)).await;
+    tokio::task::yield_now().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_execution_renews_repeatedly_without_restarting_or_timing_out() {
+    let store = Store::new([], Duration::ZERO);
+    let (handle, probe) = start_probe(store.clone(), 650, 0).await;
+    for renewals in 1..=6 {
+        elapse(100).await;
+        assert!(!handle.is_finished());
+        assert_eq!(store.renewals.load(Ordering::SeqCst), renewals);
+    }
+    elapse(50).await;
+    handle.await.unwrap();
+    assert_eq!(probe.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.hooks.load(Ordering::SeqCst), 1);
+    assert!(!probe.cancelled.load(Ordering::SeqCst));
+    assert!(store.committed.load(Ordering::SeqCst));
+    elapse(300).await;
+    assert_eq!(store.renewals.load(Ordering::SeqCst), 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_claim_cancels_execution_without_settlement_or_release() {
+    let store = Store::new([Renewal::Lost], Duration::ZERO);
+    let (handle, probe) = start_probe(store.clone(), 1000, 0).await;
+    elapse(100).await;
+    handle.await.unwrap();
+    assert!(probe.cancelled.load(Ordering::SeqCst));
+    assert_eq!(store.settlements.load(Ordering::SeqCst), 0);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_renewal_error_retries_within_lease_and_recovers() {
+    let store = Store::new([Renewal::Error, Renewal::Healthy], Duration::ZERO);
+    let (handle, probe) = start_probe(store.clone(), 350, 0).await;
+    elapse(100).await;
+    assert_eq!(store.renewals.load(Ordering::SeqCst), 1);
+    assert!(!probe.cancelled.load(Ordering::SeqCst));
+    elapse(5).await;
+    assert_eq!(store.renewals.load(Ordering::SeqCst), 2);
+    elapse(100).await;
+    elapse(100).await;
+    elapse(45).await;
+    handle.await.unwrap();
+    assert!(store.committed.load(Ordering::SeqCst));
+    assert!(!probe.cancelled.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_errors_cancel_before_ready_business_can_run_at_the_lease_deadline() {
+    let store = Store::new(std::iter::repeat_n(Renewal::Error, 100), Duration::ZERO);
+    let (handle, probe) = start_probe(store.clone(), 300, 0).await;
+    elapse(100).await;
+    for _ in 0..39 {
+        elapse(5).await;
+        assert!(!handle.is_finished());
+    }
+    elapse(5).await;
+    handle.await.unwrap();
+    assert!(probe.cancelled.load(Ordering::SeqCst));
+    assert_eq!(probe.completed_executions.load(Ordering::SeqCst), 0);
+    assert!(!store.committed.load(Ordering::SeqCst));
+    assert_eq!(store.releases.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hanging_renewal_cannot_extend_the_last_confirmed_lease() {
+    let store = Store::new([Renewal::Hanging], Duration::ZERO);
+    let (handle, probe) = start_probe(store.clone(), 1000, 0).await;
+    elapse(100).await;
+    assert_eq!(store.renewals.load(Ordering::SeqCst), 1);
+    elapse(199).await;
+    assert!(!handle.is_finished());
+    elapse(1).await;
+    handle.await.unwrap();
+    assert!(probe.cancelled.load(Ordering::SeqCst));
+    assert_eq!(store.settlements.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn settlement_keeps_renewing_until_commit() {
+    let store = Store::new([], Duration::from_secs(399));
+    let (handle, probe) = start_probe(store.clone(), 1, 0).await;
+    elapse(1).await;
+    assert_eq!(store.settlements.load(Ordering::SeqCst), 1);
+    elapse(99).await;
+    elapse(100).await;
+    elapse(100).await;
+    assert!(!handle.is_finished());
+    assert_eq!(store.renewals.load(Ordering::SeqCst), 3);
+    elapse(100).await;
+    handle.await.unwrap();
+    assert!(store.committed.load(Ordering::SeqCst));
+    assert_eq!(probe.hooks.load(Ordering::SeqCst), 1);
+    assert_eq!(store.releases.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_callback_has_no_engine_timeout_or_renewal() {
+    let store = Store::new([], Duration::ZERO);
+    let (handle, probe) = start_probe(store.clone(), 1, 1000).await;
+    elapse(1).await;
+    assert!(store.committed.load(Ordering::SeqCst));
+    assert_eq!(probe.hooks.load(Ordering::SeqCst), 1);
+    elapse(600).await;
+    assert!(!handle.is_finished());
+    assert_eq!(store.renewals.load(Ordering::SeqCst), 0);
+    elapse(400).await;
+    handle.await.unwrap();
+    assert_eq!(store.settlements.load(Ordering::SeqCst), 1);
 }

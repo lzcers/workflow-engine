@@ -12,12 +12,13 @@ CREATE TABLE IF NOT EXISTS task_counters (
     next_task_id BIGINT NOT NULL DEFAULT 0
 );
 
--- 通用任务表：run_id 为「一次 run」的分组键（JOIN 汇合与等齐前驱按同 run 判定），
+-- 通用任务表：run_id 标识一次运行，scope_id 隔离运行内的分支（JOIN 按同 run 和 scope 判定），
 -- 业务可把自己的血缘键（如 world 的 commit_id）映射到该列，引擎不解读其内容；
 -- enqueue 未指定分组时以新任务 ID 创建运行；直接写入的 NULL 在同一 workflow 下按同组处理。
 CREATE TABLE IF NOT EXISTS tasks (
     workflow_id TEXT   NOT NULL,
     run_id      BIGINT,
+    scope_id    BIGINT,
     task_id     BIGINT NOT NULL CHECK (task_id > 0),
     parent_task_ids BIGINT[] NOT NULL DEFAULT '{}',
     name        TEXT   NOT NULL,
@@ -43,17 +44,18 @@ COMMENT ON COLUMN task_counters.next_task_id IS '最近一次分配的 task_id�
 
 COMMENT ON TABLE tasks IS '工作流任务实例及其执行状态；以 (workflow_id, task_id) 唯一定位一条任务，同一次 run 可包含多个任务。';
 COMMENT ON COLUMN tasks.workflow_id IS '工作流标识；用于隔离任务、分配 task_id 和限定调度范围，与 task_id 组成主键。';
-COMMENT ON COLUMN tasks.run_id IS '运行分组键；同一工作流内用于 JOIN 汇合、JOIN 等齐前驱及失败级联，后继继承源任务的值；enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。';
+COMMENT ON COLUMN tasks.run_id IS '运行分组键；与 scope_id 一起限定 JOIN 汇合、前驱等待及失败级联，后继继承源任务的值；enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。';
+COMMENT ON COLUMN tasks.scope_id IS '运行内的执行分组；scope 节点入队时以自身 task_id 开启新分组，普通和 JOIN 后继继承源任务分组；NULL 表示运行的默认分组，JOIN 汇聚、前驱等待和失败级联只发生在同组。';
 COMMENT ON COLUMN tasks.parent_task_ids IS '来源任务 ID 数组，引用同一 workflow_id 下的 task_id；入口为空，成功和失败后继均记录源任务，JOIN 累积并去重所有贡献者；仅用于溯源，不要求来源任务成功。';
 COMMENT ON COLUMN tasks.task_id IS '工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一，用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。';
-COMMENT ON COLUMN tasks.task_type IS '节点声明的任务类型：normal 为普通节点，event 为外部事件入口，join 为汇合节点；仅 join 额外检查 depends_on_names 中的静态前驱是否全部就绪。';
+COMMENT ON COLUMN tasks.task_type IS '节点声明的任务类型：normal 为普通节点，event 为外部事件入口，scope 为分组入口，join 为汇合节点；仅 join 额外检查 depends_on_names 中的静态前驱是否全部就绪。';
 COMMENT ON COLUMN tasks.name IS '工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。';
 COMMENT ON COLUMN tasks.status IS '任务状态：pending 待认领，running 已认领，succeeded 成功，failed 永久失败，skipped 跳过，superseded 失败已由后继接管。';
 COMMENT ON COLUMN tasks.claimed_by IS '最近一次认领任务的 worker 标识；未认领时为 NULL，任务结算后保留，不代表租约仍有效。';
 COMMENT ON COLUMN tasks.lease_until IS '本次认领的固定处理截止时间，不续租；NULL 表示无有效租约，pending/running 任务在无租约或到期后可按依赖重新认领；结算或释放时清空。';
 COMMENT ON COLUMN tasks.attempt IS '认领代次；初始为 0，每次认领加 1，用于写入校验；超过 max_attempts 的认领只处理最终失败，不再执行业务。';
 COMMENT ON COLUMN tasks.max_attempts IS '该任务行的业务执行次数上限，默认 3（含首次）；耗尽后重新认领并通过统一失败流程结算，失败边新建任务单独计数。';
-COMMENT ON COLUMN tasks.depends_on_names IS '静态前驱节点名数组；join 认领时要求同一 workflow_id、run_id 下每个前驱至少有一个实例且全部实例成功，同时用于血缘记录及失败级联。';
+COMMENT ON COLUMN tasks.depends_on_names IS '静态前驱节点名数组；join 认领时要求同一 workflow_id、run_id、scope_id 下每个前驱至少有一个实例且全部实例成功，同时用于血缘记录及失败级联。';
 COMMENT ON COLUMN tasks.input_json IS '节点输入的 JSON 值；结构由节点输入类型决定，JOIN 输入按前驱节点名汇聚。';
 COMMENT ON COLUMN tasks.output_json IS '节点成功输出的 JSON 值；结构由节点输出类型决定，尚未写入输出时为 SQL NULL。';
 COMMENT ON COLUMN tasks.error IS '失败、跳过或被后继接管的原因文本，也记录重试预算耗尽及依赖失败原因；成功结算时清空。';
@@ -68,3 +70,7 @@ ON tasks(workflow_id, status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_tasks_pending_sessions
 ON tasks(status, workflow_id)
 WHERE status = 'pending';
+
+-- JOIN 分组合并、前驱就绪与失败检查。
+CREATE INDEX IF NOT EXISTS idx_tasks_scope_name
+ON tasks(workflow_id, run_id, scope_id, name, status);

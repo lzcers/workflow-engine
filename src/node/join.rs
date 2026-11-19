@@ -8,7 +8,7 @@
 //! 的输入就是已合并好的 `Map`，直接透传作为输出。下游既可以用 `Map` 直接消费，
 //! 也可接一条 `map` 边把 `Map` 换算成强类型输入。
 //!
-//! JOIN 的「等待全部静态前驱完成」由 [`super::TaskType::Join`] 通知[`super::super::graph::Graph`]
+//! JOIN 的「等待同一运行、作用域内全部静态前驱完成」由 [`super::TaskType::Join`] 通知[`super::super::graph::Graph`]
 //! 与存储（`depends_on_names` 闸门）共同保证，节点本身不关心等待逻辑。
 
 use serde_json::Value;
@@ -26,7 +26,7 @@ impl<Ctx: Send> Node<Ctx> for JoinNode {
     type In = Value;
     type Out = Value;
 
-    /// JOIN 汇聚门：任务类型为 [`TaskType::Join`]，存储据此做「等齐全部静态前驱」的认领闸门。
+    /// JOIN 汇聚门：任务类型为 [`TaskType::Join`]，存储据此等齐同作用域的全部静态前驱。
     const TASK_TYPE: TaskType = TaskType::Join;
 
     async fn execute(&self, _ctx: &mut Ctx, input: Self::In) -> Result<Self::Out, NodeError> {

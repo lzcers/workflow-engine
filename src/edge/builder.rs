@@ -2,10 +2,10 @@
 //!
 //! 提供两个具体载体（[`EdgeImpl`] 实现 [`SuccessEdge`]，[`FailureEdgeImpl`] 实现
 //! [`FailureEdge`]）以及两套命名建边函数：
-//! - 命令式：成功边 [`when`]（返回 [`WhenBuilder`]）/ [`map`]，失败边 [`on_error`]（无条件）/
+//! - 命令式：成功边 [`when`]（返回 [`WhenBuilder`]）/ [`map`] / [`foreach`]，失败边 [`on_error`]（无条件）/
 //!   [`when_error`]（返回 [`ErrorWhenBuilder`]）。类型参数直接来自转换/条件闭包的签名；
 //!   与注册节点的接线一致性由 build 期的类型指纹校验兜底（无编译期检查）。
-//! - 类型检查版（DSL 专用）：[`map_checked`]/[`when_checked`]/[`on_error_checked`]/
+//! - 类型检查版（DSL 专用）：[`map_checked`]/[`foreach_checked`]/[`when_checked`]/[`on_error_checked`]/
 //!   [`when_error_checked`]，接收由节点实例推导的 [`NodeKey`]，编译期强制转换函数入参 ==
 //!   上游节点 `Out`（失败边为 `In`）、出参 == 下游节点 `In`；`when`/`when_error` 不接转换时
 //!   用 `.passthrough_checked()` 透传并强制上游输出类型 == 下游输入类型；无条件的成功透传
@@ -23,6 +23,7 @@ use super::{FailureEdge, SuccessEdge};
 pub struct EdgeImpl<SrcOut, DstIn> {
     src: &'static str,
     dst: &'static str,
+    creates_scope: bool,
     when: Option<Box<dyn Fn(&SrcOut) -> bool + Send + Sync>>,
     map: Option<Box<dyn Fn(&SrcOut) -> Vec<DstIn> + Send + Sync>>,
     marker: PhantomData<fn(SrcOut) -> DstIn>,
@@ -40,6 +41,9 @@ where
     }
     fn dst(&self) -> &'static str {
         self.dst
+    }
+    fn creates_scope(&self) -> bool {
+        self.creates_scope
     }
     fn when(&self) -> Option<&(dyn Fn(&SrcOut) -> bool + Send + Sync)> {
         self.when.as_deref()
@@ -93,6 +97,7 @@ impl<SrcOut> WhenBuilder<SrcOut> {
         EdgeImpl {
             src: self.src,
             dst: self.dst,
+            creates_scope: false,
             when: Some(self.condition),
             map: None,
             marker: PhantomData,
@@ -107,6 +112,7 @@ impl<SrcOut> WhenBuilder<SrcOut> {
         EdgeImpl {
             src: self.src,
             dst: self.dst,
+            creates_scope: false,
             when: Some(self.condition),
             map: Some(Box::new(transform)),
             marker: PhantomData,
@@ -129,6 +135,7 @@ impl<SrcOut> WhenBuilder<SrcOut> {
         EdgeImpl {
             src: self.src,
             dst: to.name(),
+            creates_scope: false,
             when: Some(self.condition),
             map: Some(Box::new(transform)),
             marker: PhantomData,
@@ -271,6 +278,7 @@ where
     EdgeImpl {
         src: from,
         dst: to,
+        creates_scope: false,
         when: None,
         map: Some(Box::new(transform)),
         marker: PhantomData,
@@ -297,10 +305,40 @@ where
     EdgeImpl {
         src: from.name(),
         dst: to.name(),
+        creates_scope: false,
         when: None,
         map: Some(Box::new(transform)),
         marker: PhantomData,
     }
+}
+
+/// 将数组逐项传给目标节点，每个目标任务以自身 task_id 建立独立作用域。
+/// 后继任务继承该作用域；空数组不创建任务。与 [`map`] 不同，本边明确建立分组边界。
+pub fn foreach<T>(from: &'static str, to: &'static str) -> EdgeImpl<Vec<T>, T>
+where
+    T: Clone + 'static,
+{
+    EdgeImpl {
+        src: from,
+        dst: to,
+        creates_scope: true,
+        when: None,
+        map: Some(Box::new(|items| items.clone())),
+        marker: PhantomData,
+    }
+}
+
+/// 逐项分组边的类型检查入口；源输出必须是目标输入组成的 Vec。
+pub fn foreach_checked<K1, K2, Ctx>(
+    from: NodeKey<Ctx, K1>,
+    to: NodeKey<Ctx, K2>,
+) -> EdgeImpl<Vec<K2::In>, K2::In>
+where
+    K1: Node<Ctx, Out = Vec<K2::In>>,
+    K2: Node<Ctx>,
+    K2::In: Clone,
+{
+    foreach(from.name(), to.name())
 }
 
 /// 失败边（无条件）：`from` 失败后，用喂给失败节点的**输入 + 错误**构造 `to` 输入。
@@ -411,6 +449,7 @@ where
     EdgeImpl {
         src: from.name(),
         dst: to.name(),
+        creates_scope: false,
         when: None,
         map: None,
         marker: PhantomData,

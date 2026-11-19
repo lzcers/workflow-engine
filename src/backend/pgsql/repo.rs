@@ -17,11 +17,11 @@ use crate::{Task, TaskRecord, TaskStatus};
 
 /// 最终失败恢复认领保存的原因，重复恢复时保留第一次记录。
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted";
-const WINDOW_EXPIRED_ERR: &str = "task execution window expired; retry budget exhausted";
+const LEASE_EXPIRED_ERR: &str = "task lease expired; retry budget exhausted";
 
 /// 任务行 SELECT / RETURNING 列（顺序与表结构一致）。`pub`：消费方的业务查询
 /// 与同一张表交互时复用同一列序。
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, parent_task_ids, name, status, \
+pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
      claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
      input_json, output_json, error, created_at, updated_at";
 
@@ -163,20 +163,27 @@ async fn settle_in_tx(
     Ok(row.into())
 }
 
-/// 事务内入队后继：普通任务逐条创建，JOIN 按运行和节点名累积来源与输入。
+/// 事务内入队后继：普通任务逐条创建，Scope 和 foreach 开启新分组，JOIN 按运行、分组和节点名累积。
 /// 调用方先获取运行锁，覆盖 JOIN 首次创建的窗口；本方法不自行开事务或提交。
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
     run_id: Option<i64>,
+    scope_id: Option<i64>,
     parent_task_ids: &[i64],
     name: &str,
     inputs: &[Value],
     task_type: &str,
+    creates_scope: bool,
     depends_on_names: &[String],
     max_attempts: i32,
 ) -> Result<Vec<TaskRecord>, StorageError> {
+    if creates_scope && task_type == "join" {
+        return Err(StorageError::InvalidFanout {
+            detail: "foreach cannot target a JOIN node".into(),
+        });
+    }
     let mut rows = Vec::with_capacity(inputs.len());
     for input in inputs {
         let existing = if task_type == "join" {
@@ -185,6 +192,7 @@ async fn enqueue_fanout_in_tx(
                 SELECT {ROW_COLS} FROM tasks
                 WHERE workflow_id = $1 AND name = $2
                   AND run_id IS NOT DISTINCT FROM $3
+                  AND scope_id IS NOT DISTINCT FROM $4
                   AND task_type = 'join' AND status IN ('pending', 'running')
                 ORDER BY task_id LIMIT 1 FOR UPDATE
                 "#
@@ -192,6 +200,7 @@ async fn enqueue_fanout_in_tx(
             .bind(workflow_id)
             .bind(name)
             .bind(run_id)
+            .bind(scope_id)
             .fetch_optional(&mut **tx)
             .await?
         } else {
@@ -229,6 +238,7 @@ async fn enqueue_fanout_in_tx(
                         SELECT 1 FROM tasks
                         WHERE workflow_id = $1
                           AND run_id IS NOT DISTINCT FROM $2
+                          AND scope_id IS NOT DISTINCT FROM $4
                           AND name = ANY($3) AND status = 'failed'
                     )
                     "#,
@@ -236,6 +246,7 @@ async fn enqueue_fanout_in_tx(
                 .bind(workflow_id)
                 .bind(run_id)
                 .bind(depends_on_names)
+                .bind(scope_id)
                 .fetch_one(&mut **tx)
                 .await?
             } else {
@@ -247,8 +258,8 @@ async fn enqueue_fanout_in_tx(
                 INSERT INTO tasks
                     (workflow_id, task_id, run_id, name, status,
                      attempt, max_attempts, task_type, parent_task_ids, depends_on_names,
-                     input_json)
-                VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10::jsonb)
+                     input_json, scope_id)
+                VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10::jsonb, $11)
                 RETURNING {ROW_COLS}
                 "#
             ))
@@ -266,6 +277,11 @@ async fn enqueue_fanout_in_tx(
             .bind(parent_task_ids)
             .bind(depends_on_names)
             .bind(input)
+            .bind(if creates_scope || task_type == "scope" {
+                Some(task_id)
+            } else {
+                scope_id
+            })
             .fetch_one(&mut **tx)
             .await?
         };
@@ -305,6 +321,7 @@ const EXECUTABLE_WHERE: &str = r#"
                     FROM tasks st
                     WHERE st.workflow_id = wt.workflow_id
                       AND st.run_id IS NOT DISTINCT FROM wt.run_id
+                      AND st.scope_id IS NOT DISTINCT FROM wt.scope_id
                       AND st.name = dn.name
                       AND st.status = 'succeeded'
                 )
@@ -313,6 +330,7 @@ const EXECUTABLE_WHERE: &str = r#"
                     FROM tasks st
                     WHERE st.workflow_id = wt.workflow_id
                       AND st.run_id IS NOT DISTINCT FROM wt.run_id
+                      AND st.scope_id IS NOT DISTINCT FROM wt.scope_id
                       AND st.name = dn.name
                       AND st.status <> 'succeeded'
                 )
@@ -340,13 +358,13 @@ impl PgTaskRepo {
                 (
                     workflow_id, task_id, run_id, name, status,
                     claimed_by, lease_until, attempt, max_attempts, parent_task_ids, depends_on_names,
-                    input_json, output_json, error, created_at, updated_at, task_type
+                    input_json, output_json, error, created_at, updated_at, task_type, scope_id
                 )
             VALUES
                 (
                     $1, $2, $3, $4, 'pending',
                     NULL, NULL, 0, $5, $6, $7,
-                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9
+                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9, $10
                 )
             RETURNING {ROW_COLS}
             "#
@@ -361,6 +379,11 @@ impl PgTaskRepo {
             .bind(&task.depends_on_names)
             .bind(&task.input)
             .bind(&task.task_type)
+            .bind(if task.task_type == "scope" {
+                Some(task_id)
+            } else {
+                task.scope_id
+            })
             .fetch_one(&mut **tx)
             .await?;
         Ok(row.into())
@@ -376,18 +399,20 @@ impl PgTaskRepo {
         Ok(row)
     }
 
-    /// 在同一事务中逐条入队输入；仅 JOIN 按运行和节点名汇合。
-    /// JOIN 累积 parent_task_ids 和输入。
+    /// 在同一事务中逐条入队输入；仅 JOIN 按运行、分组和节点名汇合。
+    /// JOIN 累积 parent_task_ids 和输入，Scope 和 foreach 为每条输入建立独立分组。
     /// 运行级事务锁覆盖首次创建窗口，已有 JOIN 通过行锁合并。
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_fanout(
         &self,
         workflow_id: &str,
         run_id: Option<i64>,
+        scope_id: Option<i64>,
         parent_task_ids: &[i64],
         name: &str,
         inputs: &[Value],
         task_type: &str,
+        creates_scope: bool,
         depends_on_names: &[String],
         max_attempts: i32,
     ) -> Result<Vec<TaskRecord>, StorageError> {
@@ -401,10 +426,12 @@ impl PgTaskRepo {
             &mut tx,
             workflow_id,
             run_id,
+            scope_id,
             parent_task_ids,
             name,
             inputs,
             task_type,
+            creates_scope,
             depends_on_names,
             max_attempts,
         )
@@ -413,7 +440,7 @@ impl PgTaskRepo {
         Ok(rows)
     }
 
-    /// 当前认领成功结算与后继入队在同一事务提交，后继继承最新的 run_id。
+    /// 当前认领成功结算与后继入队在同一事务提交，后继继承最新的 run_id 和 scope_id；Scope 和 foreach 后继开启新分组。
     pub async fn succeed_and_enqueue(
         &self,
         task: &TaskRecord,
@@ -434,10 +461,12 @@ impl PgTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                settled.scope_id,
                 &[task.task_id],
                 f.dst,
                 &f.inputs,
                 f.task_type,
+                f.creates_scope,
                 &f.depends_on_names,
                 max_attempts,
             )
@@ -472,10 +501,12 @@ impl PgTaskRepo {
                 &mut tx,
                 &task.workflow_id,
                 settled.run_id,
+                settled.scope_id,
                 &[task.task_id],
                 f.dst,
                 &f.inputs,
                 f.task_type,
+                f.creates_scope,
                 &f.depends_on_names,
                 max_attempts,
             )
@@ -490,6 +521,7 @@ impl PgTaskRepo {
                 WHERE source.workflow_id = $1 AND source.task_id = $2
                   AND dependent.workflow_id = source.workflow_id
                   AND dependent.run_id IS NOT DISTINCT FROM source.run_id
+                  AND dependent.scope_id IS NOT DISTINCT FROM source.scope_id
                   AND dependent.status = 'pending'
                   AND dependent.task_type = 'join'
                   AND source.name = ANY(dependent.depends_on_names)
@@ -502,6 +534,39 @@ impl PgTaskRepo {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// 续租不改变认领代次；先等行锁，再检查数据库时间，过期认领不能复活。
+    pub async fn renew_claim(
+        &self,
+        task: &TaskRecord,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        match lock_task(&mut tx, task).await {
+            Ok(_) => {}
+            Err(StorageError::ClaimLost { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let lease_until = sqlx::query_scalar(
+            r#"
+            UPDATE tasks
+            SET lease_until = clock_timestamp() + make_interval(secs => $5),
+                updated_at = clock_timestamp()
+            WHERE workflow_id = $1 AND task_id = $2
+              AND claimed_by = $3 AND attempt = $4
+              AND status = 'running' AND lease_until > clock_timestamp()
+            RETURNING lease_until
+            "#,
+        )
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(&task.claimed_by)
+        .bind(task.attempt)
+        .bind(LEASE_DURATION.as_secs() as f64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(lease_until)
     }
 
     /// 仅释放当前有效认领；旧 worker 不能释放新 owner 的租约。
@@ -550,7 +615,7 @@ impl PgTaskRepo {
         .rows_affected())
     }
 
-    /// 认领当前工作流的就绪任务，使用固定租约和递增的 attempt 隔离执行者。
+    /// 认领当前工作流的就绪任务，使用可续期租约和递增的 attempt 隔离执行者。
     /// `FOR UPDATE SKIP LOCKED` 保证多 worker 不会同时认领同一行。
     ///
     /// 返回的 attempt <= max_attempts 时执行业务；超出预算的认领只负责最终失败结算。
@@ -596,7 +661,7 @@ impl PgTaskRepo {
             .bind(worker)
             .bind(LEASE_DURATION.as_secs() as f64)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .bind(WINDOW_EXPIRED_ERR)
+            .bind(LEASE_EXPIRED_ERR)
             .bind(BUDGET_EXHAUSTED_ERR)
             .fetch_all(&mut *tx)
             .await?;

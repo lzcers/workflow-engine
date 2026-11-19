@@ -12,6 +12,7 @@
 //!
 //! 边语法（`SRC -> DST` 后跟一条子句（可省略），每条以逗号结尾）：
 //! - `|> fn`：无条件成功转换边。
+//! - `foreach`：把源输出 Vec 逐项传给目标，每个目标任务建立独立作用域。
 //! - `src -> dst`（裸边，无子句）：无条件成功透传边（编译期强制 SRC 的 `Out` == DST 的 `In`）。
 //! - `on_error fn`：无条件失败边（失败输入 + 错误 → `to` 输入，不约束为回退）。
 //! - `when(cond) |> fn`：成功条件边 + 转换。
@@ -34,7 +35,8 @@
 // 宏在调用方展开，因此接线函数必须可访问；它们属于 DSL 的实现入口。
 #[doc(hidden)]
 pub use crate::edge::{
-    map_checked, on_error_checked, passthrough_checked, when_checked, when_error_checked,
+    foreach_checked, map_checked, on_error_checked, passthrough_checked, when_checked,
+    when_error_checked,
 };
 
 /// 把工作流身份、`nodes { name => instance }` 与 `edges { ... }` 展开为
@@ -44,7 +46,7 @@ pub use crate::edge::{
 /// - `workflow_id` / `title`：必填的稳定 ID 与展示标题，接受可转换为 `String` 的表达式。
 /// - `nodes`：`name => instance` 注册构造完成的节点，所有构建表达式只求值一次。
 ///   可用 `#[title = expr]` / `#[description = expr]` 附加图描述，各最多出现一次。
-/// - `edges`：`src -> dst map/on_error/when(cond) map <expr>`，表达式为建边纯函数；
+/// - `edges`：支持透传、`|> transform`、`foreach`、`when(cond)` 和 `on_error transform` 等子句；
 ///   边经类型检查版构造函数（[`crate::dsl::map_checked`] 等）装配，编译期校验类型接线。
 ///
 #[doc = include_str!("../tests/doctests/workflow.md")]
@@ -99,6 +101,14 @@ macro_rules! workflow {
     // 多源 AND 汇合不作为 DSL 语法糖：JOIN 是业务节点，在 `nodes` 块显式注册
     // （如 `finalize_join => JoinNode`），源经普通边汇入 JOIN。已移除的方括号语法
     // `[A, B, C] -> D` 不再支持。
+
+    // 逐项分组边：SRC -> DST foreach（SRC 的 Out == Vec<DST 的 In>）
+    (@edges $b:expr; $src:ident -> $dst:ident foreach, $($rest:tt)*) => {
+        $crate::dsl::workflow!(@edges
+            $b.edge($crate::dsl::foreach_checked($src, $dst))
+            ; $($rest)*
+        )
+    };
 
     // 成功转换边：SRC -> DST |> fn（map_checked：转换入参 == SRC 的 Out，出参 == DST 的 In）
     (@edges $b:expr; $src:ident -> $dst:ident |> $transform:expr, $($rest:tt)*) => {

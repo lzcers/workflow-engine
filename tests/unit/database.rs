@@ -21,6 +21,7 @@ fn task() -> Task {
         task_type: "normal".into(),
         workflow_id: "connection-check".into(),
         run_id: Some(1),
+        scope_id: None,
         parent_task_ids: vec![],
         name: "start".into(),
         max_attempts: 3,

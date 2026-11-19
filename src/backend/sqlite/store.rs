@@ -50,7 +50,14 @@ impl TaskStore for SqliteTaskStore {
         Box::pin(self.repo.claim_many(workflow_id, worker_id, limit))
     }
 
-    /// 原子成功结算：写入输出并入队全部成功后继，后继使用任务最新的分组键。
+    fn renew_claim<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
+        Box::pin(self.repo.renew_claim(task))
+    }
+
+    /// 原子成功结算：写入输出并入队全部成功后继，继承任务最新的 run_id 和 scope_id。
     fn settle_success<'a>(
         &'a self,
         task: &'a TaskRecord,

@@ -6,6 +6,8 @@ pub enum StorageError {
     Database(#[from] sqlx::Error),
     #[error("claim for task {workflow_id}:{task_id} is no longer valid")]
     ClaimLost { workflow_id: String, task_id: i64 },
+    #[error("invalid fanout plan: {detail}")]
+    InvalidFanout { detail: String },
     #[error("unsupported database URL scheme; expected postgres, postgresql, or sqlite")]
     UnsupportedScheme,
     #[error("database backend {backend} is not enabled")]

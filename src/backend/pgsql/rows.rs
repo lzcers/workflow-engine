@@ -11,6 +11,7 @@ pub struct TaskRow {
     pub workflow_id: String,
     pub task_id: i64,
     pub run_id: Option<i64>,
+    pub scope_id: Option<i64>,
     pub parent_task_ids: Vec<i64>,
     pub name: String,
     #[sqlx(try_from = "String")]
@@ -34,6 +35,7 @@ impl From<TaskRow> for TaskRecord {
             workflow_id: row.workflow_id,
             task_id: row.task_id,
             run_id: row.run_id,
+            scope_id: row.scope_id,
             parent_task_ids: row.parent_task_ids,
             name: row.name,
             status: row.status,

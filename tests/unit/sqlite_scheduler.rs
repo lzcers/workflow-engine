@@ -11,7 +11,7 @@ use crate::{
     backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
     database::Database,
     dsl,
-    graph::{JoinNode, Node, NodeContext, NodeError},
+    graph::{JoinNode, Node, NodeContext, NodeError, ScopeNode},
     scheduler::Scheduler,
     task::{Task, TaskRecord, TaskStatus},
 };
@@ -324,14 +324,175 @@ struct SignalNode {
 
 impl Node<Context> for SignalNode {
     type In = i32;
-    type Out = i32;
+    type Out = Vec<i32>;
 
-    async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
+    async fn execute(&self, _: &mut Context, input: i32) -> Result<Vec<i32>, NodeError> {
         self.started.notify_one();
         if let Some(release) = &self.release {
             release.notified().await;
         }
+        Ok(vec![input])
+    }
+}
+
+struct Item;
+
+impl Node<Context> for Item {
+    type In = i32;
+    type Out = i32;
+
+    async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
         Ok(input)
+    }
+}
+
+#[tokio::test]
+async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
+    for use_foreach in [false, true] {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let pool = match &database {
+            Database::Sqlite(pool) => pool.clone(),
+            #[cfg(feature = "pg")]
+            Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
+        };
+        let repo = SqliteTaskRepo::new(pool);
+        let starts: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
+        let releases: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
+        macro_rules! report_graph {
+            ($item_node:expr; $($clause:tt)*) => {
+                dsl::workflow! {
+                    workflow_id: "scoped-reports";
+                    title: "独立作用域复用计算与报表";
+                    context: Context::default();
+                    nodes {
+                        start => AddOne,
+                        source_a => SignalNode { started: starts[0].clone(), release: Some(releases[0].clone()) },
+                        source_b => SignalNode { started: starts[1].clone(), release: Some(releases[1].clone()) },
+                        source_c => SignalNode { started: starts[2].clone(), release: Some(releases[2].clone()) },
+                        per_item => $item_node,
+                        worker => AddOne,
+                        collect => JoinNode,
+                        report => Sum,
+                    }
+                    edges {
+                        start -> source_a,
+                        start -> source_b |> |output| vec![*output + 10],
+                        start -> source_c |> |output| vec![*output + 20],
+                        source_a -> per_item $($clause)*,
+                        source_b -> per_item $($clause)*,
+                        source_c -> per_item $($clause)*,
+                        per_item -> worker,
+                        per_item -> collect |> |output| vec![json!({"summary": output})],
+                        worker -> collect |> |output| vec![json!({"worker": [output]})],
+                        collect -> report |> |output: &Value| vec![
+                            serde_json::from_value::<Collected>(output.clone()).unwrap(),
+                        ],
+                    }
+                }
+            };
+        }
+        let graph = if use_foreach {
+            report_graph!(Item; foreach)
+        } else {
+            report_graph!(ScopeNode::<i32>::new(); |> |output| output.clone())
+        }
+        .unwrap();
+        let root = repo
+            .enqueue(&Task::new("scoped-reports", "start", json!(0)))
+            .await
+            .unwrap();
+        let scheduler = Scheduler::new(
+            Arc::new(graph),
+            Arc::new(SqliteTaskStore::new(repo.clone())),
+            Duration::from_millis(2),
+        )
+        .with_max_concurrency(8);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scheduler.run() => panic!("scheduler must run until cancelled"),
+                _ = async {
+                    tokio::join!(starts[0].notified(), starts[1].notified(), starts[2].notified());
+                    // The next source stays running until the preceding report has completed.
+                    // Shared nodes must not wait for or collect another source's future scope.
+                    for (index, source) in [2, 0, 1].into_iter().enumerate() {
+                        releases[source].notify_one();
+                        loop {
+                            let tasks = repo.list_all("scoped-reports").await.unwrap();
+                            let reports = tasks.iter().filter(|task|
+                                task.name == "report" && task.status == TaskStatus::Succeeded
+                            ).count();
+                            if reports == index + 1 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("each scope produces its own report before the next source is released");
+
+        let tasks = repo.list_all("scoped-reports").await.unwrap();
+        assert_eq!(tasks.len(), 16);
+        assert!(tasks.iter().all(|task| task.run_id == root.run_id
+            && task.status == TaskStatus::Succeeded
+            && task.attempt == 1));
+        let scopes: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.name == "per_item")
+            .collect();
+        assert_eq!(scopes.len(), 3);
+        for scope in scopes {
+            assert_eq!(
+                scope.task_type,
+                if use_foreach { "normal" } else { "scope" }
+            );
+            assert_eq!(scope.scope_id, Some(scope.task_id));
+            let source = tasks
+                .iter()
+                .find(|task| scope.parent_task_ids == [task.task_id])
+                .unwrap();
+            assert_eq!(source.scope_id, None);
+            assert_eq!(source.output, Some(json!([scope.input])));
+            let scoped: Vec<_> = tasks
+                .iter()
+                .filter(|task| task.scope_id == scope.scope_id)
+                .collect();
+            assert_eq!(scoped.len(), 4, "scope, worker, JOIN and report");
+            let input = scope.input.as_i64().unwrap();
+            let worker = scoped.iter().find(|task| task.name == "worker").unwrap();
+            assert_eq!(worker.parent_task_ids, [scope.task_id]);
+            assert_eq!(worker.input, scope.input);
+            assert_eq!(worker.output, Some(json!(input + 1)));
+
+            let join = scoped.iter().find(|task| task.name == "collect").unwrap();
+            let mut predecessors = join.depends_on_names.clone();
+            predecessors.sort();
+            assert_eq!(predecessors, ["per_item", "worker"]);
+            let mut parents = join.parent_task_ids.clone();
+            parents.sort_unstable();
+            assert_eq!(parents, [scope.task_id, worker.task_id]);
+            assert_eq!(join.input, json!({"summary": input, "worker": [input + 1]}));
+
+            let report = scoped.iter().find(|task| task.name == "report").unwrap();
+            assert_eq!(report.parent_task_ids, [join.task_id]);
+            assert_eq!(report.input, join.input);
+            assert_eq!(report.output, Some(json!(input * 2 + 1)));
+        }
+        let mut reports: Vec<_> = tasks.iter().filter(|task| task.name == "report").collect();
+        reports.sort_unstable_by_key(|task| task.task_id);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|task| task.output.clone().unwrap())
+                .collect::<Vec<_>>(),
+            [json!(43), json!(3), json!(23)],
+            "reports retain their source pairing despite out-of-order source completion",
+        );
+        database.close().await;
     }
 }
 
@@ -356,6 +517,7 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         task_type: "normal".into(),
         workflow_id: "scheduler-wake".into(),
         run_id: None,
+        scope_id: None,
         parent_task_ids: vec![],
         name: "slow".into(),
         max_attempts: 3,

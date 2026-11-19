@@ -12,9 +12,12 @@ CREATE TABLE IF NOT EXISTS task_counters (
 CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流标识；用于隔离任务、分配 task_id 和限定调度范围，与 task_id 组成主键。
     workflow_id TEXT NOT NULL,
-    -- 运行分组键；用于 JOIN 汇合、等齐前驱及失败级联，后继继承源任务的值。
+    -- 工作流运行身份；后继继承源任务的值。
     -- enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。
     run_id INTEGER,
+    -- 运行内的 JOIN 隔离域；scope 节点以自身任务 ID 开始新域，其他后继继承源任务的值。
+    -- NULL 表示该运行的默认域；汇聚、前驱等齐和失败级联只在同一域内发生。
+    scope_id INTEGER,
     -- 工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一。
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。
     task_id INTEGER NOT NULL CHECK (task_id > 0),
@@ -39,10 +42,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 该任务行的业务执行次数上限（含首次）；耗尽后重新认领并通过统一失败流程结算。
     -- 失败边新建的任务单独计数。
     max_attempts INTEGER NOT NULL DEFAULT 3,
-    -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；join 汇合节点，额外检查静态前驱。
-    task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event')),
+    -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；scope 隔离域入口；join 汇合节点。
+    task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event', 'scope')),
     -- 静态前驱节点名的 JSON 数组，用于血缘记录及 JOIN 失败级联。
-    -- join 认领时要求同一 workflow_id、run_id 下每个前驱至少有一个实例且全部实例成功。
+    -- join 认领时要求同一 workflow_id、run_id、scope_id 下每个前驱至少有一个实例且全部实例成功。
     depends_on_names TEXT NOT NULL DEFAULT '[]'
         CHECK (json_valid(depends_on_names) AND json_type(depends_on_names) = 'array'),
     -- 节点输入的 JSON 文本；结构由节点输入类型决定，JOIN 输入按前驱节点名汇聚。
@@ -60,4 +63,4 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(workflow_id, status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_tasks_recovery ON tasks(status, workflow_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_predecessors ON tasks(workflow_id, run_id, name, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_predecessors ON tasks(workflow_id, run_id, scope_id, name, status);

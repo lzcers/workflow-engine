@@ -2,7 +2,7 @@
 //!
 //! 与 `Node`/`AnyNode` 完全对称的分层结构，但**成功边与失败边是两种独立类型**：
 //! - 成功边（[`SuccessEdge`]，载体 [`EdgeImpl`]）：吃 `src` 的**输出**，条件命中后透传或
-//!   经 `map` 扇出为 `dst` 输入，构成前向主 DAG。
+//!   经 `map` 扇出为 `dst` 输入，或经 `foreach` 逐项建立独立作用域，构成前向主 DAG。
 //! - 失败边（[`FailureEdge`]，载体 [`FailureEdgeImpl`]）：吃失败节点的**输入 + 错误**，
 //!   条件命中后透传或经 `map` 扇出为 `dst` 输入，构成后向回退图。
 //!
@@ -11,8 +11,8 @@
 //! （`settle_success` vs `settle_failure`）都不同，本就是两条独立路由维度。
 //! 每种 trait 只承载它需要的成员，不再有恒为 `None` 的占位方法。
 //!
-//! **成功边与失败边在形状上完全对称**：都是 `when`（条件门）+ `map`（转换，可扇出，
-//! 无 `map` 即透传），`plan_success`/`plan_failure` 结构一致。失败边**不约束为回退操作**，
+//! 普通成功边与失败边都支持 `when`（条件门）+ `map`（转换，可扇出，无 `map` 即透传）；
+//! 逐项建立作用域的 `foreach` 只用于成功边。失败边**不约束为回退操作**，
 //! 回退重试只是 `map` 的一种用法；也可做按错误类型的错误分支、兜底降级等一般路由。
 //!
 //! 子模块划分：
@@ -25,8 +25,9 @@ mod failure;
 mod success;
 
 pub use builder::{
-    EdgeImpl, ErrorWhenBuilder, FailureEdgeImpl, WhenBuilder, map, map_checked, on_error,
-    on_error_checked, passthrough_checked, when, when_checked, when_error, when_error_checked,
+    EdgeImpl, ErrorWhenBuilder, FailureEdgeImpl, WhenBuilder, foreach, foreach_checked, map,
+    map_checked, on_error, on_error_checked, passthrough_checked, when, when_checked, when_error,
+    when_error_checked,
 };
 pub use failure::{AnyFailureEdge, FailureEdge};
 pub use success::{AnySuccessEdge, SuccessEdge};

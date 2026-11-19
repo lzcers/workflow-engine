@@ -1,7 +1,7 @@
 //! 成功边：把 `src` 的成功输出 `SrcOut` 路由为 `dst` 输入 `DstIn`。
 //!
 //! 成功边是前向主 DAG 的构成单元，提供强类型 [`SuccessEdge`] 接口与对 `Value` 规划的
-//! 擦除接口 [`AnySuccessEdge`]。构造经 [`super::when`] / [`super::map`] 完成。
+//! 擦除接口 [`AnySuccessEdge`]。构造经 [`super::when`] / [`super::map`] / [`super::foreach`] 完成。
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -21,6 +21,10 @@ pub trait SuccessEdge: Send + Sync {
     fn src(&self) -> &'static str;
     /// 目标节点名。
     fn dst(&self) -> &'static str;
+    /// 每条输入是否为目标任务建立独立作用域；普通转换和透传边继承上游作用域。
+    fn creates_scope(&self) -> bool {
+        false
+    }
     /// 成功条件（`None` 为无条件）。
     fn when(&self) -> Option<&(dyn Fn(&Self::SrcOut) -> bool + Send + Sync)>;
     /// 成功转换（`None` 则透传 `src` 输出）。
@@ -37,6 +41,8 @@ pub trait AnySuccessEdge: Send + Sync {
     fn src(&self) -> &'static str;
     /// 目标节点名。
     fn dst(&self) -> &'static str;
+    /// 每条输入是否为目标任务建立独立作用域。
+    fn creates_scope(&self) -> bool;
     /// 成功规划：条件命中经 `map` 产出 `dst` 输入（已序列化为 `Value`）。
     ///
     /// - `Ok(Vec)` 为空 = 正常剪枝（`when` 不命中 / `map` 返回空，**不产出任何下游实例**）。
@@ -60,6 +66,9 @@ where
     }
     fn dst(&self) -> &'static str {
         SuccessEdge::dst(self)
+    }
+    fn creates_scope(&self) -> bool {
+        SuccessEdge::creates_scope(self)
     }
 
     fn src_out_type(&self) -> TypeFingerprint {

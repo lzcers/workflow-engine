@@ -17,9 +17,11 @@ mod erased;
 
 pub use crate::edge::{
     EdgeError, EdgeImpl, ErrorWhenBuilder, FailureEdge, FailureEdgeImpl, SuccessEdge, WhenBuilder,
-    map, on_error, when, when_error,
+    foreach, map, on_error, when, when_error,
 };
-pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
+pub use crate::node::{
+    JoinNode, Node, NodeContext, NodeError, NodeKey, ScopeNode, TaskType, Trigger,
+};
 pub use builder::GraphBuilder;
 pub use description::{EdgeDescription, EdgeKind, GraphDescription, NodeDescription};
 pub use erased::ErasedGraph;
@@ -44,14 +46,16 @@ pub struct Graph<Ctx> {
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
 }
 
-/// 一条成功后继规划：目标节点名 + 输入列表（按 dst 聚合）。
+/// 一条后继规划：目标节点名 + 输入列表（按目标节点与作用域策略聚合）。
 #[derive(Debug)]
 pub struct Successor {
     /// 目标节点名。
     pub dst: &'static str,
-    /// 目标节点产出的任务类型（普通节点 / JOIN 门），入队时落库到 `task_type` 列。
+    /// 目标节点产出的任务类型，入队时落库到 `task_type` 列。
     pub task_type: TaskType,
-    /// 喂给 `dst` 的输入列表。普通节点每条输入创建独立任务，JOIN 在同一运行内累积输入。
+    /// 每条输入是否以新目标任务的 task_id 建立作用域；false 时继承上游作用域。
+    pub creates_scope: bool,
+    /// 喂给 `dst` 的输入列表。普通/Scope 节点每条输入创建独立任务，JOIN 在同一运行、作用域内累积输入。
     pub inputs: Vec<Value>,
     /// 目标节点的静态前驱节点名全集（通用血缘，`String` 以便直接落库）。是否用其做
     /// 「等齐前驱」闸门由 `task_type` 决定（仅 [`TaskType::Join`] 生效）。
@@ -137,33 +141,36 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 规划 `name` 节点的成功后继：遍历其出成功边，`when` 命中后经 `map` 产出 dst 输入，
-    /// 并按 dst 聚合为批量后继，是否汇合由目标节点类型决定。
+    /// 并按 (dst, creates_scope) 聚合为批量后继，是否汇合由目标节点类型决定。
     ///
     /// 返回 [`Successor`] 列表：`when` 不命中或 `map` 返回空则无该项；无 `map` 时透传 `out`。
     /// 纯函数，不触碰 DB——只回答「该入队哪些后继、各喂什么输入（单条 or 多条）」。
     ///
     /// 规划失败（[`EdgeError`]，多为图装配/类型接线错误）为确定性错误，应终止结算。
     pub fn plan_success(&self, name: &str, out: &Value) -> Result<Vec<Successor>, EdgeError> {
-        // 按目标节点名字分组收集经过转换后的结果
-        let mut order: Vec<&'static str> = Vec::new();
-        let mut by_dst: HashMap<&'static str, Vec<Value>> = HashMap::new();
+        // 同一目标的普通转换和 foreach 必须保留各自的作用域策略。
+        let mut order = Vec::new();
+        let mut by_destination: HashMap<(&'static str, bool), Vec<Value>> = HashMap::new();
 
         // 遍历所有成功路径的边，拿到这些边的目标。
         for e in self.success_edges.iter().filter(|e| e.src() == name) {
-            let dst = e.dst();
-            // 目标节点不在收集的分组里？说明这是新的目标节点
-            if !by_dst.contains_key(dst) {
-                order.push(dst);
+            let destination = (e.dst(), e.creates_scope());
+            // 按首次出现顺序保留各目标与作用域策略。
+            if !by_destination.contains_key(&destination) {
+                order.push(destination);
             }
             // 对于 image_propmt |map|-> image_generator 经过 map 转换后会是一个 Vec<Input>
             // 这意味着扇出多实例了
             // {image_generator: Vec[Input]}
-            by_dst.entry(dst).or_default().extend(e.plan_success(out)?);
+            by_destination
+                .entry(destination)
+                .or_default()
+                .extend(e.plan_success(out)?);
         }
         Ok(order
             .into_iter()
-            .filter_map(|dst| {
-                let inputs = by_dst.remove(dst)?;
+            .filter_map(|(dst, creates_scope)| {
+                let inputs = by_destination.remove(&(dst, creates_scope))?;
                 if inputs.is_empty() {
                     return None;
                 }
@@ -171,6 +178,7 @@ impl<Ctx> Graph<Ctx> {
                     dst,
                     inputs,
                     task_type: self.task_type_of(dst).expect("validated edge destination"),
+                    creates_scope,
                     depends_on_names: self.predecessors_of(dst),
                 })
             })
@@ -178,8 +186,8 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 规划 `name` 节点的失败后继：遍历其失败边，`when` 命中后经 `map` 产出 dst 输入，
-    /// 并按 dst 聚合为批量后继——与 [`Graph::plan_success`] 完全对称。失败边不约束为回退
-    /// 操作，可做错误分支、兜底降级等一般路由；无 `map` 时透传失败节点输入。
+    /// 并按 dst 聚合为批量后继，creates_scope 始终为 false。失败边不约束为回退操作，
+    /// 可做错误分支、兜底降级等一般路由；无 `map` 时透传失败节点输入。
     ///
     /// 返回 [`Successor`] 列表：`when` 不命中或 `map` 返回空则无该项。
     /// `task_type` 如实反映 dst 节点的类型（同 [`Graph::plan_success`]）；
@@ -196,7 +204,7 @@ impl<Ctx> Graph<Ctx> {
         input: &Value,
         err: &NodeError,
     ) -> Result<Vec<Successor>, EdgeError> {
-        // 按目标节点名字分组收集（同 plan_success）。
+        // 失败边均继承作用域，只需按目标节点名字分组收集。
         let mut order: Vec<&'static str> = Vec::new();
         let mut by_dst: HashMap<&'static str, Vec<Value>> = HashMap::new();
         for e in self.failure_edges.iter().filter(|e| e.src() == name) {
@@ -221,6 +229,7 @@ impl<Ctx> Graph<Ctx> {
                     inputs,
                     // task_type 如实反映 dst 节点类型：失败后继可能汇聚到 JOIN/错误处理节点，
                     task_type: self.task_type_of(dst).expect("validated edge destination"),
+                    creates_scope: false,
                     // 保持为空（当前约束）：认领闸门只支持「等齐前驱成功」，不支持「等齐失败」；
                     // 填入失败源名会让后继因前驱已失败而永久悬挂。详见方法级注释。
                     depends_on_names: Vec::new(),
@@ -258,7 +267,7 @@ impl<Ctx> Graph<Ctx> {
                 (TaskType::Event, None) => {
                     return Err(format!("event node {name} must declare a trigger"));
                 }
-                (TaskType::Normal | TaskType::Join, Some(_)) => {
+                (TaskType::Normal | TaskType::Join | TaskType::Scope, Some(_)) => {
                     return Err(format!("non-event node {name} must not declare a trigger"));
                 }
                 _ => {}
@@ -275,6 +284,12 @@ impl<Ctx> Graph<Ctx> {
             if dst.node.task_type() == TaskType::Event {
                 return Err(format!(
                     "success edge must not target event node {}",
+                    e.dst()
+                ));
+            }
+            if e.creates_scope() && dst.node.task_type() == TaskType::Join {
+                return Err(format!(
+                    "foreach edge must not target join node {}",
                     e.dst()
                 ));
             }

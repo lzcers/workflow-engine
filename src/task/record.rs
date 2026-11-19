@@ -56,9 +56,11 @@ impl TryFrom<String> for TaskStatus {
 pub struct TaskRecord {
     pub workflow_id: String,
     pub task_id: i64,
-    /// 分组键（代际分组）：同组任务共享 JOIN 汇合与等齐前驱的判定域
-    /// 业务侧可承载血缘语义。
+    /// 一次完整运行的身份；进入新的执行作用域时保持不变。
     pub run_id: Option<i64>,
+    /// 执行作用域：foreach 目标或 Scope 任务使用自身 task_id，其后继继承；None 为运行的根作用域。
+    /// JOIN 仅在同一 workflow、run、scope 内合并输入、等齐前驱和级联失败。
+    pub scope_id: Option<i64>,
     /// 来源任务 ID 集合；入口为空，普通后继记录源任务，JOIN 累积并去重所有贡献者。
     /// 失败后继同样记录来源；此字段不要求来源任务成功。
     pub parent_task_ids: Vec<i64>,
@@ -66,13 +68,13 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     /// 最近一次认领的执行器身份；Scheduler 每次启动生成新的 UUID。
     pub claimed_by: Option<String>,
-    /// 本次认领的固定处理截止时间，覆盖执行与结算，不续租。
+    /// 读取快照时的租约截止时间；执行与结算期间由调度器续租，不代表节点运行时限。
     pub lease_until: Option<chrono::DateTime<chrono::Utc>>,
     /// 每次认领递增的代次，用于写入校验；超过 max_attempts 后只处理最终失败。
     pub attempt: i32,
     /// 业务执行的最大尝试次数；最终失败的恢复认领不再执行业务。
     pub max_attempts: i32,
-    /// 节点声明的任务类型（`normal`/`join`/`event`）；仅 JOIN 额外检查静态前驱。
+    /// 节点声明的任务类型（`normal`/`join`/`scope`/`event`）；仅 JOIN 额外检查静态前驱。
     pub task_type: String,
     /// 静态前驱节点名全集（通用血缘；仅 `task_type = 'join'` 用作等齐前驱的认领闸门）。
     pub depends_on_names: Vec<String>,
@@ -91,10 +93,12 @@ pub struct Task {
     pub workflow_id: String,
     /// Some(id) 加入指定运行；None 在入队时以新任务的 task_id 创建独立运行。
     pub run_id: Option<i64>,
+    /// 普通任务继承该作用域；Scope 任务入队时改用自身 task_id，None 为根作用域。
+    pub scope_id: Option<i64>,
     /// 来源任务 ID 集合；独立入口为空，不作为认领时的成功条件。
     pub parent_task_ids: Vec<i64>,
     pub name: String,
-    /// 节点声明的任务类型（`normal`/`join`/`event`），入队时原样保存。
+    /// 节点声明的任务类型（`normal`/`join`/`scope`/`event`），入队时原样保存。
     pub task_type: String,
     pub max_attempts: i32,
     /// JOIN 静态前驱节点名全集（普通节点默认空集）。
@@ -103,11 +107,12 @@ pub struct Task {
 }
 
 impl Task {
-    /// 创建普通类型的独立运行入口；入队前可设置节点类型、运行、来源、静态前驱和尝试预算。
+    /// 创建普通类型的独立运行入口；入队前可设置节点类型、运行、作用域、来源、静态前驱和尝试预算。
     pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             workflow_id: workflow_id.into(),
             run_id: None,
+            scope_id: None,
             parent_task_ids: Vec::new(),
             name: name.into(),
             task_type: "normal".to_owned(),

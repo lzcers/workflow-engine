@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{Task, TaskRecord};
 
-/// 每次认领的固定租约时长，同时作为本次任务执行的时间预算。
+/// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
 
 /// 一条后继入队规划：由调度器从图规划结果（`Graph::plan_success` / `plan_failure`）
@@ -18,9 +18,12 @@ pub const LEASE_DURATION: Duration = Duration::from_secs(300);
 pub struct FanoutPlan {
     /// 目标节点名。
     pub dst: &'static str,
-    /// 目标节点产出的任务类型（`normal` / `join`），落库到 `task_type` 列。
+    /// 目标节点产出的任务类型（`normal` / `join` / `scope`），落库到 `task_type` 列。
     pub task_type: &'static str,
-    /// 喂给目标节点的输入列表：普通节点每条输入创建独立任务，JOIN 在同一运行内累积输入。
+    /// 每条输入是否以新任务的 task_id 建立作用域；false 时继承上游作用域。
+    /// 不能与 task_type = join 同时使用。
+    pub creates_scope: bool,
+    /// 喂给目标节点的输入列表：普通/Scope 节点每条输入创建独立任务，JOIN 在同一运行、作用域内累积输入。
     /// 空列表不创建任务。
     pub inputs: Vec<Value>,
     /// 目标节点的静态前驱节点名全集（仅 `task_type = join` 时用作等齐前驱的认领闸门）。
@@ -54,7 +57,7 @@ pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) {
     }
 }
 
-/// 引擎与调度器共用的任务持久化抽象：提交、认领、原子结算和释放认领。
+/// 引擎与调度器共用的任务持久化抽象：提交、认领、续租、原子结算和释放认领。
 ///
 /// 存储可供多个工作流共享；认领时显式传入工作流身份，提交与结算沿用任务的身份。
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
@@ -69,7 +72,8 @@ pub trait TaskStore: Sync {
 
     /// 原子入队任务并确定运行身份，返回已持久化的任务快照。
     /// run_id 为 None 时，以新分配的 task_id 创建独立运行；Some(id) 则保留指定运行。
-    /// 节点类型、来源任务、静态前驱和尝试预算沿用输入；任务与非空 run_id 必须在同一事务内提交。
+    /// Scope 任务的 scope_id 设为自身 task_id，其他任务沿用输入 scope_id。
+    /// 节点类型、来源任务、静态前驱和尝试预算沿用输入；任务及其运行、作用域身份必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
@@ -77,16 +81,16 @@ pub trait TaskStore: Sync {
     ///
     /// 待处理任务必须同时满足：
     /// - 状态为 pending / running，未持有租约或租约已过期。
-    /// - JOIN 要求记录中 `depends_on_names` 的每个前驱，在同一 `workflow_id + run_id`
-    ///   下至少存在一个实例，且全部实例均已成功；同为 NULL 的 run_id 视为同组。
+    /// - JOIN 要求记录中 `depends_on_names` 的每个前驱，在同一 `workflow_id + run_id + scope_id`
+    ///   下至少存在一个实例，且全部实例均已成功；run_id、scope_id 各自按 NULL 相等判定。
     ///   skipped / failed / superseded 均不算成功。前驱集合为空时不增加此项限制
     ///   （图规划的失败后继当前使用空集合）；普通任务不使用前驱名作认领闸门。
     /// `parent_task_ids` 只记录来源，不参与认领资格判断。
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
-    /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入固定 300 秒租约。
+    /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入 300 秒租约。
     /// 返回的 attempt <= max_attempts 时执行业务；超过上限时只做最终失败结算，不再执行节点。
-    /// 首次认领耗尽任务时必须持久化 error：末次租约过期记录执行窗口超时，无租约则记录预算耗尽。
+    /// 首次认领耗尽任务时必须持久化 error：末次租约过期记录租约失效，无租约则记录预算耗尽。
     /// 后续认领保留该原因，使最终失败处理在崩溃或结算失败后仍可恢复。
     fn claim_many<'a>(
         &'a self,
@@ -95,16 +99,28 @@ pub trait TaskStore: Sync {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>>;
 
+    /// 将仍有效的认领延长至数据库当前时间 + LEASE_DURATION，返回新截止时间。
+    ///
+    /// 原子校验 workflow_id、task_id、claimed_by、attempt、running 状态和尚未过期的租约。
+    /// 失权、已结算或过期返回 None，不能复活过期认领；数据库错误单独返回 Err。
+    /// 续租不递增 attempt，也适用于超过业务尝试预算的最终失败结算认领。
+    fn renew_claim<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error>>;
+
     /// 在同一事务内写入产物、标记成功并入队全部成功后继。
     ///
     /// 必须校验当前有效认领且 attempt <= max_attempts；旧执行者和仅用于最终失败的认领不能提交成功。
-    /// 成功后继记录源任务 ID，并继承结算时最新的任务身份（如 `run_id`）。
-    /// 普通后继每条输入创建独立任务。JOIN 按同一 workflow、run、节点名汇入已有
+    /// 成功后继记录源任务 ID，并继承结算时最新的 run_id、scope_id；creates_scope 为 true
+    /// 或目标为 Scope 节点时改用自身 task_id 建立新作用域，二者同时出现仍只建立一个作用域。
+    /// creates_scope 为 true 的 JOIN 规划必须拒绝，不能在新作用域中等待外部前驱。
+    /// 普通/Scope 后继每条输入创建独立任务。JOIN 按同一 workflow、run、scope、节点名汇入已有
     /// pending / running JOIN，parent_task_ids 取去重并集，输入通过 [`merge_join_input`] 累积。
     /// 新任务的 parent_task_ids 为仅包含源任务 ID 的数组。
     /// 前驱成功、来源累积、JOIN 输入合并与后继创建必须在同一事务提交，且并发首次
     /// 汇入不能创建重复 JOIN。认领校验与原子结算保证同一父任务不会重复生成后继。
-    /// 新建 JOIN 如已有静态前驱永久 failed，应直接标记 failed。
+    /// 新建 JOIN 如同作用域已有静态前驱永久 failed，应直接标记 failed。
     fn settle_success<'a>(
         &'a self,
         task: &'a TaskRecord,
@@ -115,7 +131,7 @@ pub trait TaskStore: Sync {
     /// 在同一事务内结算失败，并入队失败后继或级联已有依赖任务。
     ///
     /// `successors` 非空时标记 `superseded`；为空时标记 `failed`，并将同一工作流、
-    /// 同一 run 内以源节点名为静态前驱的已有 pending JOIN 标记失败。
+    /// 同一 run、scope 内以源节点名为静态前驱的已有 pending JOIN 标记失败。
     /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
     /// 失败后继同样将源任务 ID 写入 parent_task_ids，使用与成功后继相同的创建和 JOIN 汇合规则。
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
