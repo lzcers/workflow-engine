@@ -5,5 +5,5 @@ pub(crate) mod scope;
 pub(crate) mod store;
 
 pub use record::{Task, TaskRecord, TaskStatus};
-pub use scope::{JoinDependency, JoinState, ScopeRecord};
-pub(crate) use store::{FanoutPlan, TaskStore};
+pub use scope::ScopeRecord;
+pub(crate) use store::TaskStore;

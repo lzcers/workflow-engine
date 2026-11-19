@@ -5,7 +5,8 @@ use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
 use super::{SqliteTaskRepo, SqliteTaskStore, migrate};
 use crate::error::StorageError;
-use crate::task::{FanoutPlan, TaskStore};
+use crate::graph::{Successor, TaskType};
+use crate::task::TaskStore;
 use crate::{Task, TaskRecord, TaskStatus};
 
 async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
@@ -15,7 +16,7 @@ async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
         .await
         .unwrap();
     migrate(&pool).await.unwrap();
-    let repo = SqliteTaskRepo::new(pool.clone());
+    let repo = SqliteTaskRepo::new(pool.clone(), Default::default());
     (pool, repo)
 }
 
@@ -30,15 +31,13 @@ async fn get(repo: &SqliteTaskRepo, task: &TaskRecord) -> TaskRecord {
         .unwrap()
 }
 
-fn plan(dst: &'static str, task_type: &'static str, inputs: Vec<Value>) -> FanoutPlan {
-    FanoutPlan {
+fn plan(dst: &'static str, task_type: TaskType, inputs: Vec<Value>) -> Successor {
+    Successor {
         foreach: false,
-        edge_id: dst.to_owned(),
-        source_subgraph_path: vec![],
+
         destination_subgraph_path: vec![],
         predecessor_subgraph_paths: Default::default(),
-        join_incoming_edges: Default::default(),
-        join_upstream_names: vec![],
+
         dst,
         task_type,
         inputs,
@@ -48,6 +47,12 @@ fn plan(dst: &'static str, task_type: &'static str, inputs: Vec<Value>) -> Fanou
 #[tokio::test]
 async fn migration_is_idempotent_and_task_values_round_trip() {
     let (pool, repo) = memory_repo().await;
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('tasks')")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(columns.iter().any(|name| name == "depends_on_names"));
+    assert!(!columns.iter().any(|name| name == "join_state"));
     let store = SqliteTaskStore::new(repo.clone());
     let mut input = new_task("workflow", "root");
     input.run_id = Some(42);
@@ -92,7 +97,8 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert_eq!(get(&repo, &first).await.output, Some(output));
 
     let mut tx = pool.begin().await.unwrap();
-    let rolled_back = SqliteTaskRepo::insert_task(&mut tx, &new_task("workflow", "rollback"))
+    let rolled_back = repo
+        .insert_task(&mut tx, &new_task("workflow", "rollback"))
         .await
         .unwrap();
     assert_eq!(rolled_back.run_id, Some(rolled_back.task_id));
@@ -110,6 +116,26 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     );
     assert_eq!(next.run_id, Some(next.task_id));
     assert_ne!(next.run_id, second.run_id);
+
+    let scoped = repo
+        .enqueue(&Task {
+            run_id: first.run_id,
+            subgraph_path: vec!["analysis".into()],
+            ..new_task("workflow", "analysis.entry")
+        })
+        .await
+        .unwrap();
+    for (run_id, scope_id) in [(first.run_id, Some(i64::MAX)), (Some(43), scoped.scope_id)] {
+        let invalid = Task {
+            run_id,
+            scope_id,
+            ..new_task("workflow", "invalid_scope")
+        };
+        assert!(matches!(
+            repo.enqueue(&invalid).await,
+            Err(StorageError::InvalidFanout { .. })
+        ));
+    }
 }
 
 #[tokio::test]
@@ -126,7 +152,7 @@ async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
     assert_eq!(child.run_id, root.run_id);
     assert_eq!(child.max_attempts, 5);
     assert_eq!(child.parent_task_ids, [root.task_id]);
-    assert_eq!(child.join_state.expected[0].name, "root");
+    assert_eq!(child.depends_on_names[0], "root");
     let mut missing = new_task("deps", "missing_dependency");
     missing.run_id = root.run_id;
     missing.task_type = "join".into();
@@ -151,10 +177,18 @@ async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
             .unwrap()
             .is_empty()
     );
-    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
+    assert!(
+        repo.executable_workflow_ids("deps")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     repo.succeed(&claimed[0], &json!(null)).await.unwrap();
-    assert_eq!(repo.executable_workflow_ids().await.unwrap(), ["deps"]);
+    assert_eq!(
+        repo.executable_workflow_ids("deps").await.unwrap(),
+        ["deps"]
+    );
     let claimed = repo.claim_many("deps", "worker-b", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, child.task_id);
@@ -200,7 +234,10 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(repo.executable_workflow_ids().await.unwrap(), ["retry"]);
+    assert_eq!(
+        repo.executable_workflow_ids("retry").await.unwrap(),
+        ["retry"]
+    );
     let recovery = repo
         .claim_many("retry", "recovery", 1)
         .await
@@ -252,7 +289,12 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
     assert!(exhausted.lease_until.is_none());
     assert_eq!(exhausted.error, recovery.error);
     assert_eq!(get(&repo, &child).await.status, TaskStatus::Failed);
-    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
+    assert!(
+        repo.executable_workflow_ids("retry")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     let mut zero = new_task("zero", "root");
     zero.max_attempts = 0;
@@ -307,21 +349,15 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         images.iter().map(|task| task.task_id).collect::<Vec<_>>()
     );
 
-    let contribution = |source: &str, input| FanoutPlan {
-        edge_id: source.to_owned(),
-        join_incoming_edges: [
-            ("image".into(), "image".into()),
-            ("text".into(), "text".into()),
-        ]
-        .into(),
+    let contribution = |input| Successor {
         predecessor_subgraph_paths: [("image".into(), vec![]), ("text".into(), vec![])].into(),
-        ..plan("collect", "join", vec![input])
+        ..plan("collect", TaskType::Join, vec![input])
     };
     store
         .settle_success(
             &claimed[0],
             &json!("a"),
-            &[contribution("image", json!({"image": "a"}))],
+            &[contribution(json!({"image": "a"}))],
         )
         .await
         .unwrap();
@@ -342,7 +378,7 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         .settle_success(
             &claimed[1],
             &json!("b"),
-            &[contribution("image", json!({"image": "b"}))],
+            &[contribution(json!({"image": "b"}))],
         )
         .await
         .unwrap();
@@ -373,7 +409,7 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         .settle_success(
             &text_claim,
             &json!("text"),
-            &[contribution("text", json!({"text": "text"}))],
+            &[contribution(json!({"text": "text"}))],
         )
         .await
         .unwrap();
@@ -415,11 +451,9 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
     }
     let sources = repo.claim_many("fanin", "worker", 10).await.unwrap();
     for source in &sources {
-        let contribution = FanoutPlan {
-            edge_id: "image".into(),
-            join_incoming_edges: [("image".into(), "image".into())].into(),
+        let contribution = Successor {
             predecessor_subgraph_paths: [("image".into(), vec![])].into(),
-            ..plan("collect", "join", vec![source.input.clone()])
+            ..plan("collect", TaskType::Join, vec![source.input.clone()])
         };
         repo.succeed_and_enqueue(source, &source.input, &[contribution], 3)
             .await
@@ -450,13 +484,15 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         .await
         .unwrap()
         .remove(0);
-    let valid = plan("child", "normal", vec![json!("a"), json!("b")]);
-    let scoped = FanoutPlan {
+    let valid = plan("child", TaskType::Normal, vec![json!("a"), json!("b")]);
+    let scoped = Successor {
         foreach: true,
         destination_subgraph_path: vec!["analysis".into()],
         ..valid.clone()
     };
-    let invalid = plan("invalid", "unsupported", vec![json!({})]);
+    let invalid = plan("invalid", TaskType::Normal, vec![json!({})]);
+    sqlx::query("CREATE TRIGGER reject_invalid BEFORE INSERT ON tasks WHEN NEW.name = 'invalid' BEGIN SELECT RAISE(ABORT, 'invalid successor'); END")
+        .execute(&pool).await.unwrap();
     assert!(
         store
             .settle_success(&claimed, &json!({"done": true}), &[valid.clone(), invalid])
@@ -531,12 +567,13 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert!(claimed.attempt > claimed.max_attempts);
     assert_eq!(expired.scope_id, task.scope_id);
     assert_eq!(claimed.scope_id, task.scope_id);
-    let recovery = FanoutPlan {
-        source_subgraph_path: vec!["analysis".into()],
+    let recovery = Successor {
         destination_subgraph_path: vec!["analysis".into()],
-        ..plan("recovery", "normal", vec![json!({"retry": true})])
+        ..plan("recovery", TaskType::Normal, vec![json!({"retry": true})])
     };
-    let invalid = plan("invalid", "unsupported", vec![json!({})]);
+    let invalid = plan("invalid", TaskType::Normal, vec![json!({})]);
+    sqlx::query("CREATE TRIGGER reject_invalid BEFORE INSERT ON tasks WHEN NEW.name = 'invalid' BEGIN SELECT RAISE(ABORT, 'invalid successor'); END")
+        .execute(&pool).await.unwrap();
     let message = claimed.error.as_deref().unwrap();
     assert!(matches!(
         store
@@ -600,7 +637,11 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
         .settle_failure(
             &source,
             "retry requested",
-            &[plan("retry", "normal", vec![json!({"retry": true})])],
+            &[plan(
+                "retry",
+                TaskType::Normal,
+                vec![json!({"retry": true})],
+            )],
         )
         .await
         .unwrap();
@@ -890,7 +931,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
     let before = serde_json::to_value(&second).unwrap();
     let store = SqliteTaskStore::new(repo.clone());
     assert!(store.renew_claim(&first).await.unwrap().is_none());
-    let fanout = plan("forbidden", "normal", vec![json!("stale")]);
+    let fanout = plan("forbidden", TaskType::Normal, vec![json!("stale")]);
     for result in [
         repo.release_claim(&first).await,
         store
@@ -1049,8 +1090,8 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     let pool_a = file.connect().await;
     migrate(&pool_a).await.unwrap();
     let pool_b = file.connect().await;
-    let repo_a = SqliteTaskRepo::new(pool_a.clone());
-    let repo_b = SqliteTaskRepo::new(pool_b.clone());
+    let repo_a = SqliteTaskRepo::new(pool_a.clone(), Default::default());
+    let repo_b = SqliteTaskRepo::new(pool_b.clone(), Default::default());
     for i in 0..40 {
         repo_a
             .enqueue(&new_task("concurrent", &format!("task-{i}")))
@@ -1101,11 +1142,13 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
             repo.succeed_and_enqueue(
                 source,
                 &source.input,
-                &[FanoutPlan {
-                    edge_id: "worker".into(),
-                    join_incoming_edges: [("worker".into(), "worker".into())].into(),
+                &[Successor {
                     predecessor_subgraph_paths: [("worker".into(), vec![])].into(),
-                    ..plan("collect", "join", vec![json!({"worker": source.input})])
+                    ..plan(
+                        "collect",
+                        TaskType::Join,
+                        vec![json!({"worker": source.input})],
+                    )
                 }],
                 3,
             )
@@ -1155,7 +1198,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
 
     let reopened = file.connect().await;
     migrate(&reopened).await.unwrap();
-    let repo = SqliteTaskRepo::new(reopened.clone());
+    let repo = SqliteTaskRepo::new(reopened.clone(), Default::default());
     let rows = repo.list_all("concurrent").await.unwrap();
     assert_eq!(rows.len(), 40);
     let saved = repo.get("concurrent", task_id).await.unwrap().unwrap();

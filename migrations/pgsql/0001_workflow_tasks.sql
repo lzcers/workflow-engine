@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempt     INT    NOT NULL DEFAULT 0,
     max_attempts INT   NOT NULL DEFAULT 3,
     task_type      TEXT   NOT NULL DEFAULT 'normal',
-    join_state JSONB NOT NULL DEFAULT '{"expected":[],"arrivals":{},"upstream":[]}',
+    depends_on_names TEXT[] NOT NULL DEFAULT '{}',
     input_json  JSONB  NOT NULL,
     output_json JSONB,
     error       TEXT,
@@ -48,14 +48,14 @@ COMMENT ON COLUMN tasks.run_id IS '运行分组键；与 scope_id 一起限定 J
 COMMENT ON COLUMN tasks.scope_id IS '运行内的执行分组；实例及父子关系保存在 scopes 表；进入子图创建实例，退出恢复父实例，NULL 为运行根作用域。';
 COMMENT ON COLUMN tasks.parent_task_ids IS '来源任务 ID 数组，引用同一 workflow_id 下的 task_id；入口为空，成功和失败后继均记录源任务，JOIN 累积并去重所有贡献者；仅用于溯源，不要求来源任务成功。';
 COMMENT ON COLUMN tasks.task_id IS '工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一，用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。';
-COMMENT ON COLUMN tasks.task_type IS '节点声明的任务类型：normal 为普通节点，event 为外部事件入口，join 为汇合节点；JOIN 按 join_state 等待预期贡献及上游生产结束。';
+COMMENT ON COLUMN tasks.task_type IS '节点声明的任务类型：normal 为普通节点，event 为外部事件入口，join 为汇合节点；JOIN 按 depends_on_names 和 scopes 父子关系等待来源成功及图中的上游生产结束。';
 COMMENT ON COLUMN tasks.name IS '工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。';
 COMMENT ON COLUMN tasks.status IS '任务状态：pending 待认领，running 已认领，succeeded 成功，failed 永久失败，skipped 跳过，superseded 失败已由后继接管。';
 COMMENT ON COLUMN tasks.claimed_by IS '最近一次认领任务的 worker 标识；未认领时为 NULL，任务结算后保留，不代表租约仍有效。';
 COMMENT ON COLUMN tasks.lease_until IS '本次认领的租约截止时间，执行及结算期间持续续租；NULL 表示无有效租约，pending/running 任务在无租约或到期后可按依赖重新认领；结算或释放时清空。';
 COMMENT ON COLUMN tasks.attempt IS '认领代次；初始为 0，每次认领加 1，用于写入校验；超过 max_attempts 的认领只处理最终失败，不再执行业务。';
 COMMENT ON COLUMN tasks.max_attempts IS '该任务行的业务执行次数上限，默认 3（含首次）；耗尽后重新认领并通过统一失败流程结算，失败边新建任务单独计数。';
-COMMENT ON COLUMN tasks.join_state IS 'JOIN 预期来源、入边贡献以及上游生产屏障；与业务输入分离。';
+COMMENT ON COLUMN tasks.depends_on_names IS 'JOIN 所需的前驱节点名；通过 scopes 父子关系确定实例范围，上游生产结束条件由执行图提供。';
 COMMENT ON COLUMN tasks.input_json IS '节点输入的 JSON 值；结构由节点输入类型决定，JOIN 输入按前驱节点名汇聚。';
 COMMENT ON COLUMN tasks.output_json IS '节点成功输出的 JSON 值；结构由节点输出类型决定，尚未写入输出时为 SQL NULL。';
 COMMENT ON COLUMN tasks.error IS '失败、跳过或被后继接管的原因文本，也记录重试预算耗尽及依赖失败原因；成功结算时清空。';

@@ -1,6 +1,6 @@
 //! [`PgTaskStore`]：通用引擎 [`crate::task::TaskStore`] 的 pgsql 实现。
 //!
-//! 通过 [`PgTaskRepo`] 供多个工作流共享，接收任务模块定义的后继计划，
+//! 通过 [`PgTaskRepo`] 使用当前工作流的上游关系，接收图规划的后继，
 //! 不感知任何业务字段。
 
 use futures::future::BoxFuture;
@@ -8,10 +8,11 @@ use serde_json::Value;
 
 use super::repo::PgTaskRepo;
 use crate::error::StorageError;
-use crate::task::{FanoutPlan, TaskStore};
+use crate::graph::Successor;
+use crate::task::TaskStore;
 use crate::{Task, TaskRecord};
 
-/// 共享任务存储：通过 `PgTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
+/// 工作流任务存储：通过 `PgTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
 #[derive(Clone)]
 pub struct PgTaskStore {
     repo: PgTaskRepo,
@@ -62,7 +63,7 @@ impl TaskStore for PgTaskStore {
         &'a self,
         task: &'a TaskRecord,
         output: &'a Value,
-        successors: &'a [FanoutPlan],
+        successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.repo
@@ -77,7 +78,7 @@ impl TaskStore for PgTaskStore {
         &'a self,
         task: &'a TaskRecord,
         message: &'a str,
-        successors: &'a [FanoutPlan],
+        successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.repo

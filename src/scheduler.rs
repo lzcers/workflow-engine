@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::{
     graph::{Graph, Successor},
     node::{NodeContext, NodeError},
-    task::{FanoutPlan, TaskRecord, TaskStore, store::LEASE_DURATION},
+    task::{TaskRecord, TaskStore, store::LEASE_DURATION},
 };
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -154,12 +154,12 @@ enum ExecutionOutcome<Ctx> {
     Success {
         context: Ctx,
         output: Value,
-        successors: Vec<FanoutPlan>,
+        successors: Vec<Successor>,
     },
     Failure {
         context: Option<Ctx>,
         error: NodeError,
-        successors: Vec<FanoutPlan>,
+        successors: Vec<Successor>,
     },
 }
 
@@ -297,7 +297,7 @@ where
                 return ExecutionOutcome::Success {
                     context,
                     output,
-                    successors: successors.into_iter().map(FanoutPlan::from).collect(),
+                    successors,
                 };
             }
             // 无法规划成功后继时，按不可重试的业务错误进入失败路径。
@@ -320,7 +320,7 @@ where
 {
     warn!(error = %error, "task failed");
     let successors = match graph.plan_failure(&task.name, &task.input, &error) {
-        Ok(successors) => successors.into_iter().map(FanoutPlan::from).collect(),
+        Ok(successors) => successors,
         Err(error) => {
             warn!(error = %error, "plan failure successors failed");
             Vec::new()
@@ -376,24 +376,6 @@ where
                 None => graph.context().fork(task).await,
             };
             graph.on_error(&task.name, &mut context, &error).await;
-        }
-    }
-}
-
-/// 存储只接收入队计划，不依赖图类型。
-impl From<Successor> for FanoutPlan {
-    fn from(s: Successor) -> Self {
-        FanoutPlan {
-            dst: s.dst,
-            task_type: s.task_type.as_str(),
-            edge_id: s.edge_id,
-            foreach: s.foreach,
-            source_subgraph_path: s.source_subgraph_path,
-            destination_subgraph_path: s.destination_subgraph_path,
-            predecessor_subgraph_paths: s.predecessor_subgraph_paths,
-            join_incoming_edges: s.join_incoming_edges,
-            join_upstream_names: s.join_upstream_names,
-            inputs: s.inputs,
         }
     }
 }

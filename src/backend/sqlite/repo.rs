@@ -4,30 +4,31 @@
 //! before reading. This serializes competing claimers and fan-in updates without
 //! relying on PostgreSQL row locks or upgrading a deferred read transaction.
 
+use std::{collections::HashMap, sync::Arc};
+
 use super::{join, scope};
-use crate::task::{
-    JoinState,
-    scope::{ScopeEntries, join_state},
-};
+use crate::task::scope::{ScopeEntries, dependency_names};
 use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
-use crate::task::FanoutPlan;
+use crate::graph::Successor;
+use crate::node::TaskType;
 use crate::{Task, TaskRecord, TaskStatus};
 
 use crate::task::store::{LEASE_DURATION, merge_join_input};
 
 /// Columns suitable for application queries against the same task table.
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
-    claimed_by, lease_until, attempt, max_attempts, task_type, join_state, \
+    claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
     input_json, output_json, error, created_at, updated_at";
 
-/// Workflow task repository. Clones share the same connection pool.
+/// One graph's task repository. Clones share its connection pool and upstream names.
 #[derive(Clone)]
 pub struct SqliteTaskRepo {
     pool: SqlitePool,
+    upstreams: Arc<HashMap<String, Vec<String>>>,
 }
 
 /// Allocate a workflow-local task ID inside the caller's transaction.
@@ -59,10 +60,10 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
 
 /// Implements the JOIN predecessor/lease gate in [`crate::task::TaskStore::claim_many`]
 /// for both claim and recovery. Parent IDs record provenance, not execution dependencies.
-fn executable_where() -> String {
+fn executable_where(upstream_parameter: &str) -> String {
     format!(
         "wt.status IN ('pending', 'running') AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now')) AND ({})",
-        join::ready()
+        join::ready(upstream_parameter)
     )
 }
 
@@ -70,29 +71,28 @@ fn executable_where() -> String {
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     source: &TaskRecord,
-    plan: &FanoutPlan,
+    plan: &Successor,
     max_attempts: i32,
     entries: &mut ScopeEntries,
 ) -> Result<(), StorageError> {
-    if plan.foreach && plan.task_type == "join" {
+    if plan.foreach && plan.task_type == TaskType::Join {
         return Err(StorageError::InvalidFanout {
             detail: "foreach cannot target a JOIN node".into(),
         });
     }
-    for (index, input) in plan.inputs.iter().enumerate() {
+    for input in &plan.inputs {
         let scope_id = scope::route(
             tx,
             &source.workflow_id,
             source.run_id,
             source.scope_id,
-            &plan.source_subgraph_path,
             &plan.destination_subgraph_path,
             source.task_id,
-            plan.foreach.then(|| (plan.edge_id.clone(), index)),
+            plan.foreach,
             entries,
         )
         .await?;
-        let existing = if plan.task_type == "join" {
+        let existing = if plan.task_type == TaskType::Join {
             sqlx::query_as::<_, TaskRow>(&format!(
                 "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND name=?2 AND run_id IS ?3 AND scope_id IS ?4 AND task_type='join' AND status IN ('pending','running') ORDER BY task_id LIMIT 1"
             )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
@@ -107,13 +107,11 @@ async fn enqueue_fanout_in_tx(
             }
             let mut input_json = existing.input_json;
             merge_join_input(&mut input_json, input);
-            let mut state = existing.join_state;
-            state.arrive(&plan.edge_id, source.task_id);
-            sqlx::query("UPDATE tasks SET parent_task_ids=?3, input_json=?4, join_state=?5, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE workflow_id=?1 AND task_id=?2")
-                .bind(&source.workflow_id).bind(existing.task_id).bind(Json(parents)).bind(input_json).bind(Json(state))
+            sqlx::query("UPDATE tasks SET parent_task_ids=?3, input_json=?4, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE workflow_id=?1 AND task_id=?2")
+                .bind(&source.workflow_id).bind(existing.task_id).bind(Json(parents)).bind(input_json)
                 .execute(&mut **tx).await?;
         } else {
-            let mut state = if plan.task_type == "join" {
+            let dependencies = if plan.task_type == TaskType::Join {
                 let chain = scope::chain(tx, &source.workflow_id, scope_id).await?;
                 let mut entry_names = std::collections::HashMap::new();
                 for scope in &chain {
@@ -130,17 +128,14 @@ async fn enqueue_fanout_in_tx(
                         entry.insert(name);
                     }
                 }
-                join_state(plan, &chain, &entry_names)?
+                dependency_names(plan, &chain, &entry_names)?
             } else {
-                JoinState::default()
+                Vec::new()
             };
-            if plan.task_type == "join" {
-                state.arrive(&plan.edge_id, source.task_id);
-            }
             let task_id = allocate_task_id(tx, &source.workflow_id).await?;
-            sqlx::query("INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,task_type,parent_task_ids,join_state,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10)")
+            sqlx::query("INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,task_type,parent_task_ids,depends_on_names,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10)")
                 .bind(&source.workflow_id).bind(task_id).bind(source.run_id).bind(plan.dst)
-                .bind(max_attempts).bind(plan.task_type).bind(Json(vec![source.task_id])).bind(Json(state)).bind(input).bind(scope_id)
+                .bind(max_attempts).bind(plan.task_type.as_str()).bind(Json(vec![source.task_id])).bind(Json(dependencies)).bind(input).bind(scope_id)
                 .execute(&mut **tx).await?;
         }
     }
@@ -153,11 +148,12 @@ async fn fail_blocked_joins(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
+    upstreams: &HashMap<String, Vec<String>>,
 ) -> Result<(), StorageError> {
     loop {
         let changed = sqlx::query(&format!(
-            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='pending' AND ({})", join::failed()
-        )).bind(workflow_id).bind(run_id).execute(&mut **tx).await?.rows_affected();
+            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='pending' AND ({})", join::failed("?3")
+        )).bind(workflow_id).bind(run_id).bind(Json(upstreams)).execute(&mut **tx).await?.rows_affected();
         if changed == 0 {
             break;
         }
@@ -166,44 +162,41 @@ async fn fail_blocked_joins(
 }
 
 impl SqliteTaskRepo {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, upstreams: HashMap<String, Vec<String>>) -> Self {
+        Self {
+            pool,
+            upstreams: Arc::new(upstreams),
+        }
     }
 
     /// Insert a pending task in an application-owned transaction.
     /// Without an explicit run ID, the allocated task ID starts a new run.
     /// Start with `pool.begin_with("BEGIN IMMEDIATE")` when the transaction also reads.
     pub async fn insert_task(
+        &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         task: &Task,
     ) -> Result<TaskRecord, StorageError> {
         let task_id = allocate_task_id(tx, &task.workflow_id).await?;
         let run_id = Some(task.run_id.unwrap_or(task_id));
-        let source_path: Vec<_> = scope::chain(tx, &task.workflow_id, task.scope_id)
-            .await?
-            .into_iter()
-            .map(|scope| scope.subgraph_id)
-            .collect();
         let scope_id = scope::route(
             tx,
             &task.workflow_id,
             run_id,
             task.scope_id,
-            &source_path,
             &task.subgraph_path,
             task_id,
-            None,
+            false,
             &mut ScopeEntries::new(),
         )
         .await?;
-        let state = JoinState::from_names(&task.depends_on_names, scope_id);
         let row = sqlx::query_as::<_, TaskRow>(&format!(
-            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,parent_task_ids,join_state,input_json,task_type,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10) RETURNING {ROW_COLS}"
+            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,parent_task_ids,depends_on_names,input_json,task_type,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10) RETURNING {ROW_COLS}"
         )).bind(&task.workflow_id).bind(task_id).bind(run_id).bind(&task.name).bind(task.max_attempts)
-          .bind(Json(&task.parent_task_ids)).bind(Json(state)).bind(&task.input).bind(&task.task_type).bind(scope_id)
+          .bind(Json(&task.parent_task_ids)).bind(Json(&task.depends_on_names)).bind(&task.input).bind(&task.task_type).bind(scope_id)
           .fetch_one(&mut **tx).await?;
         if task.task_type == "join" {
-            fail_blocked_joins(tx, &task.workflow_id, run_id).await?;
+            fail_blocked_joins(tx, &task.workflow_id, run_id, &self.upstreams).await?;
             let row = sqlx::query_as::<_, TaskRow>(&format!(
                 "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND task_id=?2"
             ))
@@ -219,7 +212,7 @@ impl SqliteTaskRepo {
     /// Enqueue in the supplied run, or atomically create a run using the new task ID.
     pub async fn enqueue(&self, task: &Task) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row = Self::insert_task(&mut tx, task).await?;
+        let row = self.insert_task(&mut tx, task).await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -230,7 +223,7 @@ impl SqliteTaskRepo {
         &self,
         task: &TaskRecord,
         output: &Value,
-        fanouts: &[FanoutPlan],
+        fanouts: &[Successor],
         max_attempts: i32,
     ) -> Result<TaskRecord, StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -265,7 +258,7 @@ impl SqliteTaskRepo {
             )
             .await?;
         }
-        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id).await?;
+        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id, &self.upstreams).await?;
         tx.commit().await?;
         Ok(settled.into())
     }
@@ -275,7 +268,7 @@ impl SqliteTaskRepo {
         &self,
         task: &TaskRecord,
         error: &str,
-        fanouts: &[FanoutPlan],
+        fanouts: &[Successor],
         max_attempts: i32,
     ) -> Result<(), StorageError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -316,7 +309,7 @@ impl SqliteTaskRepo {
             )
             .await?;
         }
-        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id).await?;
+        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id, &self.upstreams).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -404,7 +397,7 @@ impl SqliteTaskRepo {
         worker: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
-        let executable_where = executable_where();
+        let executable_where = executable_where("?5");
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -434,6 +427,7 @@ impl SqliteTaskRepo {
         .bind(worker)
         .bind(LEASE_DURATION.as_secs() as i64)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(Json(self.upstreams.as_ref()))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -451,16 +445,21 @@ impl SqliteTaskRepo {
         Ok(rows.into_iter().map(TaskRecord::from).collect())
     }
 
-    /// Workflows with claimable execution or final failure settlement work.
-    pub async fn executable_workflow_ids(&self) -> Result<Vec<String>, StorageError> {
-        let executable_where = executable_where();
+    /// Whether this workflow has claimable execution or final failure settlement work.
+    pub async fn executable_workflow_ids(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let executable_where = executable_where("?2");
         Ok(sqlx::query_scalar(&format!(
             r#"
             SELECT DISTINCT wt.workflow_id FROM tasks wt
-            WHERE {executable_where}
+            WHERE wt.workflow_id = ?1 AND {executable_where}
             ORDER BY wt.workflow_id
             "#
         ))
+        .bind(workflow_id)
+        .bind(Json(self.upstreams.as_ref()))
         .fetch_all(&self.pool)
         .await?)
     }
@@ -491,7 +490,7 @@ impl SqliteTaskRepo {
     }
 
     pub async fn fail(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
-        self.set_terminal(task, TaskStatus::Failed.as_str(), error)
+        self.fail_and_enqueue(task, error, &[], task.max_attempts)
             .await
     }
 

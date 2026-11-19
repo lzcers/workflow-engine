@@ -372,21 +372,19 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
         .plan_success("batch.fetch", &serde_json::json!({}))
         .unwrap();
     assert_eq!(plans.len(), 2);
-    assert_eq!(plans[0].source_subgraph_path, ["batch"]);
     assert_eq!(
         plans[0].destination_subgraph_path,
         ["batch", "batch.analysis"]
     );
     let join = &plans[1];
-    assert_eq!(join.join_incoming_edges.len(), 2);
-    assert_eq!(
-        join.join_upstream_names,
-        ["batch.analysis.signal", "batch.fetch", "source"]
-    );
-    assert_eq!(
-        join.predecessor_subgraph_paths["source"],
-        Vec::<String>::new()
-    );
+    let mut predecessors: Vec<_> = join
+        .predecessor_subgraph_paths
+        .keys()
+        .map(String::as_str)
+        .collect();
+    predecessors.sort();
+    assert_eq!(predecessors, ["batch.analysis.signal", "batch.fetch"]);
+    assert_eq!(join.predecessor_subgraph_paths["batch.fetch"], ["batch"]);
     let exit = graph
         .plan_success("batch.analysis.join", &serde_json::json!({}))
         .unwrap();

@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。
     run_id INTEGER,
     -- 运行内的 JOIN 隔离域；实例及父子关系保存在 scopes 表，进入子图创建实例，退出恢复父实例。
-    -- NULL 表示运行根作用域；跨边界 JOIN 来源由 join_state 绑定到具体入口或子实例。
+    -- NULL 表示运行根作用域；跨边界 JOIN 按 scopes 父子关系及入口任务匹配来源。
     scope_id INTEGER,
     -- 工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一。
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。
@@ -44,9 +44,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_attempts INTEGER NOT NULL DEFAULT 3,
     -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；join 汇合节点。
     task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event')),
-    -- JOIN 的预期来源、实际入边贡献和上游生产屏障。
-    join_state TEXT NOT NULL DEFAULT '{"expected":[],"arrivals":{},"upstream":[]}'
-        CHECK (json_valid(join_state)),
+    -- JOIN 当前调用需要等待的前驱节点名；匹配范围由 scopes 父子关系确定。
+    depends_on_names TEXT NOT NULL DEFAULT '[]'
+        CHECK (json_valid(depends_on_names) AND json_type(depends_on_names) = 'array'),
     -- 节点输入的 JSON 文本；结构由节点输入类型决定，JOIN 输入按前驱节点名汇聚。
     input_json TEXT NOT NULL CHECK (json_valid(input_json)),
     -- 节点成功输出的 JSON 文本；结构由节点输出类型决定，尚未写入输出时为 SQL NULL。

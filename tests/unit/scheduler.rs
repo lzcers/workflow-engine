@@ -25,7 +25,8 @@ use crate::{
     Graph, Node, NodeContext, NodeError, Task, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
     edge::on_error,
-    task::{FanoutPlan, TaskStore, store::LEASE_DURATION},
+    graph::Successor,
+    task::{TaskStore, store::LEASE_DURATION},
 };
 
 struct Context {
@@ -107,7 +108,7 @@ async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
         .await
         .unwrap();
     migrate(&pool).await.unwrap();
-    let repo = SqliteTaskRepo::new(pool.clone());
+    let repo = SqliteTaskRepo::new(pool.clone(), Default::default());
     (pool, repo)
 }
 
@@ -352,7 +353,7 @@ impl TaskStore for Store {
         &'a self,
         _: &'a TaskRecord,
         _: &'a Value,
-        _: &'a [FanoutPlan],
+        _: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move {
             self.settlements.fetch_add(1, Ordering::SeqCst);
@@ -368,7 +369,7 @@ impl TaskStore for Store {
         &'a self,
         _: &'a TaskRecord,
         _: &'a str,
-        _: &'a [FanoutPlan],
+        _: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), Self::Error>> {
         Box::pin(async { panic!("lease loss must not be recorded as a business failure") })
     }
@@ -461,7 +462,7 @@ fn claim() -> TaskRecord {
         attempt: 1,
         max_attempts: 1,
         task_type: "normal".into(),
-        join_state: Default::default(),
+        depends_on_names: Vec::new(),
         input: json!(7),
         output: None,
         error: None,

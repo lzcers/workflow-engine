@@ -82,7 +82,6 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         #[cfg(feature = "pg")]
         Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
     };
-    let repo = SqliteTaskRepo::new(pool);
 
     // start ─┬─ worker × 2 ─┬─ collect (JOIN) ─ total
     //        └─ summary ────┘
@@ -110,6 +109,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     }
     .unwrap();
 
+    let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
     let root = repo
         .enqueue(&Task::new("dsl-workflow", "start", json!(0)))
         .await
@@ -187,12 +187,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     );
     let join = tasks.iter().find(|task| task.name == "collect").unwrap();
     assert_eq!(join.task_type, "join");
-    let mut predecessors = join
-        .join_state
-        .expected
-        .iter()
-        .map(|dependency| dependency.name.clone())
-        .collect::<Vec<_>>();
+    let mut predecessors = join.depends_on_names.clone();
     predecessors.sort();
     assert_eq!(predecessors, ["summary", "worker"]);
     let mut parent_ids = join.parent_task_ids.clone();
@@ -228,7 +223,12 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .find(|task| task.name == "total")
         .unwrap();
     assert_eq!(other_total.output, Some(json!(316)));
-    assert!(repo.executable_workflow_ids().await.unwrap().is_empty());
+    assert!(
+        repo.executable_workflow_ids("dsl-workflow")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     database.close().await;
 }
 
@@ -241,7 +241,6 @@ async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
         #[cfg(feature = "pg")]
         Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
     };
-    let repo = SqliteTaskRepo::new(pool);
     let (completed, mut completions) = mpsc::unbounded_channel();
     let graph = dsl::workflow! {
         workflow_id: "nested-fanout";
@@ -260,6 +259,7 @@ async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
         }
     }
     .unwrap();
+    let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
     let root = repo
         .enqueue(&Task::new("nested-fanout", "start", json!(0)))
         .await
@@ -364,7 +364,6 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
             #[cfg(feature = "pg")]
             Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
         };
-        let repo = SqliteTaskRepo::new(pool);
         let starts: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         let releases: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         macro_rules! report_graph {
@@ -410,6 +409,7 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
             report_graph!(Item; |> |output| output.clone())
         }
         .unwrap();
+        let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
         let root = repo
             .enqueue(&Task::new("scoped-reports", "start", json!(0)))
             .await
@@ -484,12 +484,7 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                 .iter()
                 .find(|task| task.name == "analysis.collect")
                 .unwrap();
-            let mut predecessors = join
-                .join_state
-                .expected
-                .iter()
-                .map(|dependency| dependency.name.clone())
-                .collect::<Vec<_>>();
+            let mut predecessors = join.depends_on_names.clone();
             predecessors.sort();
             assert_eq!(predecessors, ["analysis.per_item", "analysis.worker"]);
             let mut parents = join.parent_task_ids.clone();
@@ -532,7 +527,6 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
             #[cfg(feature = "pg")]
             Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
         };
-        let repo = SqliteTaskRepo::new(pool);
         let starts: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         let releases: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         let graph = dsl::workflow! {
@@ -565,6 +559,7 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
             }
         }
         .unwrap();
+        let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
         let root = repo
             .enqueue(&Task::new("external-entry-join", "start", json!(0)))
             .await
@@ -634,22 +629,9 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
                 .iter()
                 .find(|task| task.name == "analysis.collect" && task.scope_id == worker.scope_id)
                 .unwrap();
-            assert_eq!(join.join_state.expected.len(), 2);
-            let external = join
-                .join_state
-                .expected
-                .iter()
-                .find(|dependency| dependency.name == source.name)
-                .unwrap();
-            assert_eq!(external.task_id, Some(source.task_id));
-            assert!(
-                join.join_state
-                    .expected
-                    .iter()
-                    .any(|dependency| dependency.name == worker.name
-                        && dependency.scope_id == worker.scope_id
-                        && dependency.task_id.is_none())
-            );
+            assert_eq!(join.depends_on_names.len(), 2);
+            assert!(join.depends_on_names.contains(&source.name));
+            assert!(join.depends_on_names.contains(&worker.name));
             let mut parents = join.parent_task_ids.clone();
             parents.sort_unstable();
             assert_eq!(parents, [source.task_id, worker.task_id]);
@@ -682,7 +664,7 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         .await
         .unwrap();
     migrate(&db).await.unwrap();
-    let repo = SqliteTaskRepo::new(db.clone());
+    let repo = SqliteTaskRepo::new(db.clone(), Default::default());
     let mut task = Task {
         task_type: "normal".into(),
         workflow_id: "scheduler-wake".into(),

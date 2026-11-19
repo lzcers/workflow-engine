@@ -48,21 +48,16 @@ pub struct Graph<Ctx> {
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
 }
 
-/// 一条实际边的后继规划，保留边身份及逐项输入顺序。
-#[derive(Debug)]
+/// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
+#[derive(Debug, Clone)]
 pub struct Successor {
-    pub edge_id: String,
     pub dst: &'static str,
     pub task_type: TaskType,
-    pub foreach: bool,
-    pub source_subgraph_path: Vec<String>,
-    pub destination_subgraph_path: Vec<String>,
     pub inputs: Vec<Value>,
-    pub depends_on_names: Vec<String>,
-    /// 包含直接前驱及全部传递上游，用于解析跨子图依赖。
+    pub foreach: bool,
+    pub destination_subgraph_path: Vec<String>,
+    /// 直接前驱的静态归属，用于选择当前子图调用的有效入口。
     pub predecessor_subgraph_paths: HashMap<String, Vec<String>>,
-    pub join_incoming_edges: HashMap<String, String>,
-    pub join_upstream_names: Vec<String>,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -165,12 +160,7 @@ impl<Ctx> Graph<Ctx> {
     /// 所有成功边分别规划；不同 foreach 边不合并，也不按下标隐式配对。
     pub fn plan_success(&self, name: &str, out: &Value) -> Result<Vec<Successor>, EdgeError> {
         let mut plans = Vec::new();
-        for (index, edge) in self
-            .success_edges
-            .iter()
-            .enumerate()
-            .filter(|(_, edge)| edge.src() == name)
-        {
+        for edge in self.success_edges.iter().filter(|edge| edge.src() == name) {
             let inputs = edge.plan_success(out)?;
             if inputs.is_empty() {
                 continue;
@@ -178,38 +168,17 @@ impl<Ctx> Graph<Ctx> {
             let dst = edge.dst();
             let task_type = self.task_type_of(dst).expect("validated edge destination");
             let depends_on_names = self.predecessors_of(dst);
-            let join_upstream_names = if task_type == TaskType::Join {
-                self.upstream_names(dst)
-            } else {
-                Vec::new()
-            };
             let predecessor_subgraph_paths = depends_on_names
                 .iter()
-                .chain(&join_upstream_names)
                 .map(|name| (name.clone(), self.subgraph_path(name)))
                 .collect();
-            let join_incoming_edges = if task_type == TaskType::Join {
-                self.success_edges
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, edge)| edge.dst() == dst)
-                    .map(|(index, edge)| (format!("success:{index}"), edge.src().to_owned()))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
             plans.push(Successor {
-                edge_id: format!("success:{index}"),
                 dst,
                 task_type,
                 foreach: edge.is_foreach(),
-                source_subgraph_path: self.subgraph_path(name),
                 destination_subgraph_path: self.subgraph_path(dst),
                 inputs,
-                depends_on_names,
                 predecessor_subgraph_paths,
-                join_incoming_edges,
-                join_upstream_names,
             });
         }
         Ok(plans)
@@ -223,33 +192,32 @@ impl<Ctx> Graph<Ctx> {
         err: &NodeError,
     ) -> Result<Vec<Successor>, EdgeError> {
         let mut plans = Vec::new();
-        for (index, edge) in self
-            .failure_edges
-            .iter()
-            .enumerate()
-            .filter(|(_, edge)| edge.src() == name)
-        {
+        for edge in self.failure_edges.iter().filter(|edge| edge.src() == name) {
             let inputs = edge.plan_failure(input, err)?;
             if inputs.is_empty() {
                 continue;
             }
             plans.push(Successor {
-                edge_id: format!("failure:{index}"),
                 dst: edge.dst(),
                 task_type: self
                     .task_type_of(edge.dst())
                     .expect("validated edge destination"),
                 foreach: false,
-                source_subgraph_path: self.subgraph_path(name),
                 destination_subgraph_path: self.subgraph_path(edge.dst()),
                 inputs,
-                depends_on_names: Vec::new(),
                 predecessor_subgraph_paths: HashMap::new(),
-                join_incoming_edges: HashMap::new(),
-                join_upstream_names: Vec::new(),
             });
         }
         Ok(plans)
+    }
+
+    /// 从固定执行图派生 JOIN 生产者范围；不随任务持久化。
+    pub(crate) fn join_upstreams(&self) -> HashMap<String, Vec<String>> {
+        self.nodes
+            .iter()
+            .filter(|(_, entry)| entry.node.task_type() == TaskType::Join)
+            .map(|(&name, _)| (name.to_owned(), self.upstream_names(name)))
+            .collect()
     }
 
     fn upstream_names(&self, dst: &'static str) -> Vec<String> {

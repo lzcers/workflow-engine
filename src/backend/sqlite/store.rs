@@ -1,6 +1,6 @@
 //! [`SqliteTaskStore`]：通用引擎 [`crate::task::TaskStore`] 的 SQLite 实现。
 //!
-//! 通过 [`SqliteTaskRepo`] 供多个工作流共享，直接持久化图规划的后继输入，
+//! 通过 [`SqliteTaskRepo`] 持久化当前图规划的后继输入，
 //! 不感知任何业务字段。
 
 use futures::future::BoxFuture;
@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use super::repo::SqliteTaskRepo;
 use crate::error::StorageError;
-use crate::task::{FanoutPlan, TaskStore};
+use crate::graph::Successor;
+use crate::task::TaskStore;
 use crate::{Task, TaskRecord};
 
 /// 共享任务存储：通过 `SqliteTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
@@ -62,7 +63,7 @@ impl TaskStore for SqliteTaskStore {
         &'a self,
         task: &'a TaskRecord,
         output: &'a Value,
-        successors: &'a [FanoutPlan],
+        successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.repo
@@ -77,7 +78,7 @@ impl TaskStore for SqliteTaskStore {
         &'a self,
         task: &'a TaskRecord,
         message: &'a str,
-        successors: &'a [FanoutPlan],
+        successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.repo

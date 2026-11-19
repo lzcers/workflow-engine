@@ -7,45 +7,31 @@ use super::super::test_support::connect_test;
 use super::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR};
 use super::{PgTaskRepo, TASK_READY_CHANNEL};
 use crate::error::StorageError;
-use crate::task::FanoutPlan;
+use crate::graph::{Successor, TaskType};
 use crate::{Task, TaskRecord, TaskStatus};
 
-fn plan(dst: &'static str, task_type: &'static str, inputs: Vec<Value>) -> FanoutPlan {
-    FanoutPlan {
+fn plan(dst: &'static str, task_type: TaskType, inputs: Vec<Value>) -> Successor {
+    Successor {
         dst,
         task_type,
         inputs,
         foreach: false,
-        edge_id: dst.into(),
-        source_subgraph_path: vec![],
+
         destination_subgraph_path: vec![],
         predecessor_subgraph_paths: Default::default(),
-        join_incoming_edges: Default::default(),
-        join_upstream_names: vec![],
     }
 }
 
-fn join_plan(
-    dst: &'static str,
-    source: &str,
-    inputs: Vec<Value>,
-    names: &[&str],
-    path: &[&str],
-) -> FanoutPlan {
+fn join_plan(dst: &'static str, inputs: Vec<Value>, names: &[&str], path: &[&str]) -> Successor {
     let path: Vec<String> = path.iter().map(|name| (*name).to_owned()).collect();
-    FanoutPlan {
-        edge_id: source.into(),
-        source_subgraph_path: path.clone(),
+    Successor {
         destination_subgraph_path: path.clone(),
         predecessor_subgraph_paths: names
             .iter()
             .map(|name| ((*name).to_owned(), path.clone()))
             .collect(),
-        join_incoming_edges: names
-            .iter()
-            .map(|name| ((*name).to_owned(), (*name).to_owned()))
-            .collect(),
-        ..plan(dst, "join", inputs)
+
+        ..plan(dst, TaskType::Join, inputs)
     }
 }
 
@@ -72,7 +58,15 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='tasks'",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert!(columns.iter().any(|name| name == "depends_on_names"));
+    assert!(!columns.iter().any(|name| name == "join_state"));
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "enqueue-runs";
     let mut task = Task::new(workflow_id, "root", json!({"input": 1}));
     task.task_type = "event".into();
@@ -106,10 +100,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     assert_eq!(stored.task_type, "normal");
     assert_eq!(stored.max_attempts, child.max_attempts);
     assert_eq!(stored.parent_task_ids, child.parent_task_ids);
-    assert_eq!(
-        stored.join_state.expected[0].name,
-        child.depends_on_names[0]
-    );
+    assert_eq!(stored.depends_on_names[0], child.depends_on_names[0]);
     assert_eq!(stored.input, child.input);
     assert_eq!(stored.status, TaskStatus::Pending);
     assert_eq!(stored.attempt, 0);
@@ -133,6 +124,20 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     .await
     .unwrap();
     assert_eq!(parent, None);
+    for (run_id, scope_id) in [
+        (first.run_id, Some(i64::MAX)),
+        (second.run_id, scoped.scope_id),
+    ] {
+        let invalid = Task {
+            run_id,
+            scope_id,
+            ..Task::new(workflow_id, "invalid_scope", json!({}))
+        };
+        assert!(matches!(
+            repo.enqueue(&invalid).await,
+            Err(StorageError::InvalidFanout { .. })
+        ));
+    }
 }
 
 /// 原子成功结算：succeed + 全部后继（单条及批量输入）在同一事务内落库，
@@ -142,7 +147,7 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "succeed_and_enqueue_atomic";
     repo.enqueue(&Task {
         task_type: "normal".into(),
@@ -169,19 +174,23 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
             &source,
             &json!({"prompts": ["a", "b"]}),
             &[
-                plan("finalize_node", "normal", vec![json!({})]),
-                FanoutPlan {
+                plan("finalize_node", TaskType::Normal, vec![json!({})]),
+                Successor {
                     destination_subgraph_path: vec!["images".into()],
                     ..plan(
                         "image_generate",
-                        "normal",
+                        TaskType::Normal,
                         vec![json!({"prompt": "a"}), json!({"prompt": "b"})],
                     )
                 },
-                FanoutPlan {
+                Successor {
                     foreach: true,
                     destination_subgraph_path: vec!["images".into()],
-                    ..plan("image_generate", "normal", vec![json!({"prompt": "c"})])
+                    ..plan(
+                        "image_generate",
+                        TaskType::Normal,
+                        vec![json!({"prompt": "c"})],
+                    )
                 },
             ],
             3,
@@ -222,7 +231,7 @@ async fn normal_fanout_creates_each_input_independently() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     for (case, (foreach, count)) in [(false, 2), (true, 0), (true, 1), (true, 3)]
         .into_iter()
         .enumerate()
@@ -240,7 +249,7 @@ async fn normal_fanout_creates_each_input_independently() {
                 .find(|task| task.task_id == root.task_id)
                 .unwrap();
             let inputs: Vec<_> = (0..count).map(|item| json!({"item": item})).collect();
-            let mut fanout = plan("image_generate", "normal", inputs.clone());
+            let mut fanout = plan("image_generate", TaskType::Normal, inputs.clone());
             fanout.foreach = foreach;
             if foreach {
                 fanout.destination_subgraph_path = vec!["images".into()];
@@ -275,7 +284,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "join-parents";
     seed(&repo, workflow_id, "source", Some(42)).await;
     seed(&repo, workflow_id, "source", Some(42)).await;
@@ -288,7 +297,6 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
             &contribution,
             &[join_plan(
                 "collect",
-                "source",
                 vec![contribution.clone(), json!({"extra": source.task_id})],
                 &["source"],
                 &[],
@@ -340,7 +348,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "fail_and_enqueue_atomic";
     // 有后继：superseded + 后继入队，并保留源任务。
     repo.enqueue(&Task {
@@ -365,7 +373,11 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     repo.fail_and_enqueue(
         &retried,
         "validation failed",
-        &[plan("scene_proposal", "normal", vec![json!({"Retry": {}})])],
+        &[plan(
+            "scene_proposal",
+            TaskType::Normal,
+            vec![json!({"Retry": {}})],
+        )],
         3,
     )
     .await
@@ -446,7 +458,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     .await
     .unwrap();
     assert!(
-        repo.fail_and_enqueue(&failed, "budget exhausted", &[], 3,)
+        repo.fail_and_enqueue(&failed, "budget exhausted", &[], 3)
             .await
             .is_err()
     );
@@ -496,7 +508,7 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     async fn enqueue(repo: &PgTaskRepo, workflow_id: &str) -> TaskRecord {
         repo.enqueue(&Task {
             task_type: "normal".into(),
@@ -567,7 +579,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     async fn insert_task(repo: &PgTaskRepo, workflow_id: &str, name: &str) -> TaskRecord {
         repo.enqueue(&Task::new(workflow_id, name, json!({})))
             .await
@@ -611,7 +623,10 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
         repo.release_claim(&claim).await.unwrap();
     }
 
-    let mut sessions = repo.executable_workflow_ids().await.unwrap();
+    let mut sessions = Vec::new();
+    for workflow_id in [claimable, blocked, done, exhausted] {
+        sessions.extend(repo.executable_workflow_ids(workflow_id).await.unwrap());
+    }
     sessions.sort();
     assert_eq!(
         sessions,
@@ -626,7 +641,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "exhausted-recovery";
     let mut input = Task::new(workflow_id, "source", json!({}));
     input.max_attempts = 1;
@@ -645,7 +660,10 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     );
     sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1")
         .bind(workflow_id).execute(database.pool()).await.unwrap();
-    assert_eq!(repo.executable_workflow_ids().await.unwrap(), [workflow_id]);
+    assert_eq!(
+        repo.executable_workflow_ids(workflow_id).await.unwrap(),
+        [workflow_id]
+    );
     let recovery = repo
         .claim_many(workflow_id, "recovery", 1)
         .await
@@ -669,7 +687,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
 
     let fanout = plan(
         "handle_failure",
-        "normal",
+        TaskType::Normal,
         vec![json!({"reason": "timeout"})],
     );
     let mut invalid = fanout.clone();
@@ -748,7 +766,7 @@ async fn task_ready_notifications_carry_workflow_id() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "task_ready_notifications";
     let mut listener = PgListener::connect(database.database_url()).await.unwrap();
     listener.listen(TASK_READY_CHANNEL).await.unwrap();
@@ -781,7 +799,7 @@ async fn task_ready_notifications_carry_workflow_id() {
     repo.succeed_and_enqueue(
         &source,
         &json!({}),
-        &[plan("commit_scene", "normal", vec![json!({})])],
+        &[plan("commit_scene", TaskType::Normal, vec![json!({})])],
         3,
     )
     .await
@@ -816,7 +834,7 @@ async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i
 }
 
 async fn reject_stale_writes(repo: &PgTaskRepo, task: &TaskRecord) {
-    let fanouts = [plan("must-not-exist", "normal", vec![json!({})])];
+    let fanouts = [plan("must-not-exist", TaskType::Normal, vec![json!({})])];
     assert!(repo.renew_claim(task).await.unwrap().is_none());
     assert!(matches!(
         repo.release_claim(task).await,
@@ -858,7 +876,7 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     for max_attempts in [3, 0] {
         let workflow_id = format!("renew-{max_attempts}");
         let mut task = Task::new(&workflow_id, "root", json!({}));
@@ -912,7 +930,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "claim-fencing";
     let root = seed(&repo, workflow_id, "root", Some(7)).await;
     let old = repo
@@ -1018,7 +1036,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let schema: String = sqlx::query_scalar("SELECT current_schema()")
         .fetch_one(database.pool())
         .await
@@ -1079,7 +1097,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
         (
             right.clone(),
             ["join-b", "join-a"],
-            PgTaskRepo::new(alternate_pool.clone()),
+            PgTaskRepo::new(alternate_pool.clone(), Default::default()),
         ),
     ] {
         workers.spawn(async move {
@@ -1088,7 +1106,6 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
                 .map(|name| {
                     join_plan(
                         name,
-                        &source.name,
                         vec![json!({ source.name.clone(): source.task_id })],
                         &["left", "right"],
                         &[],
@@ -1134,7 +1151,7 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     for operation in 0..4 {
         let workflow_id = format!("lease-lock-wait-{operation}");
         seed(&repo, &workflow_id, "root", None).await;
@@ -1180,7 +1197,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     let Some(database) = connect_test().await else {
         return;
     };
-    let repo = PgTaskRepo::new(database.pool().clone());
+    let repo = PgTaskRepo::new(database.pool().clone(), Default::default());
     let workflow_id = "scoped-join";
     seed(&repo, workflow_id, "root", Some(42)).await;
     let root = repo
@@ -1191,10 +1208,14 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     repo.succeed_and_enqueue(
         &root,
         &json!(["a", "b", "c"]),
-        &[FanoutPlan {
+        &[Successor {
             foreach: true,
             destination_subgraph_path: vec!["analysis".into()],
-            ..plan("entry", "normal", vec![json!("a"), json!("b"), json!("c")])
+            ..plan(
+                "entry",
+                TaskType::Normal,
+                vec![json!("a"), json!("b"), json!("c")],
+            )
         }],
         3,
     )
@@ -1202,10 +1223,9 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     .unwrap();
     let scopes = repo.claim_many(workflow_id, "worker", 3).await.unwrap();
     for scope in &scopes {
-        let fanouts = ["left", "right"].map(|dst| FanoutPlan {
-            source_subgraph_path: vec!["analysis".into()],
+        let fanouts = ["left", "right"].map(|dst| Successor {
             destination_subgraph_path: vec!["analysis".into()],
-            ..plan(dst, "normal", vec![scope.input.clone()])
+            ..plan(dst, TaskType::Normal, vec![scope.input.clone()])
         });
         repo.succeed_and_enqueue(scope, &scope.input, &fanouts, 3)
             .await
@@ -1232,7 +1252,6 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     let contribution = |task: &TaskRecord| {
         join_plan(
             "join",
-            &task.name,
             vec![json!({task.name.clone(): task.input})],
             &["left", "right"],
             &["analysis"],
@@ -1279,10 +1298,9 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     repo.succeed_and_enqueue(
         &ready[0],
         &ready[0].input,
-        &[FanoutPlan {
-            source_subgraph_path: vec!["analysis".into()],
+        &[Successor {
             destination_subgraph_path: vec!["analysis".into()],
-            ..plan("report", "normal", vec![ready[0].input.clone()])
+            ..plan("report", TaskType::Normal, vec![ready[0].input.clone()])
         }],
         3,
     )

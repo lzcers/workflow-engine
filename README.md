@@ -15,7 +15,7 @@
 | 模块 | 职责 |
 | --- | --- |
 | [`graph`](src/graph) | `Graph`、构图接口、节点 `Node`、上下文 `NodeContext`、`JoinNode`、成功/失败边与图描述 |
-| [`engine`](src/engine.rs) | `Engine` 按 URL 初始化共享存储，通过 `make` 为不同的图创建工作流实例；`EngineError` 描述初始化与提交错误 |
+| [`engine`](src/engine.rs) | `Engine` 按 URL 初始化共享连接池，通过 `make` 为不同的图创建工作流实例；`EngineError` 描述初始化与提交错误 |
 | [`workflow`](src/workflow.rs) | 单图 `Workflow` 提交独立运行并自动执行，返回 `RunHandle` |
 | [`task`](src/task) | 任务输入 `Task`、任务快照 `TaskRecord` 与状态 `TaskStatus` |
 | [`dsl`](src/dsl.rs) | `workflow!` 宏将 `nodes { … }` 和 `edges { … }` 展开为图构建链，并做编译期类型接线校验 |
@@ -42,7 +42,9 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 并通过认领校验阻止重复结算，因此不需要额外的实例编号去重。
 只有 JOIN 按 `workflow_id + run_id + scope_id + name` 汇入已有 pending / running JOIN，跨父任务
 累积输入，并将所有贡献者 ID 去重合并到 `parent_task_ids`。JOIN 是否就绪由
-持久化的 `join_state` 判断，既检查预期输入，也等待仍可能产生输入的上游完成。
+`depends_on_names`、`scopes` 父子关系和任务状态共同判断。可能继续产生输入的上游范围
+在工作流创建时从当前执行图计算，并绑定该工作流的存储实例，不写入任务表。
+同一 Engine 的不同工作流共享数据库连接池，各自保留自己的上游映射。
 
 ## 子图与执行作用域
 
@@ -75,9 +77,13 @@ edges { etfs -> analysis.daily foreach }
 不同 foreach 边不按下标隐式配对。`map` 只转换或扇出数据，不为每条输入单独分组。
 空数组不创建任务，`foreach` 不直接指向 JOIN。
 
-JOIN 在同一实例内聚合来源，并持久化预期依赖与实际到达的贡献。边界路由、scope 创建、
+JOIN 在同一实例内聚合来源，以 `depends_on_names` 保存该次调用的有效前驱名。边界路由、scope 创建、
 源任务结算和后继入队在同一事务中完成。子图定义通过 `GraphDescription.subgraphs` 输出，
 节点通过 `subgraph_id` 声明归属；画布折叠不改变真实节点和边。
+
+等待条件按有效前驱名对应的任务状态判断，不逐条记录入边是否到达。跨子图退出时，JOIN
+查询所属作用域及其后代中的同名任务，并等待仍可能创建这些任务的上游结束；跨子图进入时，
+通过作用域的 `trigger_task_id` 识别本次调用的外部来源，避免混入其他调用。
 
 组内 JOIN 按当前实例等待；外部入口贡献绑定创建该实例的具体任务，不自动关联不同入口事件。
 多个外部入口是不同子图调用的备选来源，当前实例只等待真实入口对应的贡献；组内必需前驱仍须全部完成。
@@ -87,10 +93,10 @@ DDL 只初始化当前 schema，不迁移旧表；旧 schema 数据库需要另�
 
 ## 引擎与工作流实例
 
-`Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享任务存储。
+`Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享连接池。
 `engine.make(graph)` 接收 `Graph<Ctx>` 并返回非泛型的 `Workflow`，构造时立即启动一个后台调度器，
 因此必须在 Tokio runtime 内调用。调度器会认领当前图已有的可执行任务，无需先提交新运行。
-同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有独立的调度器。
+同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有绑定图上游映射的任务存储和独立的调度器。
 `Workflow` 通过 `Arc<dyn ErasedGraph>` 与后台调度器共享同一个 `Graph<Ctx>`，
 节点执行仍保留类型约束。宿主可以直接将不同上下文的工作流放入同一集合，
 并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型和触发声明。
@@ -198,7 +204,7 @@ SQLite 可写文件连接默认启用 WAL 和 5 秒锁等待，未指定 `mode` 
 `mode` 和 `immutable` 参数保持原意。内存及临时数据库使用单连接且不按空闲时间或存活时间回收。
 PostgreSQL 使用最多 10 个连接和 5 秒连接池获取超时。
 
-两个后端均使用引擎自有的 `tasks` / `task_counters` 表，建表 SQL 分别位于
+两个后端均使用引擎自有的 `tasks` / `task_counters` / `scopes` 表，建表 SQL 分别位于
 [`migrations/pgsql/0001_workflow_tasks.sql`](migrations/pgsql/0001_workflow_tasks.sql) 和
 [`migrations/sqlite/0001_workflow_tasks.sql`](migrations/sqlite/0001_workflow_tasks.sql)，由 Engine 幂等执行。
 任务认领、续租、失效认领恢复、后继入队及 JOIN 汇合由内部调度和存储实现负责。

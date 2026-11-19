@@ -1,8 +1,8 @@
 //! 真实存储上的嵌套进入、退出和 JOIN 隔离；同一图验证 SQLite 与 PostgreSQL。
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{marker::PhantomData, time::Duration};
-use tokio::sync::mpsc;
+use std::{marker::PhantomData, sync::Arc, time::Duration};
+use tokio::sync::{Semaphore, mpsc};
 use workflow_engine::task::ScopeRecord;
 use workflow_engine::{
     Engine, Graph, JoinNode, Node, NodeContext, NodeError, TaskRecord, workflow,
@@ -72,20 +72,24 @@ async fn read_scopes(url: &str, workflow_id: &str) -> Vec<ScopeRecord> {
     #[cfg(feature = "sqlite")]
     if url.starts_with("sqlite:") {
         let pool = sqlx::SqlitePool::connect(url).await.unwrap();
-        return sqlx::query_as(sql)
+        let scopes = sqlx::query_as(sql)
             .bind(workflow_id)
             .fetch_all(&pool)
             .await
             .unwrap();
+        pool.close().await;
+        return scopes;
     }
     #[cfg(feature = "pg")]
     if url.starts_with("postgres") {
         let pool = sqlx::PgPool::connect(url).await.unwrap();
-        return sqlx::query_as(sql)
+        let scopes = sqlx::query_as(sql)
             .bind(workflow_id)
             .fetch_all(&pool)
             .await
             .unwrap();
+        pool.close().await;
+        return scopes;
     }
     panic!("unsupported test backend")
 }
@@ -94,12 +98,14 @@ async fn execute_sql(url: &str, sql: &str) {
     if url.starts_with("sqlite:") {
         let pool = sqlx::SqlitePool::connect(url).await.unwrap();
         sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        pool.close().await;
         return;
     }
     #[cfg(feature = "pg")]
     if url.starts_with("postgres") {
         let pool = sqlx::PgPool::connect(url).await.unwrap();
         sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        pool.close().await;
         return;
     }
     panic!("unsupported test backend")
@@ -276,6 +282,117 @@ async fn entry_and_foreach(url: &str) {
         8
     );
 }
+
+struct PausedProducer(Arc<Semaphore>);
+impl Node<Context> for PausedProducer {
+    type In = i32;
+    type Out = i32;
+
+    async fn execute(&self, context: &mut Context, input: i32) -> Result<i32, NodeError> {
+        let _ = context
+            .results
+            .send((context.task.as_ref().unwrap().clone(), Value::Null));
+        self.0.acquire().await.unwrap().forget();
+        Ok(input)
+    }
+}
+
+async fn waits_for_later_upstream_tasks(url: &str) {
+    let engine = Engine::new(url).await.unwrap();
+    let (results, mut receiver) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let graph = workflow! {
+        workflow_id: format!("late-upstream-{}", uuid::Uuid::new_v4());
+        title: "JOIN waits for tasks that have not been produced";
+        context: Context { task: None, results };
+        nodes { start => pass::<i32>(), joined => JoinNode, finish => pass::<Value>() }
+        subgraph batch {
+            nodes { prepare => PausedProducer(release.clone()), worker => pass::<i32>() }
+            edges { prepare -> worker, }
+        }
+        edges {
+            start -> batch.worker |> |_| vec![1],
+            start -> batch.prepare |> |_| vec![2],
+            batch.worker -> joined |> |value| vec![json!({"values": value})],
+            joined -> finish,
+        }
+    }
+    .unwrap();
+    let workflow = engine.make(graph);
+    let (other_results, mut other_receiver) = mpsc::unbounded_channel();
+    let other_release = Arc::new(Semaphore::new(0));
+    let other_graph = workflow! {
+        workflow_id: format!("unrelated-upstream-{}", uuid::Uuid::new_v4());
+        title: "Same JOIN name with a different upstream graph";
+        context: Context { task: None, results: other_results };
+        nodes { start => pass::<i32>(), joined => JoinNode, finish => pass::<Value>() }
+        subgraph batch {
+            nodes { prepare => PausedProducer(other_release.clone()), worker => pass::<i32>() }
+            edges {}
+        }
+        edges {
+            start -> batch.worker,
+            start -> batch.prepare,
+            batch.worker -> joined |> |value| vec![json!({"values": value})],
+            joined -> finish,
+        }
+    }
+    .unwrap();
+    let other_workflow = engine.make(other_graph);
+    workflow.submit("start", 0).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let (mut prepared, mut completed) = (false, false);
+        while !prepared || !completed {
+            let (task, _) = receiver.recv().await.unwrap();
+            assert_ne!(
+                task.name, "finish",
+                "JOIN ran before the producer completed"
+            );
+            prepared |= task.name == "batch.prepare";
+            completed |= task.name == "batch.worker";
+        }
+    })
+    .await
+    .expect("the first worker must finish while the second worker is not created yet");
+    other_workflow.submit("start", 3).await.unwrap();
+    let other_output = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut prepared = false;
+        let mut output = None;
+        while !prepared || output.is_none() {
+            let (task, value) = other_receiver.recv().await.unwrap();
+            prepared |= task.name == "batch.prepare";
+            if task.name == "finish" {
+                output = Some(value);
+            }
+        }
+        output.unwrap()
+    })
+    .await
+    .expect("another workflow's JOIN must ignore its unrelated blocked producer");
+    assert_eq!(other_output, json!({"values": 3}));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1200), receiver.recv())
+            .await
+            .is_err(),
+        "JOIN must stay pending across a scheduler poll while its producer is running"
+    );
+    release.add_permits(1);
+    let output = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let (task, output) = receiver.recv().await.unwrap();
+            if task.name == "finish" {
+                break output;
+            }
+        }
+    })
+    .await
+    .expect("JOIN must complete after both worker instances finish");
+    let mut values: Vec<i32> = serde_json::from_value(output["values"].clone()).unwrap();
+    values.sort();
+    assert_eq!(values, [1, 2]);
+    other_release.add_permits(1);
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_nested_scopes_and_entry_correlation() {
@@ -284,6 +401,7 @@ async fn sqlite_nested_scopes_and_entry_correlation() {
     nested(&url).await;
     entry_and_foreach(&url).await;
     recover_nested(&url).await;
+    waits_for_later_upstream_tasks(&url).await;
     let _ = std::fs::remove_file(path);
 }
 #[cfg(feature = "pg")]
@@ -295,4 +413,5 @@ async fn postgres_nested_scopes_and_entry_correlation() {
     nested(&url).await;
     entry_and_foreach(&url).await;
     recover_nested(&url).await;
+    waits_for_later_upstream_tasks(&url).await;
 }

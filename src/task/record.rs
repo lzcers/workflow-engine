@@ -3,8 +3,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::JoinState;
-
 /// 持久化任务状态，在所有后端使用相同的值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,8 +75,8 @@ pub struct TaskRecord {
     pub max_attempts: i32,
     /// 节点声明的任务类型（`normal`/`join`/`event`）；仅 JOIN 额外检查静态前驱。
     pub task_type: String,
-    /// JOIN 的预期来源、实际贡献和生产结束屏障。
-    pub join_state: JoinState,
+    /// 当前调用需要等待的前驱节点完整名称。
+    pub depends_on_names: Vec<String>,
     /// 任务输入因 name 而异，暂保留为通用 JSON。
     pub input: Value,
     /// 节点输出直接以 JSON 落库（由节点类型化 `In`/`Out` 序列化），因 name 而异。
