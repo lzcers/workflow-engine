@@ -114,30 +114,23 @@ async fn enqueue_fanout_in_tx(
                 .execute(&mut **tx).await?;
         } else {
             let mut state = if plan.task_type == "join" {
-                let state = join_state(
-                    plan,
-                    &scope::chain(tx, &source.workflow_id, scope_id).await?,
-                )?;
-                for dependency in &state.expected {
-                    if let Some(id) = dependency.task_id {
+                let chain = scope::chain(tx, &source.workflow_id, scope_id).await?;
+                let mut entry_names = std::collections::HashMap::new();
+                for scope in &chain {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        entry_names.entry(scope.trigger_task_id)
+                    {
                         let name: String = sqlx::query_scalar(
                             "SELECT name FROM tasks WHERE workflow_id=?1 AND task_id=?2",
                         )
                         .bind(&source.workflow_id)
-                        .bind(id)
+                        .bind(scope.trigger_task_id)
                         .fetch_one(&mut **tx)
                         .await?;
-                        if name != dependency.name {
-                            return Err(StorageError::InvalidFanout {
-                                detail: format!(
-                                    "JOIN source {} is not the entry event ({name}) for this scope",
-                                    dependency.name
-                                ),
-                            });
-                        }
+                        entry.insert(name);
                     }
                 }
-                state
+                join_state(plan, &chain, &entry_names)?
             } else {
                 JoinState::default()
             };

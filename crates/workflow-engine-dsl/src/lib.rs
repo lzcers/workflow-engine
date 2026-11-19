@@ -1,4 +1,4 @@
-//! Shared syntax tree for typed workflow expansion and source editing.
+//! Syntax tree for typed workflow macro expansion.
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};

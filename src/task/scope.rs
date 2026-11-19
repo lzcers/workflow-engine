@@ -65,6 +65,7 @@ pub(crate) type ScopeEntries = HashMap<(Option<i64>, String, Option<(String, usi
 pub(crate) fn join_state(
     plan: &FanoutPlan,
     chain: &[ScopeRecord],
+    entry_names: &HashMap<i64, String>,
 ) -> Result<JoinState, StorageError> {
     let target = &plan.destination_subgraph_path;
     let current = chain.last().map(|scope| scope.scope_id);
@@ -100,11 +101,23 @@ pub(crate) fn join_state(
             descendants,
         })
     };
-    let mut expected = plan
-        .join_incoming_edges
-        .iter()
-        .map(|(edge, name)| select(name, Some(edge.clone())))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected = Vec::new();
+    for (edge, name) in &plan.join_incoming_edges {
+        let dependency = select(name, Some(edge.clone()))?;
+        if let Some(task_id) = dependency.task_id {
+            let entry_name =
+                entry_names
+                    .get(&task_id)
+                    .ok_or_else(|| StorageError::InvalidFanout {
+                        detail: format!("missing JOIN entry task {task_id}"),
+                    })?;
+            // 同一子图可被不同外部节点调用；只等待创建当前实例的入口边。
+            if entry_name != name {
+                continue;
+            }
+        }
+        expected.push(dependency);
+    }
     expected.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
     let mut upstream = Vec::new();
     for name in &plan.join_upstream_names {

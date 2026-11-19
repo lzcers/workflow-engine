@@ -336,6 +336,9 @@ impl Node<Context> for SignalNode {
         if let Some(release) = &self.release {
             release.notified().await;
         }
+        if input < 0 {
+            return Err(NodeError::permanent("source failed"));
+        }
         Ok(vec![input])
     }
 }
@@ -515,6 +518,150 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
             [json!(43), json!(3), json!(23)],
             "reports retain their source pairing despite out-of-order source completion",
         );
+        database.close().await;
+    }
+}
+
+#[tokio::test]
+async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
+    for fail_source_a in [false, true] {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let pool = match &database {
+            Database::Sqlite(pool) => pool.clone(),
+            #[cfg(feature = "pg")]
+            Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
+        };
+        let repo = SqliteTaskRepo::new(pool);
+        let starts: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
+        let releases: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
+        let graph = dsl::workflow! {
+            workflow_id: "external-entry-join";
+            title: "跨组入口与 JOIN 隔离";
+            context: Context::default();
+            nodes {
+                start => AddOne,
+                source_a => SignalNode { started: starts[0].clone(), release: Some(releases[0].clone()) },
+                source_b => SignalNode { started: starts[1].clone(), release: Some(releases[1].clone()) },
+                source_c => SignalNode { started: starts[2].clone(), release: Some(releases[2].clone()) },
+            }
+            subgraph analysis {
+                nodes { worker => AddOne, collect => JoinNode, report => Sum }
+                edges {
+                    worker -> collect |> |output| vec![json!({"worker": [output]})],
+                    collect -> report |> |output: &Value| vec![serde_json::from_value::<Collected>(output.clone()).unwrap()],
+                }
+            }
+            edges {
+                start -> source_a |> move |output| vec![if fail_source_a { -*output } else { *output }],
+                start -> source_b |> |output| vec![*output + 10],
+                start -> source_c |> |output| vec![*output + 20],
+                source_a -> analysis.collect |> |output| vec![json!({"summary": output[0]})],
+                source_a -> analysis.worker |> |output| output.clone(),
+                source_b -> analysis.worker |> |output| output.clone(),
+                source_b -> analysis.collect |> |output| vec![json!({"summary": output[0]})],
+                source_c -> analysis.collect |> |output| vec![json!({"summary": output[0]})],
+                source_c -> analysis.worker |> |output| output.clone(),
+            }
+        }
+        .unwrap();
+        let root = repo
+            .enqueue(&Task::new("external-entry-join", "start", json!(0)))
+            .await
+            .unwrap();
+        let scheduler = Scheduler::new(
+            Arc::new(graph),
+            Arc::new(SqliteTaskStore::new(repo.clone())),
+            Duration::from_millis(2),
+        )
+        .with_max_concurrency(8);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = scheduler.run() => panic!("scheduler must run until cancelled"),
+                _ = async {
+                    tokio::join!(starts[0].notified(), starts[1].notified(), starts[2].notified());
+                    let mut expected_reports = 0;
+                    for source in [2, 0, 1] {
+                        releases[source].notify_one();
+                        let source_fails = fail_source_a && source == 0;
+                        expected_reports += usize::from(!source_fails);
+                        loop {
+                            let tasks = repo.list_all("external-entry-join").await.unwrap();
+                            let reports = tasks.iter().filter(|task|
+                                task.name == "analysis.report" && task.status == TaskStatus::Succeeded
+                            ).count();
+                            let failed = tasks.iter().any(|task|
+                                task.name == "source_a" && task.status == TaskStatus::Failed
+                            );
+                            if reports == expected_reports && (!source_fails || failed) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("a report must not wait for another external entry or inherit its failure");
+
+        let tasks = repo.list_all("external-entry-join").await.unwrap();
+        assert_eq!(tasks.len(), if fail_source_a { 10 } else { 13 });
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.run_id == root.run_id && task.attempt == 1)
+        );
+        for task in &tasks {
+            let expected = if fail_source_a && task.name == "source_a" {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Succeeded
+            };
+            assert_eq!(task.status, expected, "{task:?}");
+        }
+        let mut scope_ids = Vec::new();
+        for worker in tasks.iter().filter(|task| task.name == "analysis.worker") {
+            assert!(worker.scope_id.is_some());
+            assert!(!scope_ids.contains(&worker.scope_id));
+            scope_ids.push(worker.scope_id);
+            let source = tasks
+                .iter()
+                .find(|task| worker.parent_task_ids == [task.task_id])
+                .unwrap();
+            let join = tasks
+                .iter()
+                .find(|task| task.name == "analysis.collect" && task.scope_id == worker.scope_id)
+                .unwrap();
+            assert_eq!(join.join_state.expected.len(), 2);
+            let external = join
+                .join_state
+                .expected
+                .iter()
+                .find(|dependency| dependency.name == source.name)
+                .unwrap();
+            assert_eq!(external.task_id, Some(source.task_id));
+            assert!(
+                join.join_state
+                    .expected
+                    .iter()
+                    .any(|dependency| dependency.name == worker.name
+                        && dependency.scope_id == worker.scope_id
+                        && dependency.task_id.is_none())
+            );
+            let mut parents = join.parent_task_ids.clone();
+            parents.sort_unstable();
+            assert_eq!(parents, [source.task_id, worker.task_id]);
+            let input = worker.input.as_i64().unwrap();
+            assert_eq!(join.input, json!({"summary": input, "worker": [input + 1]}));
+            let report = tasks
+                .iter()
+                .find(|task| task.name == "analysis.report" && task.scope_id == worker.scope_id)
+                .unwrap();
+            assert_eq!(report.parent_task_ids, [join.task_id]);
+            assert_eq!(report.output, Some(json!(input * 2 + 1)));
+        }
         database.close().await;
     }
 }
