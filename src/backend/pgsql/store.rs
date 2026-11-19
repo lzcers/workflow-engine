@@ -1,4 +1,4 @@
-//! [`PgTaskStore`]：通用引擎 [`crate::task::TaskStore`] 的 pgsql 实现。
+//! 为 [`PgTaskRepo`] 实现引擎的原子任务存储契约。
 //!
 //! 通过 [`PgTaskRepo`] 使用当前工作流的上游关系，接收图规划的后继，
 //! 不感知任何业务字段。
@@ -12,34 +12,11 @@ use crate::graph::Successor;
 use crate::task::TaskStore;
 use crate::{Task, TaskRecord};
 
-/// 工作流任务存储：通过 `PgTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
-#[derive(Clone)]
-pub struct PgTaskStore {
-    repo: PgTaskRepo,
-    max_attempts: i32,
-}
-
-impl PgTaskStore {
-    /// 绑定仓储；结算时新建的后继任务默认 `max_attempts = 3`。
-    pub fn new(repo: PgTaskRepo) -> Self {
-        Self {
-            repo,
-            max_attempts: 3,
-        }
-    }
-
-    /// 覆盖结算时新建后继任务的最大尝试次数；直接入队沿用 Task 的配置。
-    pub fn with_max_attempts(mut self, n: i32) -> Self {
-        self.max_attempts = n;
-        self
-    }
-}
-
-impl TaskStore for PgTaskStore {
+impl TaskStore for PgTaskRepo {
     type Error = StorageError;
 
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
-        Box::pin(self.repo.enqueue(task))
+        Box::pin(PgTaskRepo::enqueue(self, task))
     }
 
     fn claim_many<'a>(
@@ -48,14 +25,14 @@ impl TaskStore for PgTaskStore {
         worker_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(self.repo.claim_many(workflow_id, worker_id, limit))
+        Box::pin(PgTaskRepo::claim_many(self, workflow_id, worker_id, limit))
     }
 
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
-        Box::pin(self.repo.renew_claim(task))
+        Box::pin(PgTaskRepo::renew_claim(self, task))
     }
 
     /// 原子成功结算：写入输出并入队全部成功后继，后继使用任务最新的分组键。
@@ -66,8 +43,7 @@ impl TaskStore for PgTaskStore {
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            self.repo
-                .succeed_and_enqueue(task, output, successors, self.max_attempts)
+            self.succeed_and_enqueue(task, output, successors, self.max_attempts)
                 .await
                 .map(|_| ())
         })
@@ -81,8 +57,7 @@ impl TaskStore for PgTaskStore {
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            self.repo
-                .fail_and_enqueue(task, message, successors, self.max_attempts)
+            self.fail_and_enqueue(task, message, successors, self.max_attempts)
                 .await
         })
     }
@@ -92,6 +67,6 @@ impl TaskStore for PgTaskStore {
         &'a self,
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.repo.release_claim(task))
+        Box::pin(PgTaskRepo::release_claim(self, task))
     }
 }

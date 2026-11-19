@@ -23,7 +23,7 @@ use tokio::{
 use super::{Scheduler, run_task};
 use crate::{
     Graph, Node, NodeContext, NodeError, Task, TaskRecord, TaskStatus,
-    backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
+    backend::sqlite::{SqliteTaskRepo, migrate},
     edge::on_error,
     graph::Successor,
     task::{TaskStore, store::LEASE_DURATION},
@@ -32,7 +32,7 @@ use crate::{
 struct Context {
     task: Option<TaskRecord>,
     events: mpsc::UnboundedSender<(&'static str, String)>,
-    repo: SqliteTaskRepo,
+    pool: SqlitePool,
 }
 
 impl Context {
@@ -49,7 +49,7 @@ impl NodeContext for Context {
         Self {
             task: Some(task.clone()),
             events: self.events.clone(),
-            repo: self.repo.clone(),
+            pool: self.pool.clone(),
         }
     }
 }
@@ -71,16 +71,14 @@ impl Node<Context> for PendingNode {
 
     async fn on_error(ctx: &mut Context, error: &NodeError) {
         let task = ctx.task.as_ref().unwrap();
-        let stored = ctx
-            .repo
-            .get(&task.workflow_id, task.task_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            stored.status,
-            TaskStatus::Failed | TaskStatus::Superseded
-        ));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM tasks WHERE workflow_id=? AND task_id=?")
+                .bind(&task.workflow_id)
+                .bind(task.task_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .unwrap();
+        assert!(matches!(status.as_str(), "failed" | "superseded"));
         ctx.events.send(("error", error.to_string())).unwrap();
     }
 }
@@ -101,15 +99,14 @@ impl Node<Context> for SuccessNode {
     }
 }
 
-async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
+async fn memory_pool() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
     migrate(&pool).await.unwrap();
-    let repo = SqliteTaskRepo::new(pool.clone(), Default::default());
-    (pool, repo)
+    pool
 }
 
 async fn set_deadline(
@@ -133,7 +130,7 @@ async fn set_deadline(
 
 #[tokio::test]
 async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() {
-    let (pool, repo) = memory_repo().await;
+    let pool = memory_pool().await;
     let (events, mut receiver) = mpsc::unbounded_channel();
     let graph = Arc::new(
         Graph::builder(
@@ -142,7 +139,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
             Context {
                 task: None,
                 events,
-                repo: repo.clone(),
+                pool: pool.clone(),
             },
         )
         .node("pending", PendingNode)
@@ -154,6 +151,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         .build()
         .unwrap(),
     );
+    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone());
     let mut input = Task::new("timeout", "pending", json!(41));
     input.max_attempts = 1;
     repo.enqueue(&input).await.unwrap();
@@ -169,7 +167,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         chrono::Utc::now() - chrono::Duration::seconds(1),
     )
     .await;
-    let store = Arc::new(SqliteTaskStore::new(repo.clone()));
+    let store = Arc::new(repo.clone());
     let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_millis(2))
         .with_max_concurrency(1);
     let mut in_flight = JoinSet::new();
@@ -227,7 +225,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
 
 #[tokio::test]
 async fn already_expired_snapshot_never_enters_business_or_settlement() {
-    let (pool, repo) = memory_repo().await;
+    let pool = memory_pool().await;
     let (events, mut receiver) = mpsc::unbounded_channel();
     let graph = Arc::new(
         Graph::builder(
@@ -236,13 +234,14 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
             Context {
                 task: None,
                 events,
-                repo: repo.clone(),
+                pool: pool.clone(),
             },
         )
         .node("pending", PendingNode)
         .build()
         .unwrap(),
     );
+    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone());
     repo.enqueue(&Task::new("expired", "pending", json!(0)))
         .await
         .unwrap();
@@ -262,7 +261,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
         Duration::from_secs(1),
         run_task(
             graph,
-            Arc::new(SqliteTaskStore::new(repo.clone())),
+            Arc::new(repo.clone()),
             claim.clone(),
             Instant::now() - Duration::from_secs(1),
         ),

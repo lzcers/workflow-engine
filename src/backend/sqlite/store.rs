@@ -1,4 +1,4 @@
-//! [`SqliteTaskStore`]：通用引擎 [`crate::task::TaskStore`] 的 SQLite 实现。
+//! [`SqliteTaskRepo`] 直接实现通用引擎 [`crate::task::TaskStore`]。
 //!
 //! 通过 [`SqliteTaskRepo`] 持久化当前图规划的后继输入，
 //! 不感知任何业务字段。
@@ -12,34 +12,11 @@ use crate::graph::Successor;
 use crate::task::TaskStore;
 use crate::{Task, TaskRecord};
 
-/// 共享任务存储：通过 `SqliteTaskRepo` 把 [`TaskStore`] 落到 `tasks` 表。
-#[derive(Clone)]
-pub struct SqliteTaskStore {
-    repo: SqliteTaskRepo,
-    max_attempts: i32,
-}
-
-impl SqliteTaskStore {
-    /// 绑定仓储；后继任务默认 `max_attempts = 3`，入队任务使用 Task 中的预算。
-    pub fn new(repo: SqliteTaskRepo) -> Self {
-        Self {
-            repo,
-            max_attempts: 3,
-        }
-    }
-
-    /// 覆盖结算时创建的后继任务的最大尝试次数。
-    pub fn with_max_attempts(mut self, n: i32) -> Self {
-        self.max_attempts = n;
-        self
-    }
-}
-
-impl TaskStore for SqliteTaskStore {
+impl TaskStore for SqliteTaskRepo {
     type Error = StorageError;
 
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
-        Box::pin(self.repo.enqueue(task))
+        Box::pin(SqliteTaskRepo::enqueue(self, task))
     }
 
     fn claim_many<'a>(
@@ -48,14 +25,19 @@ impl TaskStore for SqliteTaskStore {
         worker_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(self.repo.claim_many(workflow_id, worker_id, limit))
+        Box::pin(SqliteTaskRepo::claim_many(
+            self,
+            workflow_id,
+            worker_id,
+            limit,
+        ))
     }
 
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
-        Box::pin(self.repo.renew_claim(task))
+        Box::pin(SqliteTaskRepo::renew_claim(self, task))
     }
 
     /// 原子成功结算：写入输出并入队全部成功后继，继承任务最新的 run_id 和 scope_id。
@@ -66,8 +48,7 @@ impl TaskStore for SqliteTaskStore {
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            self.repo
-                .succeed_and_enqueue(task, output, successors, self.max_attempts)
+            self.succeed_and_enqueue(task, output, successors, self.max_attempts)
                 .await
                 .map(|_| ())
         })
@@ -81,8 +62,7 @@ impl TaskStore for SqliteTaskStore {
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            self.repo
-                .fail_and_enqueue(task, message, successors, self.max_attempts)
+            self.fail_and_enqueue(task, message, successors, self.max_attempts)
                 .await
         })
     }
@@ -92,6 +72,6 @@ impl TaskStore for SqliteTaskStore {
         &'a self,
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.repo.release_claim(task))
+        Box::pin(SqliteTaskRepo::release_claim(self, task))
     }
 }

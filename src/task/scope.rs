@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
-use crate::graph::Successor;
+use crate::graph::ErasedGraph;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ScopeRecord {
@@ -22,15 +22,27 @@ pub(crate) type ScopeEntries = HashMap<(Option<i64>, String), i64>;
 
 /// 保留当前子图调用的有效前驱名称。不同外部入口分别调用同一子图时，不互相等待。
 pub(crate) fn dependency_names(
-    plan: &Successor,
+    graph: &dyn ErasedGraph,
+    destination: &str,
     chain: &[ScopeRecord],
     entry_names: &HashMap<i64, String>,
 ) -> Result<Vec<String>, StorageError> {
-    let target = &plan.destination_subgraph_path;
+    let unknown_node = |name: &str| StorageError::InvalidFanout {
+        detail: format!("unknown node {name}"),
+    };
+    let target = graph
+        .subgraph_path(destination)
+        .ok_or_else(|| unknown_node(destination))?;
+    let predecessors = graph
+        .predecessors_of(destination)
+        .ok_or_else(|| unknown_node(destination))?;
     let mut names = Vec::new();
-    for (name, path) in &plan.predecessor_subgraph_paths {
-        if !path.starts_with(target) {
-            let common = path.iter().zip(target).take_while(|(a, b)| a == b).count();
+    for name in predecessors {
+        let path = graph
+            .subgraph_path(&name)
+            .ok_or_else(|| unknown_node(&name))?;
+        if !path.starts_with(&target) {
+            let common = path.iter().zip(&target).take_while(|(a, b)| a == b).count();
             let entry = chain
                 .get(common)
                 .ok_or_else(|| StorageError::InvalidFanout {
@@ -41,11 +53,11 @@ pub(crate) fn dependency_names(
                     detail: format!("missing JOIN entry task {}", entry.trigger_task_id),
                 }
             })?;
-            if entry_name != name {
+            if entry_name != &name {
                 continue;
             }
         }
-        names.push(name.clone());
+        names.push(name);
     }
     names.sort();
     Ok(names)

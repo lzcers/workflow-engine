@@ -3,20 +3,28 @@ use std::{collections::HashSet, path::PathBuf, time::Duration};
 use serde_json::{Value, json};
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
-use super::{SqliteTaskRepo, SqliteTaskStore, migrate};
+use super::{SqliteTaskRepo, migrate};
+#[path = "graph_fixture.rs"]
+mod graph_fixture;
 use crate::error::StorageError;
 use crate::graph::{Successor, TaskType};
 use crate::task::TaskStore;
 use crate::{Task, TaskRecord, TaskStatus};
+use TaskType::{Join, Normal};
+use graph_fixture::graph;
 
-async fn memory_repo() -> (SqlitePool, SqliteTaskRepo) {
+async fn memory_repo(
+    workflow_id: &str,
+    nodes: &[(&'static str, TaskType, Option<&str>)],
+    edges: &[(&'static str, &'static str)],
+) -> (SqlitePool, SqliteTaskRepo) {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
     migrate(&pool).await.unwrap();
-    let repo = SqliteTaskRepo::new(pool.clone(), Default::default());
+    let repo = SqliteTaskRepo::new(pool.clone(), graph(workflow_id, nodes, edges));
     (pool, repo)
 }
 
@@ -31,29 +39,37 @@ async fn get(repo: &SqliteTaskRepo, task: &TaskRecord) -> TaskRecord {
         .unwrap()
 }
 
-fn plan(dst: &'static str, task_type: TaskType, inputs: Vec<Value>) -> Successor {
+fn plan(dst: &'static str, inputs: Vec<Value>) -> Successor {
     Successor {
-        foreach: false,
-
-        destination_subgraph_path: vec![],
-        predecessor_subgraph_paths: Default::default(),
+        new_scope_per_input: false,
 
         dst,
-        task_type,
         inputs,
     }
 }
 
 #[tokio::test]
 async fn migration_is_idempotent_and_task_values_round_trip() {
-    let (pool, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo(
+        "workflow",
+        &[
+            ("root", Normal, None),
+            ("second", Normal, None),
+            ("rollback", Normal, None),
+            ("next", Normal, None),
+            ("analysis.entry", Normal, Some("analysis")),
+            ("invalid_scope", Normal, None),
+        ],
+        &[],
+    )
+    .await;
     let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('tasks')")
         .fetch_all(&pool)
         .await
         .unwrap();
     assert!(columns.iter().any(|name| name == "depends_on_names"));
     assert!(!columns.iter().any(|name| name == "join_state"));
-    let store = SqliteTaskStore::new(repo.clone());
+    let store = repo.clone();
     let mut input = new_task("workflow", "root");
     input.run_id = Some(42);
     input.input = json!({"text": "工作流 'quoted'", "nested": [null, true, {"n": 3}]});
@@ -64,7 +80,20 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         .enqueue(&new_task("workflow", "second"))
         .await
         .unwrap();
-    let other = repo.enqueue(&new_task("other", "root")).await.unwrap();
+    let other_repo =
+        SqliteTaskRepo::new(pool.clone(), graph("other", &[("root", Normal, None)], &[]));
+    let other = other_repo
+        .enqueue(&new_task("other", "root"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        repo.enqueue(&new_task("other", "root")).await,
+        Err(StorageError::InvalidFanout { .. })
+    ));
+    assert!(matches!(
+        repo.claim_many("other", "wrong-workflow", 1).await,
+        Err(StorageError::InvalidFanout { .. })
+    ));
     assert_eq!(first.task_id, 1);
     assert_eq!(second.task_id, 2);
     assert_eq!(second.run_id, Some(second.task_id));
@@ -117,10 +146,17 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert_eq!(next.run_id, Some(next.task_id));
     assert_ne!(next.run_id, second.run_id);
 
+    for name in ["undeclared", "analysis"] {
+        assert!(matches!(
+            repo.enqueue(&new_task("workflow", name)).await,
+            Err(StorageError::InvalidFanout { .. })
+        ));
+    }
+
     let scoped = repo
         .enqueue(&Task {
             run_id: first.run_id,
-            subgraph_path: vec!["analysis".into()],
+
             ..new_task("workflow", "analysis.entry")
         })
         .await
@@ -140,12 +176,22 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
 
 #[tokio::test]
 async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
-    let (_, repo) = memory_repo().await;
+    let (_, repo) = memory_repo(
+        "deps",
+        &[
+            ("root", Normal, None),
+            ("child", Join, None),
+            ("missing_dependency", Join, None),
+            ("absent", Normal, None),
+        ],
+        &[("root", "child"), ("absent", "missing_dependency")],
+    )
+    .await;
     let root = repo.enqueue(&new_task("deps", "root")).await.unwrap();
     let mut child = new_task("deps", "child");
     child.run_id = root.run_id;
     child.max_attempts = 5;
-    child.task_type = "join".into();
+
     child.parent_task_ids = vec![root.task_id];
     child.depends_on_names = vec!["root".into()];
     let child = repo.enqueue(&child).await.unwrap();
@@ -155,7 +201,7 @@ async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
     assert_eq!(child.depends_on_names[0], "root");
     let mut missing = new_task("deps", "missing_dependency");
     missing.run_id = root.run_id;
-    missing.task_type = "join".into();
+
     missing.depends_on_names = vec!["absent".into()];
     let missing = repo.enqueue(&missing).await.unwrap();
 
@@ -197,11 +243,16 @@ async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
 
 #[tokio::test]
 async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
-    let (pool, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo(
+        "retry",
+        &[("root", Normal, None), ("child", Join, None)],
+        &[("root", "child")],
+    )
+    .await;
     let task = repo.enqueue(&new_task("retry", "root")).await.unwrap();
     let mut child = new_task("retry", "child");
     child.run_id = task.run_id;
-    child.task_type = "join".into();
+
     child.depends_on_names = vec!["root".into()];
     child.parent_task_ids = vec![task.task_id];
     let child = repo.enqueue(&child).await.unwrap();
@@ -296,6 +347,7 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
             .is_empty()
     );
 
+    let repo = SqliteTaskRepo::new(pool.clone(), graph("zero", &[("root", Normal, None)], &[]));
     let mut zero = new_task("zero", "root");
     zero.max_attempts = 0;
     let zero = repo.enqueue(&zero).await.unwrap();
@@ -318,7 +370,16 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
 
 #[tokio::test]
 async fn join_merges_across_parents_and_waits_for_all_predecessors() {
-    let (_, repo) = memory_repo().await;
+    let (_, repo) = memory_repo(
+        "join",
+        &[
+            ("image", Normal, None),
+            ("text", Normal, None),
+            ("collect", Join, None),
+        ],
+        &[("image", "collect"), ("text", "collect")],
+    )
+    .await;
     let mut images = Vec::new();
     for input in [json!("a"), json!("b")] {
         let mut image = new_task("join", "image");
@@ -326,7 +387,7 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         image.input = input;
         images.push(repo.enqueue(&image).await.unwrap());
     }
-    let store = SqliteTaskStore::new(repo.clone());
+    let store = repo.clone();
     let mut wrong_run = new_task("join", "text");
     wrong_run.run_id = Some(2);
     let wrong_run = repo.enqueue(&wrong_run).await.unwrap();
@@ -349,10 +410,7 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         images.iter().map(|task| task.task_id).collect::<Vec<_>>()
     );
 
-    let contribution = |input| Successor {
-        predecessor_subgraph_paths: [("image".into(), vec![]), ("text".into(), vec![])].into(),
-        ..plan("collect", TaskType::Join, vec![input])
-    };
+    let contribution = |input| plan("collect", vec![input]);
     store
         .settle_success(
             &claimed[0],
@@ -437,7 +495,12 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
 
 #[tokio::test]
 async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
-    let (_, repo) = memory_repo().await;
+    let (_, repo) = memory_repo(
+        "fanin",
+        &[("image", Normal, None), ("collect", Join, None)],
+        &[("image", "collect")],
+    )
+    .await;
     for run_id in [Some(1), Some(2), Some(0)] {
         for input in [
             json!({"image": "first"}),
@@ -451,10 +514,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
     }
     let sources = repo.claim_many("fanin", "worker", 10).await.unwrap();
     for source in &sources {
-        let contribution = Successor {
-            predecessor_subgraph_paths: [("image".into(), vec![])].into(),
-            ..plan("collect", TaskType::Join, vec![source.input.clone()])
-        };
+        let contribution = plan("collect", vec![source.input.clone()]);
         repo.succeed_and_enqueue(source, &source.input, &[contribution], 3)
             .await
             .unwrap();
@@ -473,24 +533,35 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
 
 #[tokio::test]
 async fn success_and_all_fanouts_commit_or_roll_back_together() {
-    let (pool, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo(
+        "atomic_success",
+        &[
+            ("root", Normal, None),
+            ("child", Normal, None),
+            ("analysis.child", Normal, Some("analysis")),
+            ("invalid", Normal, None),
+        ],
+        &[],
+    )
+    .await;
     let task = repo
         .enqueue(&new_task("atomic_success", "root"))
         .await
         .unwrap();
-    let store = SqliteTaskStore::new(repo.clone()).with_max_attempts(7);
+    let store = repo.clone().with_max_attempts(7);
     let claimed = store
         .claim_many("atomic_success", "worker", 1)
         .await
         .unwrap()
         .remove(0);
-    let valid = plan("child", TaskType::Normal, vec![json!("a"), json!("b")]);
+    let valid = plan("child", vec![json!("a"), json!("b")]);
     let scoped = Successor {
-        foreach: true,
-        destination_subgraph_path: vec!["analysis".into()],
+        dst: "analysis.child",
+        new_scope_per_input: true,
+
         ..valid.clone()
     };
-    let invalid = plan("invalid", TaskType::Normal, vec![json!({})]);
+    let invalid = plan("invalid", vec![json!({})]);
     sqlx::query("CREATE TRIGGER reject_invalid BEFORE INSERT ON tasks WHEN NEW.name = 'invalid' BEGIN SELECT RAISE(ABORT, 'invalid successor'); END")
         .execute(&pool).await.unwrap();
     assert!(
@@ -502,6 +573,14 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     let unchanged = get(&repo, &task).await;
     assert_eq!(unchanged.status, TaskStatus::Running);
     assert!(unchanged.output.is_none());
+    assert_eq!(repo.list_all("atomic_success").await.unwrap().len(), 1);
+    assert!(matches!(
+        store
+            .settle_success(&claimed, &json!({}), &[plan("undeclared", vec![json!({})])])
+            .await,
+        Err(StorageError::InvalidFanout { .. })
+    ));
+    assert_eq!(get(&repo, &task).await.status, TaskStatus::Running);
     assert_eq!(repo.list_all("atomic_success").await.unwrap().len(), 1);
 
     // Successors inherit the latest run and scope, not the claim's older snapshot.
@@ -545,13 +624,23 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
 
 #[tokio::test]
 async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_parent() {
-    let (pool, repo) = memory_repo().await;
-    let mut input = new_task("atomic_failure", "root");
+    let (pool, repo) = memory_repo(
+        "atomic_failure",
+        &[
+            ("analysis.root", Normal, Some("analysis")),
+            ("analysis.recovery", Join, Some("analysis")),
+            ("analysis.success", Normal, Some("analysis")),
+            ("invalid", Normal, None),
+        ],
+        &[("analysis.success", "analysis.recovery")],
+    )
+    .await;
+    let mut input = new_task("atomic_failure", "analysis.root");
     input.run_id = Some(4);
-    input.subgraph_path = vec!["analysis".into()];
+
     input.max_attempts = 1;
     let task = repo.enqueue(&input).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone());
+    let store = repo.clone();
     let expired = store
         .claim_many("atomic_failure", "worker", 1)
         .await
@@ -567,11 +656,8 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert!(claimed.attempt > claimed.max_attempts);
     assert_eq!(expired.scope_id, task.scope_id);
     assert_eq!(claimed.scope_id, task.scope_id);
-    let recovery = Successor {
-        destination_subgraph_path: vec!["analysis".into()],
-        ..plan("recovery", TaskType::Normal, vec![json!({"retry": true})])
-    };
-    let invalid = plan("invalid", TaskType::Normal, vec![json!({})]);
+    let recovery = plan("analysis.recovery", vec![json!({"retry": true})]);
+    let invalid = plan("invalid", vec![json!({})]);
     sqlx::query("CREATE TRIGGER reject_invalid BEFORE INSERT ON tasks WHEN NEW.name = 'invalid' BEGIN SELECT RAISE(ABORT, 'invalid successor'); END")
         .execute(&pool).await.unwrap();
     let message = claimed.error.as_deref().unwrap();
@@ -615,7 +701,12 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
         .await
         .unwrap()
         .remove(0);
-    assert_eq!(recovery.name, "recovery");
+    assert_eq!(recovery.name, "analysis.recovery");
+    assert_eq!(recovery.task_type, "join");
+    assert!(
+        recovery.depends_on_names.is_empty(),
+        "a failure-edge JOIN must not wait for the graph's success predecessors"
+    );
     assert_eq!(recovery.run_id, Some(4));
     assert_eq!(recovery.scope_id, Some(21));
     assert_eq!(recovery.parent_task_ids, [task.task_id]);
@@ -625,9 +716,9 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
 
 #[tokio::test]
 async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
-    let (_, repo) = memory_repo().await;
+    let (_, repo) = memory_repo("same_name", &[("retry", Normal, None)], &[]).await;
     repo.enqueue(&new_task("same_name", "retry")).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone());
+    let store = repo.clone();
     let source = store
         .claim_many("same_name", "worker", 1)
         .await
@@ -637,11 +728,7 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
         .settle_failure(
             &source,
             "retry requested",
-            &[plan(
-                "retry",
-                TaskType::Normal,
-                vec![json!({"retry": true})],
-            )],
+            &[plan("retry", vec![json!({"retry": true})])],
         )
         .await
         .unwrap();
@@ -655,16 +742,23 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
 
 #[tokio::test]
 async fn release_all_claims_and_store_operations_stay_in_their_workflow() {
-    let (_, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo("ours", &[("root", Normal, None)], &[]).await;
     let ours = repo.enqueue(&new_task("ours", "root")).await.unwrap();
-    let theirs = repo.enqueue(&new_task("theirs", "root")).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone());
+    let their_repo = SqliteTaskRepo::new(pool, graph("theirs", &[("root", Normal, None)], &[]));
+    let theirs = their_repo
+        .enqueue(&new_task("theirs", "root"))
+        .await
+        .unwrap();
+    let store = repo.clone();
     assert_eq!(
         store.claim_many("ours", "worker", 10).await.unwrap().len(),
         1
     );
     assert_eq!(get(&repo, &theirs).await.status, TaskStatus::Pending);
-    repo.claim_many("theirs", "other-worker", 1).await.unwrap();
+    their_repo
+        .claim_many("theirs", "other-worker", 1)
+        .await
+        .unwrap();
     assert_eq!(repo.release_claims("ours", "worker").await.unwrap(), 1);
     let reclaimed = store
         .claim_many("ours", "worker", 10)
@@ -673,7 +767,8 @@ async fn release_all_claims_and_store_operations_stay_in_their_workflow() {
         .remove(0);
     assert_eq!(reclaimed.attempt, 2);
     assert!(
-        repo.claim_many("theirs", "third-worker", 1)
+        their_repo
+            .claim_many("theirs", "third-worker", 1)
             .await
             .unwrap()
             .is_empty()
@@ -690,7 +785,17 @@ async fn release_all_claims_and_store_operations_stay_in_their_workflow() {
 
 #[tokio::test]
 async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
-    let (pool, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo(
+        "cascade",
+        &[
+            ("root", Normal, None),
+            ("child", Normal, None),
+            ("join", Join, None),
+            ("late_join", Join, None),
+        ],
+        &[("root", "join"), ("root", "late_join")],
+    )
+    .await;
     let root = repo.enqueue(&new_task("cascade", "root")).await.unwrap();
     let mut child = new_task("cascade", "child");
     child.run_id = root.run_id;
@@ -699,7 +804,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     let join = repo
         .enqueue(&Task {
             run_id: root.run_id,
-            task_type: "join".into(),
+
             depends_on_names: vec!["root".into()],
             ..new_task("cascade", "join")
         })
@@ -708,14 +813,19 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     let other_run = repo
         .enqueue(&Task {
             run_id: Some(0),
-            task_type: "join".into(),
+
             depends_on_names: vec!["root".into()],
             ..new_task("cascade", "join")
         })
         .await
         .unwrap();
-    let unrelated = repo.enqueue(&new_task("other", "root")).await.unwrap();
-    let store = SqliteTaskStore::new(repo.clone());
+    let other_repo =
+        SqliteTaskRepo::new(pool.clone(), graph("other", &[("root", Normal, None)], &[]));
+    let unrelated = other_repo
+        .enqueue(&new_task("other", "root"))
+        .await
+        .unwrap();
+    let store = repo.clone();
     let root = store
         .claim_many("cascade", "worker", 1)
         .await
@@ -762,7 +872,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     let late = repo
         .enqueue(&Task {
             run_id: root.run_id,
-            task_type: "join".into(),
+
             depends_on_names: vec!["root".into()],
             ..new_task("cascade", "late_join")
         })
@@ -778,7 +888,17 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
 async fn cascade_matches_runs_only_for_join_predecessors() {
     let runs = [Some(1), Some(2), Some(3), Some(0)];
     for source_run in runs {
-        let (_, repo) = memory_repo().await;
+        let (pool, repo) = memory_repo(
+            "cascade_runs",
+            &[
+                ("root", Normal, None),
+                ("child", Normal, None),
+                ("completed", Normal, None),
+                ("join", Join, None),
+            ],
+            &[("root", "join")],
+        )
+        .await;
         let mut root = new_task("cascade_runs", "root");
         root.run_id = source_run;
         let root = repo.enqueue(&root).await.unwrap();
@@ -792,7 +912,7 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
             targets.push(
                 repo.enqueue(&Task {
                     run_id: run_id,
-                    task_type: "join".into(),
+
                     depends_on_names: vec!["root".into()],
                     ..new_task("cascade_runs", "join")
                 })
@@ -804,7 +924,11 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
         let mut other_workflow = new_task("other", "child");
         other_workflow.run_id = source_run;
         other_workflow.parent_task_ids = vec![root.task_id];
-        let other_workflow = repo.enqueue(&other_workflow).await.unwrap();
+        let other_repo = SqliteTaskRepo::new(
+            pool.clone(),
+            graph("other", &[("child", Normal, None)], &[]),
+        );
+        let other_workflow = other_repo.enqueue(&other_workflow).await.unwrap();
 
         let mut completed = new_task("cascade_runs", "completed");
         completed.run_id = source_run;
@@ -820,7 +944,7 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
             .unwrap();
         repo.succeed(completed_claim, &json!("done")).await.unwrap();
 
-        let store = SqliteTaskStore::new(repo.clone());
+        let store = repo.clone();
         store
             .settle_failure(root_claim, "permanent failure", &[])
             .await
@@ -854,13 +978,18 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
 
 #[tokio::test]
 async fn renewal_extends_the_live_claim_without_changing_its_generation() {
-    let (pool, repo) = memory_repo().await;
-    let store = SqliteTaskStore::new(repo.clone());
     for max_attempts in [3, 0] {
         let workflow_id = format!("renew-{max_attempts}");
-        let mut task = new_task(&workflow_id, "root");
+        let (pool, repo) = memory_repo(
+            &workflow_id,
+            &[("analysis.root", Normal, Some("analysis"))],
+            &[],
+        )
+        .await;
+        let store = repo.clone();
+        let mut task = new_task(&workflow_id, "analysis.root");
         task.max_attempts = max_attempts;
-        task.subgraph_path = vec!["analysis".into()];
+
         let pending = repo.enqueue(&task).await.unwrap();
         assert!(store.renew_claim(&pending).await.unwrap().is_none());
         let claim = repo
@@ -909,7 +1038,16 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
 
 #[tokio::test]
 async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
-    let (pool, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo(
+        "fencing",
+        &[
+            ("root", Normal, None),
+            ("child", Normal, None),
+            ("forbidden", Normal, None),
+        ],
+        &[],
+    )
+    .await;
     let root = repo.enqueue(&new_task("fencing", "root")).await.unwrap();
     let mut child = new_task("fencing", "child");
     child.run_id = root.run_id;
@@ -929,9 +1067,9 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
         .remove(0);
     assert_eq!(second.attempt, first.attempt + 1);
     let before = serde_json::to_value(&second).unwrap();
-    let store = SqliteTaskStore::new(repo.clone());
+    let store = repo.clone();
     assert!(store.renew_claim(&first).await.unwrap().is_none());
-    let fanout = plan("forbidden", TaskType::Normal, vec![json!("stale")]);
+    let fanout = plan("forbidden", vec![json!("stale")]);
     for result in [
         repo.release_claim(&first).await,
         store
@@ -983,7 +1121,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
 
 #[tokio::test]
 async fn lease_expiry_rejects_settlement_even_without_takeover() {
-    let (pool, repo) = memory_repo().await;
+    let (pool, repo) = memory_repo("expiry", &[("root", Normal, None)], &[]).await;
     repo.enqueue(&new_task("expiry", "root")).await.unwrap();
     let claim = repo
         .claim_many("expiry", "worker", 1)
@@ -1023,7 +1161,12 @@ async fn lease_expiry_rejects_settlement_even_without_takeover() {
 
 #[tokio::test]
 async fn releasing_a_stopped_worker_does_not_release_another_workers_claims() {
-    let (_, repo) = memory_repo().await;
+    let (_, repo) = memory_repo(
+        "worker-release",
+        &[("first", Normal, None), ("second", Normal, None)],
+        &[],
+    )
+    .await;
     repo.enqueue(&new_task("worker-release", "first"))
         .await
         .unwrap();
@@ -1090,11 +1233,16 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     let pool_a = file.connect().await;
     migrate(&pool_a).await.unwrap();
     let pool_b = file.connect().await;
-    let repo_a = SqliteTaskRepo::new(pool_a.clone(), Default::default());
-    let repo_b = SqliteTaskRepo::new(pool_b.clone(), Default::default());
-    for i in 0..40 {
+    let declared = graph(
+        "concurrent",
+        &[("worker", Normal, None), ("after_reopen", Normal, None)],
+        &[],
+    );
+    let repo_a = SqliteTaskRepo::new(pool_a.clone(), declared.clone());
+    let repo_b = SqliteTaskRepo::new(pool_b.clone(), declared.clone());
+    for _ in 0..40 {
         repo_a
-            .enqueue(&new_task("concurrent", &format!("task-{i}")))
+            .enqueue(&new_task("concurrent", "worker"))
             .await
             .unwrap();
     }
@@ -1126,6 +1274,13 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
         .await
         .unwrap();
 
+    let fanin_graph = graph(
+        "concurrent_fanin",
+        &[("worker", Normal, None), ("collect", Join, None)],
+        &[("worker", "collect")],
+    );
+    let repo_a = SqliteTaskRepo::new(pool_a.clone(), fanin_graph.clone());
+    let repo_b = SqliteTaskRepo::new(pool_b.clone(), fanin_graph);
     for n in 1..=4 {
         let mut source = new_task("concurrent_fanin", "worker");
         source.run_id = Some(1);
@@ -1142,14 +1297,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
             repo.succeed_and_enqueue(
                 source,
                 &source.input,
-                &[Successor {
-                    predecessor_subgraph_paths: [("worker".into(), vec![])].into(),
-                    ..plan(
-                        "collect",
-                        TaskType::Join,
-                        vec![json!({"worker": source.input})],
-                    )
-                }],
+                &[plan("collect", vec![json!({"worker": source.input})])],
                 3,
             )
             .await
@@ -1198,7 +1346,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
 
     let reopened = file.connect().await;
     migrate(&reopened).await.unwrap();
-    let repo = SqliteTaskRepo::new(reopened.clone(), Default::default());
+    let repo = SqliteTaskRepo::new(reopened.clone(), declared);
     let rows = repo.list_all("concurrent").await.unwrap();
     assert_eq!(rows.len(), 40);
     let saved = repo.get("concurrent", task_id).await.unwrap().unwrap();

@@ -31,7 +31,8 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
 `Task::new(workflow_id, name, input)` 默认创建无依赖的独立运行入口，尝试预算为 3；
-入队前可设置 `run_id`、`scope_id`、`parent_task_ids`、`depends_on_names`、`task_type` 和 `max_attempts`。
+入队前可设置 `run_id`、`scope_id`、`parent_task_ids`、`depends_on_names` 和 `max_attempts`。
+节点类型、静态子图路径与前驱定义统一从绑定图查询；任务输入不重复携带这些静态定义。
 存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
 业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
 
@@ -43,8 +44,9 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 只有 JOIN 按 `workflow_id + run_id + scope_id + name` 汇入已有 pending / running JOIN，跨父任务
 累积输入，并将所有贡献者 ID 去重合并到 `parent_task_ids`。JOIN 是否就绪由
 `depends_on_names`、`scopes` 父子关系和任务状态共同判断。可能继续产生输入的上游范围
-在工作流创建时从当前执行图计算，并绑定该工作流的存储实例，不写入任务表。
-同一 Engine 的不同工作流共享数据库连接池，各自保留自己的上游映射。
+在图构建时计算并保存在图中，不写入任务表。仓储直接查询共享图，后继规划只包含
+目标节点、输入和是否为每条输入创建作用域，不复制节点类型、路径或前驱集合。
+同一 Engine 的不同工作流共享数据库连接池，各自绑定自己的图。
 
 ## 子图与执行作用域
 
@@ -96,10 +98,11 @@ DDL 只初始化当前 schema，不迁移旧表；旧 schema 数据库需要另�
 `Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享连接池。
 `engine.make(graph)` 接收 `Graph<Ctx>` 并返回非泛型的 `Workflow`，构造时立即启动一个后台调度器，
 因此必须在 Tokio runtime 内调用。调度器会认领当前图已有的可执行任务，无需先提交新运行。
-同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有绑定图上游映射的任务存储和独立的调度器。
-`Workflow` 通过 `Arc<dyn ErasedGraph>` 与后台调度器共享同一个 `Graph<Ctx>`，
+同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有绑定图的仓储和独立的调度器。
+仓储直接实现任务存储接口。`Workflow`、仓储和后台调度器共享同一个 `Graph<Ctx>`，
 节点执行仍保留类型约束。宿主可以直接将不同上下文的工作流放入同一集合，
-并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型和触发声明。
+并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型、子图路径、前驱和触发声明。
+节点查询对未知名称返回 `None`；创建任务及后继时要求目标属于绑定图，且工作流 ID 一致。
 需要具体上下文或其他图操作时，调用 `workflow.graph_as::<Ctx>()` 获取 `Option<&Graph<Ctx>>`；
 类型不匹配返回 `None`。图访问直接读取共享对象，不保存独立的节点类型或触发配置副本。
 不同图定义应使用不同的 `workflow_id`。

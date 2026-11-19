@@ -1,7 +1,7 @@
 //! SQLite 通用工作流后端，由 `sqlite` feature 启用。
 //!
 //! [`migrate`] 建立引擎自有表，随后用 [`SqliteTaskRepo`] 入队、查询任务，
-//! 用可共享的 [`SqliteTaskStore`] 驱动 [`crate::scheduler::Scheduler`]，调度器按图身份认领任务。
+//! 仓储直接实现任务存储接口，驱动 [`crate::scheduler::Scheduler`] 按图身份认领任务。
 //! 数组与 JSON 输入输出存为 JSON 文本，时间存为 UTC 文本。
 //! 写事务通过 `BEGIN IMMEDIATE` 串行化，保证并发认领和 JOIN 汇合的原子性。
 //!
@@ -26,4 +26,3 @@ mod scheduler_tests;
 
 pub use repo::SqliteTaskRepo;
 pub use schema::migrate;
-pub use store::SqliteTaskStore;

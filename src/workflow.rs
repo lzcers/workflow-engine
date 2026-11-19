@@ -32,13 +32,12 @@ impl Drop for Workflow {
 
 impl Workflow {
     pub(crate) fn new<Ctx>(
-        graph: Graph<Ctx>,
+        graph: Arc<Graph<Ctx>>,
         store: Arc<dyn TaskStore<Error = StorageError> + Send>,
     ) -> Self
     where
         Ctx: NodeContext + Sync + 'static,
     {
-        let graph = Arc::new(graph);
         let wake = Arc::new(Notify::new());
         let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_secs(1))
             .with_wake(wake.clone());
@@ -81,17 +80,14 @@ impl Workflow {
         entry: &str,
         input: impl Serialize,
     ) -> Result<RunHandle, EngineError> {
-        let task_type = self
-            .graph
+        self.graph
             .task_type_of(entry)
             .ok_or_else(|| EngineError::UnknownNode(entry.to_owned()))?;
-        let mut task = Task::new(
+        let task = Task::new(
             self.graph.workflow_id(),
             entry,
             serde_json::to_value(input)?,
         );
-        task.task_type = task_type.as_str().to_owned();
-        task.subgraph_path = self.graph.subgraph_path(entry);
         let record = self.store.enqueue(&task).await?;
         self.wake.notify_one();
         Ok(RunHandle {

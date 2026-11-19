@@ -1,12 +1,13 @@
 //! 数据库连接、引擎表初始化与任务存储创建；后端选择由连接 URL 决定。
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 #[cfg(feature = "pg")]
-use crate::backend::pgsql::{PgTaskRepo, PgTaskStore};
+use crate::backend::pgsql::PgTaskRepo;
 #[cfg(feature = "sqlite")]
-use crate::backend::sqlite::{SqliteTaskRepo, SqliteTaskStore};
+use crate::backend::sqlite::SqliteTaskRepo;
 use crate::error::StorageError;
+use crate::graph::ErasedGraph;
 use crate::task::TaskStore;
 
 /// 工作流存储的共享连接句柄。
@@ -113,22 +114,17 @@ impl Database {
         }
     }
 
-    /// 为一张图创建仓储并绑定其上游范围；不同图的仓储共享当前数据库连接池。
+    /// 为一张图创建仓储并共享原始图；不同图的仓储共享当前数据库连接池。
     /// 由 Engine 内部调用，不重新连接或初始化表。
     pub(crate) fn task_store(
         &self,
-        upstreams: HashMap<String, Vec<String>>,
+        graph: Arc<dyn ErasedGraph>,
     ) -> Arc<dyn TaskStore<Error = StorageError> + Send> {
         match self {
             #[cfg(feature = "pg")]
-            Self::Postgres(pool) => {
-                Arc::new(PgTaskStore::new(PgTaskRepo::new(pool.clone(), upstreams)))
-            }
+            Self::Postgres(pool) => Arc::new(PgTaskRepo::new(pool.clone(), graph)),
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => Arc::new(SqliteTaskStore::new(SqliteTaskRepo::new(
-                pool.clone(),
-                upstreams,
-            ))),
+            Self::Sqlite(pool) => Arc::new(SqliteTaskRepo::new(pool.clone(), graph)),
         }
     }
 

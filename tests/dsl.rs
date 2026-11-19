@@ -57,11 +57,11 @@ fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
     for input in [serde_json::json!([1]), serde_json::json!([1, 2, 3])] {
         let plans = graph.plan_success("source", &input).unwrap();
         assert_eq!(plans.len(), 2);
-        assert!(!plans[0].foreach);
-        assert!(plans[1].foreach);
+        assert!(!plans[0].new_scope_per_input);
+        assert!(plans[1].new_scope_per_input);
         for plan in plans {
             assert_eq!(plan.dst, "analysis.destination");
-            assert_eq!(plan.task_type, TaskType::Normal);
+            assert_eq!(graph.task_type_of(plan.dst), Some(TaskType::Normal));
             assert_eq!(&plan.inputs, input.as_array().unwrap());
         }
     }
@@ -78,7 +78,7 @@ fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
             &NodeError::retryable("retry"),
         )
         .unwrap();
-    assert!(!failure[0].foreach);
+    assert!(!failure[0].new_scope_per_input);
 }
 
 #[test]
@@ -365,7 +365,7 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
     assert_eq!(description.subgraphs[1].id, "batch.analysis");
     assert_eq!(description.subgraphs[1].parent_id.as_deref(), Some("batch"));
     assert_eq!(
-        graph.subgraph_path("batch.analysis.signal"),
+        graph.subgraph_path("batch.analysis.signal").unwrap(),
         ["batch", "batch.analysis"]
     );
     let plans = graph
@@ -373,22 +373,21 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
         .unwrap();
     assert_eq!(plans.len(), 2);
     assert_eq!(
-        plans[0].destination_subgraph_path,
+        graph.subgraph_path(plans[0].dst).unwrap(),
         ["batch", "batch.analysis"]
     );
     let join = &plans[1];
-    let mut predecessors: Vec<_> = join
-        .predecessor_subgraph_paths
-        .keys()
-        .map(String::as_str)
-        .collect();
-    predecessors.sort();
-    assert_eq!(predecessors, ["batch.analysis.signal", "batch.fetch"]);
-    assert_eq!(join.predecessor_subgraph_paths["batch.fetch"], ["batch"]);
+    assert_eq!(
+        graph.predecessors_of(join.dst).unwrap(),
+        ["batch.analysis.signal", "batch.fetch"]
+    );
+    assert_eq!(graph.subgraph_path("batch.fetch").unwrap(), ["batch"]);
+    assert!(graph.subgraph_path("missing").is_none());
+    assert!(graph.predecessors_of("missing").is_none());
     let exit = graph
         .plan_success("batch.analysis.join", &serde_json::json!({}))
         .unwrap();
-    assert!(exit[0].destination_subgraph_path.is_empty());
+    assert!(graph.subgraph_path(exit[0].dst).unwrap().is_empty());
 }
 
 #[test]

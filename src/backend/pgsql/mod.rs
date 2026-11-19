@@ -15,7 +15,7 @@
 //!
 //! 子模块划分：
 //! - [`repo`]：[`PgTaskRepo`]，通用 SQL 持久化操作（与业务查询解耦）；
-//! - [`store`]：[`PgTaskStore`]，[`crate::task::TaskStore`] 的 pgsql 实现；
+//! - [`store`]：为 [`PgTaskRepo`] 实现 [`crate::task::TaskStore`]；
 //! - [`crate::task::record`] / [`rows`]：数据库任务行与公共 [`crate::TaskRecord`]；
 //! - [`schema`]：引擎自有 DDL 与迁移入口。
 
@@ -32,4 +32,3 @@ mod test_support;
 
 pub use repo::PgTaskRepo;
 pub use schema::migrate;
-pub use store::PgTaskStore;

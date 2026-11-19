@@ -134,7 +134,7 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
                 return Err(format!("duplicate node name: {name}"));
             }
         }
-        let graph = Graph {
+        let mut graph = Graph {
             workflow_id: self.workflow_id,
             title: self.title,
             context: self.context,
@@ -142,8 +142,10 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
             subgraphs: self.subgraphs,
             success_edges: self.success_edges,
             failure_edges: self.failure_edges,
+            join_upstreams: Default::default(),
         };
         graph.validate()?;
+        graph.join_upstreams = graph.compute_join_upstreams();
         Ok(graph)
     }
 }

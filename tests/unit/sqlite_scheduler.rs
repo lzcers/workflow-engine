@@ -8,7 +8,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::{Notify, mpsc};
 
 use crate::{
-    backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
+    backend::sqlite::{SqliteTaskRepo, migrate},
     database::Database,
     dsl,
     graph::{JoinNode, Node, NodeContext, NodeError},
@@ -109,7 +109,8 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     }
     .unwrap();
 
-    let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
+    let graph = Arc::new(graph);
+    let repo = SqliteTaskRepo::new(pool, graph.clone());
     let root = repo
         .enqueue(&Task::new("dsl-workflow", "start", json!(0)))
         .await
@@ -122,8 +123,8 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert!(root.parent_task_ids.is_empty());
     assert_eq!(other_root.run_id, Some(other_root.task_id));
     assert_ne!(root.run_id, other_root.run_id);
-    let store = SqliteTaskStore::new(repo.clone()).with_max_attempts(5);
-    let scheduler = Scheduler::new(Arc::new(graph), Arc::new(store), Duration::from_millis(2))
+    let store = repo.clone().with_max_attempts(5);
+    let scheduler = Scheduler::new(graph.clone(), Arc::new(store), Duration::from_millis(2))
         .with_max_concurrency(3);
     tokio::time::timeout(Duration::from_secs(5), async {
         tokio::select! {
@@ -259,14 +260,15 @@ async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
         }
     }
     .unwrap();
-    let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
+    let graph = Arc::new(graph);
+    let repo = SqliteTaskRepo::new(pool, graph.clone());
     let root = repo
         .enqueue(&Task::new("nested-fanout", "start", json!(0)))
         .await
         .unwrap();
     let scheduler = Scheduler::new(
-        Arc::new(graph),
-        Arc::new(SqliteTaskStore::new(repo.clone())),
+        graph.clone(),
+        Arc::new(repo.clone()),
         Duration::from_millis(2),
     )
     .with_max_concurrency(3);
@@ -409,14 +411,15 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
             report_graph!(Item; |> |output| output.clone())
         }
         .unwrap();
-        let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
+        let graph = Arc::new(graph);
+        let repo = SqliteTaskRepo::new(pool, graph.clone());
         let root = repo
             .enqueue(&Task::new("scoped-reports", "start", json!(0)))
             .await
             .unwrap();
         let scheduler = Scheduler::new(
-            Arc::new(graph),
-            Arc::new(SqliteTaskStore::new(repo.clone())),
+            graph.clone(),
+            Arc::new(repo.clone()),
             Duration::from_millis(2),
         )
         .with_max_concurrency(8);
@@ -559,14 +562,15 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
             }
         }
         .unwrap();
-        let repo = SqliteTaskRepo::new(pool, graph.join_upstreams());
+        let graph = Arc::new(graph);
+        let repo = SqliteTaskRepo::new(pool, graph.clone());
         let root = repo
             .enqueue(&Task::new("external-entry-join", "start", json!(0)))
             .await
             .unwrap();
         let scheduler = Scheduler::new(
-            Arc::new(graph),
-            Arc::new(SqliteTaskStore::new(repo.clone())),
+            graph.clone(),
+            Arc::new(repo.clone()),
             Duration::from_millis(2),
         )
         .with_max_concurrency(8);
@@ -664,21 +668,16 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         .await
         .unwrap();
     migrate(&db).await.unwrap();
-    let repo = SqliteTaskRepo::new(db.clone(), Default::default());
     let mut task = Task {
-        task_type: "normal".into(),
         workflow_id: "scheduler-wake".into(),
         run_id: None,
         scope_id: None,
-        subgraph_path: vec![],
         parent_task_ids: vec![],
         name: "slow".into(),
         max_attempts: 3,
         depends_on_names: vec![],
         input: json!(0),
     };
-    repo.enqueue(&task).await.unwrap();
-
     let slow_started = Arc::new(Notify::new());
     let fast_started = Arc::new(Notify::new());
     let release_slow = Arc::new(Notify::new());
@@ -693,10 +692,13 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         edges {}
     }
     .unwrap();
+    let graph = Arc::new(graph);
+    let repo = SqliteTaskRepo::new(db.clone(), graph.clone());
+    repo.enqueue(&task).await.unwrap();
     let wake = Arc::new(Notify::new());
     let scheduler = Scheduler::new(
-        Arc::new(graph),
-        Arc::new(SqliteTaskStore::new(repo.clone())),
+        graph.clone(),
+        Arc::new(repo.clone()),
         Duration::from_secs(60),
     )
     .with_max_concurrency(2)

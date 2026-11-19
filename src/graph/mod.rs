@@ -46,18 +46,16 @@ pub struct Graph<Ctx> {
     subgraphs: Vec<SubgraphDescription>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
+    join_upstreams: HashMap<String, Vec<String>>,
 }
 
 /// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
 #[derive(Debug, Clone)]
 pub struct Successor {
     pub dst: &'static str,
-    pub task_type: TaskType,
     pub inputs: Vec<Value>,
-    pub foreach: bool,
-    pub destination_subgraph_path: Vec<String>,
-    /// 直接前驱的静态归属，用于选择当前子图调用的有效入口。
-    pub predecessor_subgraph_paths: HashMap<String, Vec<String>>,
+    /// 每项输入创建独立的子图调用；为 false 时，同次结算的普通跨入边共享调用。
+    pub new_scope_per_input: bool,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -138,13 +136,10 @@ impl<Ctx> Graph<Ctx> {
         node.node.execute(name, ctx, input).await
     }
 
-    /// 节点所属子图的完整路径，按外层到内层排列。
-    pub fn subgraph_path(&self, name: &str) -> Vec<String> {
+    /// 节点所属子图路径；根节点为 Some([])，不存在的节点为 None。
+    pub fn subgraph_path(&self, name: &str) -> Option<Vec<String>> {
         let mut path = Vec::new();
-        let mut current = self
-            .nodes
-            .get(name)
-            .and_then(|node| node.subgraph_id.as_deref());
+        let mut current = self.nodes.get(name)?.subgraph_id.as_deref();
         while let Some(id) = current {
             path.push(id.to_owned());
             current = self
@@ -154,7 +149,7 @@ impl<Ctx> Graph<Ctx> {
                 .and_then(|subgraph| subgraph.parent_id.as_deref());
         }
         path.reverse();
-        path
+        Some(path)
     }
 
     /// 所有成功边分别规划；不同 foreach 边不合并，也不按下标隐式配对。
@@ -165,20 +160,10 @@ impl<Ctx> Graph<Ctx> {
             if inputs.is_empty() {
                 continue;
             }
-            let dst = edge.dst();
-            let task_type = self.task_type_of(dst).expect("validated edge destination");
-            let depends_on_names = self.predecessors_of(dst);
-            let predecessor_subgraph_paths = depends_on_names
-                .iter()
-                .map(|name| (name.clone(), self.subgraph_path(name)))
-                .collect();
             plans.push(Successor {
-                dst,
-                task_type,
-                foreach: edge.is_foreach(),
-                destination_subgraph_path: self.subgraph_path(dst),
+                dst: edge.dst(),
                 inputs,
-                predecessor_subgraph_paths,
+                new_scope_per_input: edge.is_foreach(),
             });
         }
         Ok(plans)
@@ -199,20 +184,19 @@ impl<Ctx> Graph<Ctx> {
             }
             plans.push(Successor {
                 dst: edge.dst(),
-                task_type: self
-                    .task_type_of(edge.dst())
-                    .expect("validated edge destination"),
-                foreach: false,
-                destination_subgraph_path: self.subgraph_path(edge.dst()),
                 inputs,
-                predecessor_subgraph_paths: HashMap::new(),
+                new_scope_per_input: false,
             });
         }
         Ok(plans)
     }
 
-    /// 从固定执行图派生 JOIN 生产者范围；不随任务持久化。
-    pub(crate) fn join_upstreams(&self) -> HashMap<String, Vec<String>> {
+    /// 构建后固定的 JOIN 上游范围，供所有执行和存储调用共享。
+    pub fn join_upstreams(&self) -> &HashMap<String, Vec<String>> {
+        &self.join_upstreams
+    }
+
+    fn compute_join_upstreams(&self) -> HashMap<String, Vec<String>> {
         self.nodes
             .iter()
             .filter(|(_, entry)| entry.node.task_type() == TaskType::Join)
@@ -220,9 +204,9 @@ impl<Ctx> Graph<Ctx> {
             .collect()
     }
 
-    fn upstream_names(&self, dst: &'static str) -> Vec<String> {
+    fn upstream_names(&self, dst: &str) -> Vec<String> {
         let mut seen = HashSet::new();
-        let mut pending = self.predecessors_of(dst);
+        let mut pending = self.predecessors_of(dst).expect("validated JOIN node");
         while let Some(name) = pending.pop() {
             if !seen.insert(name.clone()) {
                 continue;
@@ -241,9 +225,10 @@ impl<Ctx> Graph<Ctx> {
 
     /// 节点的静态前驱节点名集合：返回所有成功边汇入 `dst` 的源节点名全集。
     ///
-    /// 通用血缘语义：普通节点也记录自己的静态前驱；是否用其做「等齐前驱」闸门
-    /// 由目标节点的 `task_type` 决定（仅 [`TaskType::Join`] 生效）。
-    fn predecessors_of(&self, dst: &'static str) -> Vec<String> {
+    /// 不存在的节点为 None，存在但没有成功前驱的节点为 Some([])。
+    /// JOIN 的有效等待集合还需由存储结合当前作用域入口筛选。
+    pub fn predecessors_of(&self, dst: &str) -> Option<Vec<String>> {
+        self.nodes.get(dst)?;
         let mut set: HashSet<&'static str> = HashSet::new();
         for e in self.success_edges.iter().filter(|e| e.dst() == dst) {
             set.insert(e.src());
@@ -251,7 +236,7 @@ impl<Ctx> Graph<Ctx> {
         {
             let mut names: Vec<_> = set.into_iter().map(str::to_owned).collect();
             names.sort();
-            names
+            Some(names)
         }
     }
 

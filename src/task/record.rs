@@ -94,13 +94,9 @@ pub struct Task {
     pub run_id: Option<i64>,
     /// 直接入队的父实例，None 为根作用域。
     pub scope_id: Option<i64>,
-    /// 目标节点的静态子图路径，仅在入队时使用，不存入任务表。
-    pub subgraph_path: Vec<String>,
     /// 来源任务 ID 集合；独立入口为空，不作为认领时的成功条件。
     pub parent_task_ids: Vec<i64>,
     pub name: String,
-    /// 节点声明的任务类型（`normal`/`join`/`event`），入队时原样保存。
-    pub task_type: String,
     pub max_attempts: i32,
     /// JOIN 静态前驱节点名全集（普通节点默认空集）。
     pub depends_on_names: Vec<String>,
@@ -108,16 +104,14 @@ pub struct Task {
 }
 
 impl Task {
-    /// 创建普通类型的独立运行入口；入队前可设置节点类型、运行、作用域、来源、静态前驱和尝试预算。
+    /// 创建独立运行入口；节点类型和静态归属由存储从图定义读取。
     pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             workflow_id: workflow_id.into(),
             run_id: None,
             scope_id: None,
-            subgraph_path: Vec::new(),
             parent_task_ids: Vec::new(),
             name: name.into(),
-            task_type: "normal".to_owned(),
             max_attempts: 3,
             depends_on_names: Vec::new(),
             input,
