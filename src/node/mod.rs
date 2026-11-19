@@ -8,7 +8,6 @@
 //!
 //! 子模块划分：
 //! - [`join`]：显式 JOIN 汇聚节点（[`JoinNode`]），引擎通用能力，把多前驱输入合并透传。
-//! - [`scope`]：执行作用域入口（[`ScopeNode`]），为每个任务及其下游建立独立的 JOIN 判定域。
 
 use futures::future::BoxFuture;
 use std::any::TypeId;
@@ -22,10 +21,8 @@ use serde_json::Value;
 use super::task::TaskRecord;
 
 mod join;
-mod scope;
 
 pub use join::JoinNode;
-pub use scope::ScopeNode;
 
 /// 外部触发器的注册声明。种类与配置由宿主解释，引擎只负责描述和提交后的任务执行。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +44,7 @@ pub trait Node<Ctx>: Send + Sync {
     type In: Serialize + DeserializeOwned + 'static;
     /// 任务输出类型，对应 DB `task.output`。
     type Out: Serialize + DeserializeOwned + 'static;
-    /// 该节点产出的任务类型。JOIN 等齐同作用域的前驱，Scope 为每个任务建立新作用域。
+    /// 该节点产出的任务类型；子图边界由图结构声明。
     const TASK_TYPE: TaskType = TaskType::Normal;
 
     /// 外部触发器的注册信息。Event 节点必须返回 Some，其他节点必须返回 None。
@@ -264,8 +261,8 @@ impl From<String> for NodeError {
     }
 }
 
-/// 节点声明的任务类型：Event 为外部事件入口，Scope 建立执行作用域，JOIN 等齐同作用域的静态前驱。
-/// Event 与 Scope 入队后的认领与执行沿用普通任务规则；事件监听和注册由宿主负责。
+/// 节点声明的任务类型：Event 为外部事件入口，JOIN 等待关联来源。
+/// Event 入队后的认领与执行沿用普通任务规则；事件监听和注册由宿主负责。
 ///
 /// 由节点经 [`Node::TASK_TYPE`] 常量声明，作为**类型级自描述**（编译期确定），
 /// 而非运行时询问。DB `tasks.task_type` 列以 [`TaskType::as_str`] 的字符串承载。
@@ -275,9 +272,7 @@ pub enum TaskType {
     Normal,
     /// 外部事件入口：声明触发配置，不允许成功边或失败边指向此节点。
     Event,
-    /// 执行作用域入口：每个任务以自身 task_id 建立新作用域，下游继承。
-    Scope,
-    /// JOIN 汇聚门：需等同作用域的全部静态前驱（`depends_on_names`）成功后才放行。
+    /// JOIN 汇聚门：按 join_state 等待预期来源成功、贡献到齐及上游生产结束。
     Join,
 }
 
@@ -287,7 +282,6 @@ impl TaskType {
         match self {
             TaskType::Normal => "normal",
             TaskType::Event => "event",
-            TaskType::Scope => "scope",
             TaskType::Join => "join",
         }
     }

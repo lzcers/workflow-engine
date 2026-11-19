@@ -22,7 +22,7 @@ pub trait SuccessEdge: Send + Sync {
     /// 目标节点名。
     fn dst(&self) -> &'static str;
     /// 每条输入是否为目标任务建立独立作用域；普通转换和透传边继承上游作用域。
-    fn creates_scope(&self) -> bool {
+    fn is_foreach(&self) -> bool {
         false
     }
     /// 成功条件（`None` 为无条件）。
@@ -42,7 +42,7 @@ pub trait AnySuccessEdge: Send + Sync {
     /// 目标节点名。
     fn dst(&self) -> &'static str;
     /// 每条输入是否为目标任务建立独立作用域。
-    fn creates_scope(&self) -> bool;
+    fn is_foreach(&self) -> bool;
     /// 成功规划：条件命中经 `map` 产出 `dst` 输入（已序列化为 `Value`）。
     ///
     /// - `Ok(Vec)` 为空 = 正常剪枝（`when` 不命中 / `map` 返回空，**不产出任何下游实例**）。
@@ -67,8 +67,8 @@ where
     fn dst(&self) -> &'static str {
         SuccessEdge::dst(self)
     }
-    fn creates_scope(&self) -> bool {
-        SuccessEdge::creates_scope(self)
+    fn is_foreach(&self) -> bool {
+        SuccessEdge::is_foreach(self)
     }
 
     fn src_out_type(&self) -> TypeFingerprint {

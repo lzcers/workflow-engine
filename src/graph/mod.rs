@@ -19,11 +19,11 @@ pub use crate::edge::{
     EdgeError, EdgeImpl, ErrorWhenBuilder, FailureEdge, FailureEdgeImpl, SuccessEdge, WhenBuilder,
     foreach, map, on_error, when, when_error,
 };
-pub use crate::node::{
-    JoinNode, Node, NodeContext, NodeError, NodeKey, ScopeNode, TaskType, Trigger,
-};
+pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
 pub use builder::GraphBuilder;
-pub use description::{EdgeDescription, EdgeKind, GraphDescription, NodeDescription};
+pub use description::{
+    EdgeDescription, EdgeKind, GraphDescription, NodeDescription, SubgraphDescription,
+};
 pub use erased::ErasedGraph;
 
 /// 节点实例与注册时的展示信息共用一条记录，保证描述对应实际执行的节点。
@@ -31,6 +31,7 @@ struct GraphNode<Ctx> {
     node: Box<dyn AnyNode<Ctx>>,
     title: String,
     description: String,
+    subgraph_id: Option<String>,
 }
 
 /// 图引擎：节点注册表 + 成功/失败边集合，持有上下文与节点实例，负责执行、后继规划、静态校验。
@@ -42,24 +43,26 @@ pub struct Graph<Ctx> {
     title: String,
     context: Ctx,
     nodes: HashMap<&'static str, GraphNode<Ctx>>,
+    subgraphs: Vec<SubgraphDescription>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
 }
 
-/// 一条后继规划：目标节点名 + 输入列表（按目标节点与作用域策略聚合）。
+/// 一条实际边的后继规划，保留边身份及逐项输入顺序。
 #[derive(Debug)]
 pub struct Successor {
-    /// 目标节点名。
+    pub edge_id: String,
     pub dst: &'static str,
-    /// 目标节点产出的任务类型，入队时落库到 `task_type` 列。
     pub task_type: TaskType,
-    /// 每条输入是否以新目标任务的 task_id 建立作用域；false 时继承上游作用域。
-    pub creates_scope: bool,
-    /// 喂给 `dst` 的输入列表。普通/Scope 节点每条输入创建独立任务，JOIN 在同一运行、作用域内累积输入。
+    pub foreach: bool,
+    pub source_subgraph_path: Vec<String>,
+    pub destination_subgraph_path: Vec<String>,
     pub inputs: Vec<Value>,
-    /// 目标节点的静态前驱节点名全集（通用血缘，`String` 以便直接落库）。是否用其做
-    /// 「等齐前驱」闸门由 `task_type` 决定（仅 [`TaskType::Join`] 生效）。
     pub depends_on_names: Vec<String>,
+    /// 包含直接前驱及全部传递上游，用于解析跨子图依赖。
+    pub predecessor_subgraph_paths: HashMap<String, Vec<String>>,
+    pub join_incoming_edges: HashMap<String, String>,
+    pub join_upstream_names: Vec<String>,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -140,103 +143,134 @@ impl<Ctx> Graph<Ctx> {
         node.node.execute(name, ctx, input).await
     }
 
-    /// 规划 `name` 节点的成功后继：遍历其出成功边，`when` 命中后经 `map` 产出 dst 输入，
-    /// 并按 (dst, creates_scope) 聚合为批量后继，是否汇合由目标节点类型决定。
-    ///
-    /// 返回 [`Successor`] 列表：`when` 不命中或 `map` 返回空则无该项；无 `map` 时透传 `out`。
-    /// 纯函数，不触碰 DB——只回答「该入队哪些后继、各喂什么输入（单条 or 多条）」。
-    ///
-    /// 规划失败（[`EdgeError`]，多为图装配/类型接线错误）为确定性错误，应终止结算。
-    pub fn plan_success(&self, name: &str, out: &Value) -> Result<Vec<Successor>, EdgeError> {
-        // 同一目标的普通转换和 foreach 必须保留各自的作用域策略。
-        let mut order = Vec::new();
-        let mut by_destination: HashMap<(&'static str, bool), Vec<Value>> = HashMap::new();
-
-        // 遍历所有成功路径的边，拿到这些边的目标。
-        for e in self.success_edges.iter().filter(|e| e.src() == name) {
-            let destination = (e.dst(), e.creates_scope());
-            // 按首次出现顺序保留各目标与作用域策略。
-            if !by_destination.contains_key(&destination) {
-                order.push(destination);
-            }
-            // 对于 image_propmt |map|-> image_generator 经过 map 转换后会是一个 Vec<Input>
-            // 这意味着扇出多实例了
-            // {image_generator: Vec[Input]}
-            by_destination
-                .entry(destination)
-                .or_default()
-                .extend(e.plan_success(out)?);
+    /// 节点所属子图的完整路径，按外层到内层排列。
+    pub fn subgraph_path(&self, name: &str) -> Vec<String> {
+        let mut path = Vec::new();
+        let mut current = self
+            .nodes
+            .get(name)
+            .and_then(|node| node.subgraph_id.as_deref());
+        while let Some(id) = current {
+            path.push(id.to_owned());
+            current = self
+                .subgraphs
+                .iter()
+                .find(|subgraph| subgraph.id == id)
+                .and_then(|subgraph| subgraph.parent_id.as_deref());
         }
-        Ok(order
-            .into_iter()
-            .filter_map(|(dst, creates_scope)| {
-                let inputs = by_destination.remove(&(dst, creates_scope))?;
-                if inputs.is_empty() {
-                    return None;
-                }
-                Some(Successor {
-                    dst,
-                    inputs,
-                    task_type: self.task_type_of(dst).expect("validated edge destination"),
-                    creates_scope,
-                    depends_on_names: self.predecessors_of(dst),
-                })
-            })
-            .collect())
+        path.reverse();
+        path
     }
 
-    /// 规划 `name` 节点的失败后继：遍历其失败边，`when` 命中后经 `map` 产出 dst 输入，
-    /// 并按 dst 聚合为批量后继，creates_scope 始终为 false。失败边不约束为回退操作，
-    /// 可做错误分支、兜底降级等一般路由；无 `map` 时透传失败节点输入。
-    ///
-    /// 返回 [`Successor`] 列表：`when` 不命中或 `map` 返回空则无该项。
-    /// `task_type` 如实反映 dst 节点的类型（同 [`Graph::plan_success`]）；
-    /// `depends_on_names` **保持为空**——这是当前存储层的能力约束：认领闸门只支持
-    /// 「等齐全部前驱**成功**」的 JOIN 语义，不支持「等齐失败/终态」。若把失败源节点名填入
-    /// `depends_on_names`，失败后继会因源节点状态为 `failed`/`superseded` 而永远无法被认领
-    /// （悬挂）。等存储层新增「等齐失败」闸门后，可改为填充失败源名全集，以支持按源汇聚的
-    /// 通用错误处理节点。
-    ///
-    /// 规划失败（[`EdgeError`]，图装配/类型接线错误）为确定性错误，调用方应告警并按无后继处理。
+    /// 所有成功边分别规划；不同 foreach 边不合并，也不按下标隐式配对。
+    pub fn plan_success(&self, name: &str, out: &Value) -> Result<Vec<Successor>, EdgeError> {
+        let mut plans = Vec::new();
+        for (index, edge) in self
+            .success_edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| edge.src() == name)
+        {
+            let inputs = edge.plan_success(out)?;
+            if inputs.is_empty() {
+                continue;
+            }
+            let dst = edge.dst();
+            let task_type = self.task_type_of(dst).expect("validated edge destination");
+            let depends_on_names = self.predecessors_of(dst);
+            let join_upstream_names = if task_type == TaskType::Join {
+                self.upstream_names(dst)
+            } else {
+                Vec::new()
+            };
+            let predecessor_subgraph_paths = depends_on_names
+                .iter()
+                .chain(&join_upstream_names)
+                .map(|name| (name.clone(), self.subgraph_path(name)))
+                .collect();
+            let join_incoming_edges = if task_type == TaskType::Join {
+                self.success_edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, edge)| edge.dst() == dst)
+                    .map(|(index, edge)| (format!("success:{index}"), edge.src().to_owned()))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            plans.push(Successor {
+                edge_id: format!("success:{index}"),
+                dst,
+                task_type,
+                foreach: edge.is_foreach(),
+                source_subgraph_path: self.subgraph_path(name),
+                destination_subgraph_path: self.subgraph_path(dst),
+                inputs,
+                depends_on_names,
+                predecessor_subgraph_paths,
+                join_incoming_edges,
+                join_upstream_names,
+            });
+        }
+        Ok(plans)
+    }
+
+    /// 失败边也按子图边界进入或退出；失败路由不建立成功 JOIN 等待条件。
     pub fn plan_failure(
         &self,
         name: &str,
         input: &Value,
         err: &NodeError,
     ) -> Result<Vec<Successor>, EdgeError> {
-        // 失败边均继承作用域，只需按目标节点名字分组收集。
-        let mut order: Vec<&'static str> = Vec::new();
-        let mut by_dst: HashMap<&'static str, Vec<Value>> = HashMap::new();
-        for e in self.failure_edges.iter().filter(|e| e.src() == name) {
-            let dst = e.dst();
-            if !by_dst.contains_key(dst) {
-                order.push(dst);
+        let mut plans = Vec::new();
+        for (index, edge) in self
+            .failure_edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| edge.src() == name)
+        {
+            let inputs = edge.plan_failure(input, err)?;
+            if inputs.is_empty() {
+                continue;
             }
-            by_dst
-                .entry(dst)
-                .or_default()
-                .extend(e.plan_failure(input, err)?);
+            plans.push(Successor {
+                edge_id: format!("failure:{index}"),
+                dst: edge.dst(),
+                task_type: self
+                    .task_type_of(edge.dst())
+                    .expect("validated edge destination"),
+                foreach: false,
+                source_subgraph_path: self.subgraph_path(name),
+                destination_subgraph_path: self.subgraph_path(edge.dst()),
+                inputs,
+                depends_on_names: Vec::new(),
+                predecessor_subgraph_paths: HashMap::new(),
+                join_incoming_edges: HashMap::new(),
+                join_upstream_names: Vec::new(),
+            });
         }
-        Ok(order
-            .into_iter()
-            .filter_map(|dst| {
-                let inputs = by_dst.remove(dst)?;
-                if inputs.is_empty() {
-                    return None;
-                }
-                Some(Successor {
-                    dst,
-                    inputs,
-                    // task_type 如实反映 dst 节点类型：失败后继可能汇聚到 JOIN/错误处理节点，
-                    task_type: self.task_type_of(dst).expect("validated edge destination"),
-                    creates_scope: false,
-                    // 保持为空（当前约束）：认领闸门只支持「等齐前驱成功」，不支持「等齐失败」；
-                    // 填入失败源名会让后继因前驱已失败而永久悬挂。详见方法级注释。
-                    depends_on_names: Vec::new(),
-                })
-            })
-            .collect())
+        Ok(plans)
     }
+
+    fn upstream_names(&self, dst: &'static str) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut pending = self.predecessors_of(dst);
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            pending.extend(
+                self.success_edges
+                    .iter()
+                    .filter(|edge| edge.dst() == name)
+                    .map(|edge| edge.src().to_owned()),
+            );
+        }
+        let mut names: Vec<_> = seen.into_iter().collect();
+        names.sort();
+        names
+    }
+
     /// 节点的静态前驱节点名集合：返回所有成功边汇入 `dst` 的源节点名全集。
     ///
     /// 通用血缘语义：普通节点也记录自己的静态前驱；是否用其做「等齐前驱」闸门
@@ -246,7 +280,11 @@ impl<Ctx> Graph<Ctx> {
         for e in self.success_edges.iter().filter(|e| e.dst() == dst) {
             set.insert(e.src());
         }
-        set.into_iter().map(|s| s.to_string()).collect()
+        {
+            let mut names: Vec<_> = set.into_iter().map(str::to_owned).collect();
+            names.sort();
+            names
+        }
     }
 
     /// 静态校验：节点名唯一、边两端节点存在、边类型接线指纹一致、success 子图无环、
@@ -262,12 +300,13 @@ impl<Ctx> Graph<Ctx> {
         if self.title.trim().is_empty() {
             return Err("workflow title must not be empty".into());
         }
+        self.describe().validate_subgraphs()?;
         for (name, entry) in &self.nodes {
             match (entry.node.task_type(), entry.node.trigger()) {
                 (TaskType::Event, None) => {
                     return Err(format!("event node {name} must declare a trigger"));
                 }
-                (TaskType::Normal | TaskType::Join | TaskType::Scope, Some(_)) => {
+                (TaskType::Normal | TaskType::Join, Some(_)) => {
                     return Err(format!("non-event node {name} must not declare a trigger"));
                 }
                 _ => {}
@@ -287,7 +326,7 @@ impl<Ctx> Graph<Ctx> {
                     e.dst()
                 ));
             }
-            if e.creates_scope() && dst.node.task_type() == TaskType::Join {
+            if e.is_foreach() && dst.node.task_type() == TaskType::Join {
                 return Err(format!(
                     "foreach edge must not target join node {}",
                     e.dst()

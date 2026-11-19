@@ -11,7 +11,7 @@ use crate::{
     backend::sqlite::{SqliteTaskRepo, SqliteTaskStore, migrate},
     database::Database,
     dsl,
-    graph::{JoinNode, Node, NodeContext, NodeError, ScopeNode},
+    graph::{JoinNode, Node, NodeContext, NodeError},
     scheduler::Scheduler,
     task::{Task, TaskRecord, TaskStatus},
 };
@@ -187,7 +187,12 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     );
     let join = tasks.iter().find(|task| task.name == "collect").unwrap();
     assert_eq!(join.task_type, "join");
-    let mut predecessors = join.depends_on_names.clone();
+    let mut predecessors = join
+        .join_state
+        .expected
+        .iter()
+        .map(|dependency| dependency.name.clone())
+        .collect::<Vec<_>>();
     predecessors.sort();
     assert_eq!(predecessors, ["summary", "worker"]);
     let mut parent_ids = join.parent_task_ids.clone();
@@ -370,22 +375,26 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                         source_a => SignalNode { started: starts[0].clone(), release: Some(releases[0].clone()) },
                         source_b => SignalNode { started: starts[1].clone(), release: Some(releases[1].clone()) },
                         source_c => SignalNode { started: starts[2].clone(), release: Some(releases[2].clone()) },
+                    }
+                    subgraph analysis {
+                        nodes {
                         per_item => $item_node,
                         worker => AddOne,
                         collect => JoinNode,
                         report => Sum,
+                        }
                     }
                     edges {
                         start -> source_a,
                         start -> source_b |> |output| vec![*output + 10],
                         start -> source_c |> |output| vec![*output + 20],
-                        source_a -> per_item $($clause)*,
-                        source_b -> per_item $($clause)*,
-                        source_c -> per_item $($clause)*,
-                        per_item -> worker,
-                        per_item -> collect |> |output| vec![json!({"summary": output})],
-                        worker -> collect |> |output| vec![json!({"worker": [output]})],
-                        collect -> report |> |output: &Value| vec![
+                        source_a -> analysis.per_item $($clause)*,
+                        source_b -> analysis.per_item $($clause)*,
+                        source_c -> analysis.per_item $($clause)*,
+                        analysis.per_item -> analysis.worker,
+                        analysis.per_item -> analysis.collect |> |output| vec![json!({"summary": output})],
+                        analysis.worker -> analysis.collect |> |output| vec![json!({"worker": [output]})],
+                        analysis.collect -> analysis.report |> |output: &Value| vec![
                             serde_json::from_value::<Collected>(output.clone()).unwrap(),
                         ],
                     }
@@ -395,7 +404,7 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
         let graph = if use_foreach {
             report_graph!(Item; foreach)
         } else {
-            report_graph!(ScopeNode::<i32>::new(); |> |output| output.clone())
+            report_graph!(Item; |> |output| output.clone())
         }
         .unwrap();
         let root = repo
@@ -421,7 +430,7 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                         loop {
                             let tasks = repo.list_all("scoped-reports").await.unwrap();
                             let reports = tasks.iter().filter(|task|
-                                task.name == "report" && task.status == TaskStatus::Succeeded
+                                task.name == "analysis.report" && task.status == TaskStatus::Succeeded
                             ).count();
                             if reports == index + 1 {
                                 break;
@@ -442,15 +451,12 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
             && task.attempt == 1));
         let scopes: Vec<_> = tasks
             .iter()
-            .filter(|task| task.name == "per_item")
+            .filter(|task| task.name == "analysis.per_item")
             .collect();
         assert_eq!(scopes.len(), 3);
         for scope in scopes {
-            assert_eq!(
-                scope.task_type,
-                if use_foreach { "normal" } else { "scope" }
-            );
-            assert_eq!(scope.scope_id, Some(scope.task_id));
+            assert_eq!(scope.task_type, "normal");
+            assert!(scope.scope_id.is_some());
             let source = tasks
                 .iter()
                 .find(|task| scope.parent_task_ids == [task.task_id])
@@ -463,26 +469,43 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                 .collect();
             assert_eq!(scoped.len(), 4, "scope, worker, JOIN and report");
             let input = scope.input.as_i64().unwrap();
-            let worker = scoped.iter().find(|task| task.name == "worker").unwrap();
+            let worker = scoped
+                .iter()
+                .find(|task| task.name == "analysis.worker")
+                .unwrap();
             assert_eq!(worker.parent_task_ids, [scope.task_id]);
             assert_eq!(worker.input, scope.input);
             assert_eq!(worker.output, Some(json!(input + 1)));
 
-            let join = scoped.iter().find(|task| task.name == "collect").unwrap();
-            let mut predecessors = join.depends_on_names.clone();
+            let join = scoped
+                .iter()
+                .find(|task| task.name == "analysis.collect")
+                .unwrap();
+            let mut predecessors = join
+                .join_state
+                .expected
+                .iter()
+                .map(|dependency| dependency.name.clone())
+                .collect::<Vec<_>>();
             predecessors.sort();
-            assert_eq!(predecessors, ["per_item", "worker"]);
+            assert_eq!(predecessors, ["analysis.per_item", "analysis.worker"]);
             let mut parents = join.parent_task_ids.clone();
             parents.sort_unstable();
             assert_eq!(parents, [scope.task_id, worker.task_id]);
             assert_eq!(join.input, json!({"summary": input, "worker": [input + 1]}));
 
-            let report = scoped.iter().find(|task| task.name == "report").unwrap();
+            let report = scoped
+                .iter()
+                .find(|task| task.name == "analysis.report")
+                .unwrap();
             assert_eq!(report.parent_task_ids, [join.task_id]);
             assert_eq!(report.input, join.input);
             assert_eq!(report.output, Some(json!(input * 2 + 1)));
         }
-        let mut reports: Vec<_> = tasks.iter().filter(|task| task.name == "report").collect();
+        let mut reports: Vec<_> = tasks
+            .iter()
+            .filter(|task| task.name == "analysis.report")
+            .collect();
         reports.sort_unstable_by_key(|task| task.task_id);
         assert_eq!(
             reports
@@ -518,6 +541,7 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         workflow_id: "scheduler-wake".into(),
         run_id: None,
         scope_id: None,
+        subgraph_path: vec![],
         parent_task_ids: vec![],
         name: "slow".into(),
         max_attempts: 3,

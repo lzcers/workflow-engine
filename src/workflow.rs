@@ -91,6 +91,7 @@ impl Workflow {
             serde_json::to_value(input)?,
         );
         task.task_type = task_type.as_str().to_owned();
+        task.subgraph_path = self.graph.subgraph_path(entry);
         let record = self.store.enqueue(&task).await?;
         self.wake.notify_one();
         Ok(RunHandle {

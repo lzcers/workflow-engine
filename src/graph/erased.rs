@@ -21,6 +21,9 @@ pub trait ErasedGraph: Any + Send + Sync {
     /// 节点声明的任务类型；节点不存在时返回 None。
     fn task_type_of(&self, name: &str) -> Option<TaskType>;
 
+    /// 静态子图路径。
+    fn subgraph_path(&self, name: &str) -> Vec<String>;
+
     /// 按节点名排序的外部触发声明。
     fn triggers(&self) -> Vec<(&str, Trigger)>;
 }
@@ -40,6 +43,10 @@ impl<Ctx: Send + Sync + 'static> ErasedGraph for Graph<Ctx> {
 
     fn task_type_of(&self, name: &str) -> Option<TaskType> {
         Graph::task_type_of(self, name)
+    }
+
+    fn subgraph_path(&self, name: &str) -> Vec<String> {
+        Graph::subgraph_path(self, name)
     }
 
     fn triggers(&self) -> Vec<(&str, Trigger)> {

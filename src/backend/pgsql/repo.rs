@@ -4,8 +4,13 @@
 //! 业务语义）应留在消费方，经 [`PgTaskRepo::insert_task`] / [`notify_tasks_ready`]
 //! 等公开事务原语与本模块组合。
 
+use super::{join, scope};
+use crate::task::{
+    JoinState,
+    scope::{ScopeEntries, join_state},
+};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, types::Json};
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
@@ -22,7 +27,7 @@ const LEASE_EXPIRED_ERR: &str = "task lease expired; retry budget exhausted";
 /// 任务行 SELECT / RETURNING 列（顺序与表结构一致）。`pub`：消费方的业务查询
 /// 与同一张表交互时复用同一列序。
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
-     claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
+     claimed_by, lease_until, attempt, max_attempts, task_type, join_state, \
      input_json, output_json, error, created_at, updated_at";
 
 /// 任务就绪通知通道：任务变为可认领时（入队 / 扇出 / 释放租约）在**同一事务**内
@@ -163,132 +168,111 @@ async fn settle_in_tx(
     Ok(row.into())
 }
 
-/// 事务内入队后继：普通任务逐条创建，Scope 和 foreach 开启新分组，JOIN 按运行、分组和节点名累积。
+/// 事务内按子图边界生成后继，JOIN 按运行、实例和节点名累积。
 /// 调用方先获取运行锁，覆盖 JOIN 首次创建的窗口；本方法不自行开事务或提交。
-#[allow(clippy::too_many_arguments)]
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
-    run_id: Option<i64>,
-    scope_id: Option<i64>,
-    parent_task_ids: &[i64],
-    name: &str,
-    inputs: &[Value],
-    task_type: &str,
-    creates_scope: bool,
-    depends_on_names: &[String],
+    source: &TaskRecord,
+    plan: &FanoutPlan,
     max_attempts: i32,
-) -> Result<Vec<TaskRecord>, StorageError> {
-    if creates_scope && task_type == "join" {
+    entries: &mut ScopeEntries,
+) -> Result<(), StorageError> {
+    if plan.foreach && plan.task_type == "join" {
         return Err(StorageError::InvalidFanout {
             detail: "foreach cannot target a JOIN node".into(),
         });
     }
-    let mut rows = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let existing = if task_type == "join" {
+    for (index, input) in plan.inputs.iter().enumerate() {
+        let scope_id = scope::route(
+            tx,
+            &source.workflow_id,
+            source.run_id,
+            source.scope_id,
+            &plan.source_subgraph_path,
+            &plan.destination_subgraph_path,
+            source.task_id,
+            plan.foreach.then(|| (plan.edge_id.clone(), index)),
+            entries,
+        )
+        .await?;
+        let existing = if plan.task_type == "join" {
             sqlx::query_as::<_, TaskRow>(&format!(
-                r#"
-                SELECT {ROW_COLS} FROM tasks
-                WHERE workflow_id = $1 AND name = $2
-                  AND run_id IS NOT DISTINCT FROM $3
-                  AND scope_id IS NOT DISTINCT FROM $4
-                  AND task_type = 'join' AND status IN ('pending', 'running')
-                ORDER BY task_id LIMIT 1 FOR UPDATE
-                "#
-            ))
-            .bind(workflow_id)
-            .bind(name)
-            .bind(run_id)
-            .bind(scope_id)
-            .fetch_optional(&mut **tx)
-            .await?
+                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=$1 AND name=$2 AND run_id IS NOT DISTINCT FROM $3 AND scope_id IS NOT DISTINCT FROM $4 AND task_type='join' AND status IN ('pending','running') ORDER BY task_id LIMIT 1 FOR UPDATE"
+            )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
+              .fetch_optional(&mut **tx).await?
         } else {
             None
         };
-
-        let row = if let Some(existing) = existing {
+        if let Some(existing) = existing {
             let mut parents = existing.parent_task_ids;
-            for &parent in parent_task_ids {
-                if !parents.contains(&parent) {
-                    parents.push(parent);
-                }
+            if !parents.contains(&source.task_id) {
+                parents.push(source.task_id);
             }
-            let mut merged_input = existing.input_json;
-            merge_join_input(&mut merged_input, input);
-            sqlx::query_as::<_, TaskRow>(&format!(
-                r#"
-                UPDATE tasks
-                SET parent_task_ids = $3, input_json = $4::jsonb, updated_at = NOW()
-                WHERE workflow_id = $1 AND task_id = $2
-                RETURNING {ROW_COLS}
-                "#
-            ))
-            .bind(workflow_id)
-            .bind(existing.task_id)
-            .bind(&parents)
-            .bind(merged_input)
-            .fetch_one(&mut **tx)
-            .await?
+            let mut input_json = existing.input_json;
+            merge_join_input(&mut input_json, input);
+            let mut state = existing.join_state;
+            state.arrive(&plan.edge_id, source.task_id);
+            sqlx::query("UPDATE tasks SET parent_task_ids=$3, input_json=$4, join_state=$5, updated_at=clock_timestamp() WHERE workflow_id=$1 AND task_id=$2")
+                .bind(&source.workflow_id).bind(existing.task_id).bind(parents).bind(input_json).bind(Json(state))
+                .execute(&mut **tx).await?;
         } else {
-            let failed_predecessor = if task_type == "join" {
-                sqlx::query_scalar::<_, bool>(
-                    r#"
-                    SELECT EXISTS (
-                        SELECT 1 FROM tasks
-                        WHERE workflow_id = $1
-                          AND run_id IS NOT DISTINCT FROM $2
-                          AND scope_id IS NOT DISTINCT FROM $4
-                          AND name = ANY($3) AND status = 'failed'
-                    )
-                    "#,
-                )
-                .bind(workflow_id)
-                .bind(run_id)
-                .bind(depends_on_names)
-                .bind(scope_id)
-                .fetch_one(&mut **tx)
-                .await?
+            let mut state = if plan.task_type == "join" {
+                let state = join_state(
+                    plan,
+                    &scope::chain(tx, &source.workflow_id, scope_id).await?,
+                )?;
+                for dependency in &state.expected {
+                    if let Some(id) = dependency.task_id {
+                        let name: String = sqlx::query_scalar(
+                            "SELECT name FROM tasks WHERE workflow_id=$1 AND task_id=$2",
+                        )
+                        .bind(&source.workflow_id)
+                        .bind(id)
+                        .fetch_one(&mut **tx)
+                        .await?;
+                        if name != dependency.name {
+                            return Err(StorageError::InvalidFanout {
+                                detail: format!(
+                                    "JOIN source {} is not the entry event ({name}) for this scope",
+                                    dependency.name
+                                ),
+                            });
+                        }
+                    }
+                }
+                state
             } else {
-                false
+                JoinState::default()
             };
-            let task_id = allocate_task_id(tx, workflow_id).await?;
-            sqlx::query_as::<_, TaskRow>(&format!(
-                r#"
-                INSERT INTO tasks
-                    (workflow_id, task_id, run_id, name, status,
-                     attempt, max_attempts, task_type, parent_task_ids, depends_on_names,
-                     input_json, scope_id)
-                VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10::jsonb, $11)
-                RETURNING {ROW_COLS}
-                "#
-            ))
-            .bind(workflow_id)
-            .bind(task_id)
-            .bind(run_id)
-            .bind(name)
-            .bind(if failed_predecessor {
-                "failed"
-            } else {
-                "pending"
-            })
-            .bind(max_attempts)
-            .bind(task_type)
-            .bind(parent_task_ids)
-            .bind(depends_on_names)
-            .bind(input)
-            .bind(if creates_scope || task_type == "scope" {
-                Some(task_id)
-            } else {
-                scope_id
-            })
-            .fetch_one(&mut **tx)
-            .await?
-        };
-        rows.push(row.into());
+            if plan.task_type == "join" {
+                state.arrive(&plan.edge_id, source.task_id);
+            }
+            let task_id = allocate_task_id(tx, &source.workflow_id).await?;
+            sqlx::query("INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,task_type,parent_task_ids,join_state,input_json,scope_id) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$8,$9,$10)")
+                .bind(&source.workflow_id).bind(task_id).bind(source.run_id).bind(plan.dst)
+                .bind(max_attempts).bind(plan.task_type).bind(vec![source.task_id]).bind(Json(state)).bind(input).bind(scope_id)
+                .execute(&mut **tx).await?;
+        }
     }
-    notify_tasks_ready(tx, workflow_id).await?;
-    Ok(rows)
+    notify_tasks_ready(tx, &source.workflow_id).await?;
+    Ok(())
+}
+
+/// 包括晚创建的 JOIN 和间接等待者；不把其他实例的失败传播过来。
+async fn fail_blocked_joins(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    run_id: Option<i64>,
+) -> Result<(), StorageError> {
+    loop {
+        let changed = sqlx::query(&format!(
+            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=clock_timestamp() WHERE wt.workflow_id=$1 AND wt.run_id IS NOT DISTINCT FROM $2 AND wt.status='pending' AND ({})", join::failed()
+        )).bind(workflow_id).bind(run_id).execute(&mut **tx).await?.rows_affected();
+        if changed == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// 通用工作流任务的 pgsql 仓储：持有连接池（`Clone` 共享同一池）。
@@ -303,41 +287,12 @@ pub struct PgTaskRepo {
 /// 共用：pending/running、无租约或租约已过期、JOIN 静态前驱等齐。
 /// 调用方需自行补 `wt.workflow_id = $1`（认领按工作流）或省略（恢复扫描跨工作流）。
 /// 预算耗尽行也须认领，以便调度器通过统一失败流程结算。
-const EXECUTABLE_WHERE: &str = r#"
-    wt.status IN ('pending', 'running')
-    AND (wt.lease_until IS NULL OR wt.lease_until <= NOW())
-    AND (
-        wt.task_type <> 'join'
-        OR NOT EXISTS (
-            -- JOIN 静态前驱闸门：每个前驱名的**全部实例**都必须已成功。
-            -- 「至少一个已成功」且「无未成功实例」，缺一不可：
-            --   - 只查「至少一个成功」会在多实例扇出时因首个实例成功而过早放行；
-            --   - 只查「无未成功实例」会在前驱尚未入队时因查到空集而过早放行。
-            SELECT 1
-            FROM unnest(wt.depends_on_names) AS dn(name)
-            WHERE NOT (
-                EXISTS (
-                    SELECT 1
-                    FROM tasks st
-                    WHERE st.workflow_id = wt.workflow_id
-                      AND st.run_id IS NOT DISTINCT FROM wt.run_id
-                      AND st.scope_id IS NOT DISTINCT FROM wt.scope_id
-                      AND st.name = dn.name
-                      AND st.status = 'succeeded'
-                )
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM tasks st
-                    WHERE st.workflow_id = wt.workflow_id
-                      AND st.run_id IS NOT DISTINCT FROM wt.run_id
-                      AND st.scope_id IS NOT DISTINCT FROM wt.scope_id
-                      AND st.name = dn.name
-                      AND st.status <> 'succeeded'
-                )
-            )
-        )
+fn executable_where() -> String {
+    format!(
+        "wt.status IN ('pending', 'running') AND (wt.lease_until IS NULL OR wt.lease_until <= NOW()) AND ({})",
+        join::ready()
     )
-"#;
+}
 
 impl PgTaskRepo {
     pub fn new(pool: PgPool) -> Self {
@@ -350,42 +305,46 @@ impl PgTaskRepo {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         task: &Task,
     ) -> Result<TaskRecord, StorageError> {
+        // 与结算保持相同锁序：run -> task/counter，直接 JOIN 入队也可能传播依赖失败。
+        if task.run_id.is_some() {
+            lock_run(tx, &task.workflow_id, task.run_id).await?;
+        }
         let task_id = allocate_task_id(tx, &task.workflow_id).await?;
-
-        let sql = format!(
-            r#"
-            INSERT INTO tasks
-                (
-                    workflow_id, task_id, run_id, name, status,
-                    claimed_by, lease_until, attempt, max_attempts, parent_task_ids, depends_on_names,
-                    input_json, output_json, error, created_at, updated_at, task_type, scope_id
-                )
-            VALUES
-                (
-                    $1, $2, $3, $4, 'pending',
-                    NULL, NULL, 0, $5, $6, $7,
-                    $8::jsonb, NULL, NULL, NOW(), NOW(), $9, $10
-                )
-            RETURNING {ROW_COLS}
-            "#
-        );
-        let row = sqlx::query_as::<_, TaskRow>(&sql)
+        let run_id = Some(task.run_id.unwrap_or(task_id));
+        let source_path: Vec<_> = scope::chain(tx, &task.workflow_id, task.scope_id)
+            .await?
+            .into_iter()
+            .map(|scope| scope.subgraph_id)
+            .collect();
+        let scope_id = scope::route(
+            tx,
+            &task.workflow_id,
+            run_id,
+            task.scope_id,
+            &source_path,
+            &task.subgraph_path,
+            task_id,
+            None,
+            &mut ScopeEntries::new(),
+        )
+        .await?;
+        let state = JoinState::from_names(&task.depends_on_names, scope_id);
+        let row = sqlx::query_as::<_, TaskRow>(&format!(
+            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,parent_task_ids,join_state,input_json,task_type,scope_id) VALUES ($1,$2,$3,$4,'pending',0,$5,$6,$7,$8,$9,$10) RETURNING {ROW_COLS}"
+        )).bind(&task.workflow_id).bind(task_id).bind(run_id).bind(&task.name).bind(task.max_attempts)
+          .bind(&task.parent_task_ids).bind(Json(state)).bind(&task.input).bind(&task.task_type).bind(scope_id)
+          .fetch_one(&mut **tx).await?;
+        if task.task_type == "join" {
+            fail_blocked_joins(tx, &task.workflow_id, run_id).await?;
+            let row = sqlx::query_as::<_, TaskRow>(&format!(
+                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=$1 AND task_id=$2"
+            ))
             .bind(&task.workflow_id)
             .bind(task_id)
-            .bind(task.run_id.unwrap_or(task_id))
-            .bind(&task.name)
-            .bind(task.max_attempts)
-            .bind(&task.parent_task_ids)
-            .bind(&task.depends_on_names)
-            .bind(&task.input)
-            .bind(&task.task_type)
-            .bind(if task.task_type == "scope" {
-                Some(task_id)
-            } else {
-                task.scope_id
-            })
             .fetch_one(&mut **tx)
             .await?;
+            return Ok(row.into());
+        }
         Ok(row.into())
     }
 
@@ -402,45 +361,8 @@ impl PgTaskRepo {
     /// 在同一事务中逐条入队输入；仅 JOIN 按运行、分组和节点名汇合。
     /// JOIN 累积 parent_task_ids 和输入，Scope 和 foreach 为每条输入建立独立分组。
     /// 运行级事务锁覆盖首次创建窗口，已有 JOIN 通过行锁合并。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn enqueue_fanout(
-        &self,
-        workflow_id: &str,
-        run_id: Option<i64>,
-        scope_id: Option<i64>,
-        parent_task_ids: &[i64],
-        name: &str,
-        inputs: &[Value],
-        task_type: &str,
-        creates_scope: bool,
-        depends_on_names: &[String],
-        max_attempts: i32,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
-        // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
-            .await?;
-        lock_run(&mut tx, workflow_id, run_id).await?;
-        let rows = enqueue_fanout_in_tx(
-            &mut tx,
-            workflow_id,
-            run_id,
-            scope_id,
-            parent_task_ids,
-            name,
-            inputs,
-            task_type,
-            creates_scope,
-            depends_on_names,
-            max_attempts,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(rows)
-    }
 
-    /// 当前认领成功结算与后继入队在同一事务提交，后继继承最新的 run_id 和 scope_id；Scope 和 foreach 后继开启新分组。
+    /// 当前认领成功结算与边界路由、后继入队在同一事务提交。
     pub async fn succeed_and_enqueue(
         &self,
         task: &TaskRecord,
@@ -456,22 +378,11 @@ impl PgTaskRepo {
         lock_settlement(&mut tx, task).await?;
         let settled =
             settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
-        for f in fanouts {
-            enqueue_fanout_in_tx(
-                &mut tx,
-                &task.workflow_id,
-                settled.run_id,
-                settled.scope_id,
-                &[task.task_id],
-                f.dst,
-                &f.inputs,
-                f.task_type,
-                f.creates_scope,
-                &f.depends_on_names,
-                max_attempts,
-            )
-            .await?;
+        let mut entries = ScopeEntries::new();
+        for fanout in fanouts {
+            enqueue_fanout_in_tx(&mut tx, &settled, fanout, max_attempts, &mut entries).await?;
         }
+        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id).await?;
         tx.commit().await?;
         Ok(settled)
     }
@@ -496,42 +407,11 @@ impl PgTaskRepo {
             TaskStatus::Superseded
         };
         let settled = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
-        for f in fanouts {
-            enqueue_fanout_in_tx(
-                &mut tx,
-                &task.workflow_id,
-                settled.run_id,
-                settled.scope_id,
-                &[task.task_id],
-                f.dst,
-                &f.inputs,
-                f.task_type,
-                f.creates_scope,
-                &f.depends_on_names,
-                max_attempts,
-            )
-            .await?;
+        let mut entries = ScopeEntries::new();
+        for fanout in fanouts {
+            enqueue_fanout_in_tx(&mut tx, &settled, fanout, max_attempts, &mut entries).await?;
         }
-        if fanouts.is_empty() {
-            sqlx::query(
-                r#"
-                UPDATE tasks AS dependent
-                SET status = 'failed', error = $3, lease_until = NULL, updated_at = clock_timestamp()
-                FROM tasks AS source
-                WHERE source.workflow_id = $1 AND source.task_id = $2
-                  AND dependent.workflow_id = source.workflow_id
-                  AND dependent.run_id IS NOT DISTINCT FROM source.run_id
-                  AND dependent.scope_id IS NOT DISTINCT FROM source.scope_id
-                  AND dependent.status = 'pending'
-                  AND dependent.task_type = 'join'
-                  AND source.name = ANY(dependent.depends_on_names)
-                "#,
-            )
-            .bind(&task.workflow_id)
-            .bind(task.task_id)
-            .bind(format!("predecessor task {} failed", task.task_id))
-            .execute(&mut *tx).await?;
-        }
+        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -626,6 +506,7 @@ impl PgTaskRepo {
         worker: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
+        let executable_where = executable_where();
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -637,7 +518,7 @@ impl PgTaskRepo {
                 SELECT wt.task_id
                 FROM tasks wt
                 WHERE wt.workflow_id = $1
-                  AND {EXECUTABLE_WHERE}
+                  AND {executable_where}
                 ORDER BY wt.task_id
                 LIMIT $4
                 FOR UPDATE SKIP LOCKED
@@ -684,11 +565,12 @@ impl PgTaskRepo {
     /// 存在可认领任务的工作流 id 列表，供应用恢复扫描（如启动时与监听重连后）：
     /// 包含需要最终失败结算的预算耗尽任务，兜底通知丢失和进程重启。
     pub async fn executable_workflow_ids(&self) -> Result<Vec<String>, StorageError> {
+        let executable_where = executable_where();
         let sql = format!(
             r#"
             SELECT DISTINCT wt.workflow_id
             FROM tasks wt
-            WHERE {EXECUTABLE_WHERE}
+            WHERE {executable_where}
             "#
         );
         let rows: Vec<(String,)> = sqlx::query_as(&sql).fetch_all(&self.pool).await?;

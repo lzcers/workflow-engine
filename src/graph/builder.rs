@@ -2,7 +2,7 @@
 
 use super::super::edge::{AnyFailureEdge, AnySuccessEdge, FailureEdge, SuccessEdge};
 use super::super::node::{Node, NodeKey};
-use super::{Graph, GraphNode};
+use super::{Graph, GraphNode, SubgraphDescription};
 use std::collections::HashSet;
 
 /// 图构建器：注册节点、追加边、组装并校验。
@@ -11,6 +11,7 @@ pub struct GraphBuilder<Ctx> {
     title: String,
     context: Ctx,
     nodes: Vec<(&'static str, GraphNode<Ctx>)>,
+    subgraphs: Vec<SubgraphDescription>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
 }
@@ -22,6 +23,7 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
             title: title.into(),
             context,
             nodes: Vec::new(),
+            subgraphs: Vec::new(),
             success_edges: Vec::new(),
             failure_edges: Vec::new(),
         }
@@ -46,6 +48,7 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
                 node: Box::new(node),
                 title: title.into(),
                 description: description.into(),
+                subgraph_id: None,
             },
         ));
         self
@@ -74,6 +77,42 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
         )
     }
 
+    /// 声明静态子图，不创建可执行节点。ID 是完整点路径。
+    pub fn subgraph(
+        mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        parent_id: Option<&str>,
+    ) -> Self {
+        self.subgraphs.push(SubgraphDescription {
+            id: id.into(),
+            title: title.into(),
+            parent_id: parent_id.map(str::to_owned),
+        });
+        self
+    }
+
+    /// 注册子图成员并返回类型化标识；归属与边端点独立。
+    pub fn node_in_subgraph_with_key<N: Node<Ctx> + 'static>(
+        mut self,
+        name: &'static str,
+        node: N,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        subgraph_id: Option<&str>,
+    ) -> (Self, NodeKey<Ctx, N>) {
+        self.nodes.push((
+            name,
+            GraphNode {
+                node: Box::new(node),
+                title: title.into(),
+                description: description.into(),
+                subgraph_id: subgraph_id.map(str::to_owned),
+            },
+        ));
+        (self, NodeKey::new(name))
+    }
+
     /// 追加一条成功边（条件/转换，前向 DAG）。
     pub fn edge<E: SuccessEdge + 'static>(mut self, e: E) -> Self {
         self.success_edges.push(Box::new(e));
@@ -100,6 +139,7 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
             title: self.title,
             context: self.context,
             nodes: self.nodes.into_iter().collect(),
+            subgraphs: self.subgraphs,
             success_edges: self.success_edges,
             failure_edges: self.failure_edges,
         };

@@ -1,0 +1,13 @@
+[package]
+name = "workflow-engine-macros"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+workflow-engine-dsl = { path = "../workflow-engine-dsl" }
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

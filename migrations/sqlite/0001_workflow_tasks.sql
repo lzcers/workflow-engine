@@ -15,8 +15,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流运行身份；后继继承源任务的值。
     -- enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。
     run_id INTEGER,
-    -- 运行内的 JOIN 隔离域；scope 节点以自身任务 ID 开始新域，其他后继继承源任务的值。
-    -- NULL 表示该运行的默认域；汇聚、前驱等齐和失败级联只在同一域内发生。
+    -- 运行内的 JOIN 隔离域；实例及父子关系保存在 scopes 表，进入子图创建实例，退出恢复父实例。
+    -- NULL 表示运行根作用域；跨边界 JOIN 来源由 join_state 绑定到具体入口或子实例。
     scope_id INTEGER,
     -- 工作流内从 1 开始分配的任务记录 ID；跨 run 递增，不保证连续或跨工作流唯一。
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     ),
     -- 最近一次认领任务的 worker 标识；未认领时为 NULL，结算后保留，不代表租约仍有效。
     claimed_by TEXT,
-    -- 本次认领的固定处理截止时间（UTC 文本），不续租；NULL 表示无有效租约，结算或释放时清空。
+    -- 本次认领的租约截止时间（UTC 文本），执行及结算期间持续续租；NULL 表示无有效租约，结算或释放时清空。
     -- pending/running 任务在无租约或到期后可按依赖重新认领。
     lease_until TEXT,
     -- 认领代次，从 0 开始，每次认领加 1；超过 max_attempts 后只处理最终失败，不再执行业务。
@@ -42,12 +42,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 该任务行的业务执行次数上限（含首次）；耗尽后重新认领并通过统一失败流程结算。
     -- 失败边新建的任务单独计数。
     max_attempts INTEGER NOT NULL DEFAULT 3,
-    -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；scope 隔离域入口；join 汇合节点。
-    task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event', 'scope')),
-    -- 静态前驱节点名的 JSON 数组，用于血缘记录及 JOIN 失败级联。
-    -- join 认领时要求同一 workflow_id、run_id、scope_id 下每个前驱至少有一个实例且全部实例成功。
-    depends_on_names TEXT NOT NULL DEFAULT '[]'
-        CHECK (json_valid(depends_on_names) AND json_type(depends_on_names) = 'array'),
+    -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；join 汇合节点。
+    task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event')),
+    -- JOIN 的预期来源、实际入边贡献和上游生产屏障。
+    join_state TEXT NOT NULL DEFAULT '{"expected":[],"arrivals":{},"upstream":[]}'
+        CHECK (json_valid(join_state)),
     -- 节点输入的 JSON 文本；结构由节点输入类型决定，JOIN 输入按前驱节点名汇聚。
     input_json TEXT NOT NULL CHECK (json_valid(input_json)),
     -- 节点成功输出的 JSON 文本；结构由节点输出类型决定，尚未写入输出时为 SQL NULL。
@@ -64,3 +63,16 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(workflow_id, status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_tasks_recovery ON tasks(status, workflow_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_predecessors ON tasks(workflow_id, run_id, scope_id, name, status);
+
+-- 子图的执行实例，仅保存身份和父子关系，无独立任务状态或调度生命周期。
+CREATE TABLE IF NOT EXISTS scopes (
+    workflow_id TEXT NOT NULL,
+    scope_id INTEGER NOT NULL CHECK (scope_id > 0),
+    run_id INTEGER,
+    subgraph_id TEXT NOT NULL,
+    parent_scope_id INTEGER,
+    trigger_task_id INTEGER NOT NULL,
+    PRIMARY KEY (workflow_id, scope_id),
+    FOREIGN KEY (workflow_id, parent_scope_id) REFERENCES scopes(workflow_id, scope_id)
+);
+CREATE INDEX IF NOT EXISTS idx_scopes_parent ON scopes(workflow_id, run_id, parent_scope_id);

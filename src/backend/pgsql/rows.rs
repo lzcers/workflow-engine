@@ -21,7 +21,8 @@ pub struct TaskRow {
     pub attempt: i32,
     pub max_attempts: i32,
     pub task_type: String,
-    pub depends_on_names: Vec<String>,
+    #[sqlx(json)]
+    pub join_state: crate::task::JoinState,
     pub input_json: Value,
     pub output_json: Option<Value>,
     pub error: Option<String>,
@@ -44,7 +45,7 @@ impl From<TaskRow> for TaskRecord {
             attempt: row.attempt,
             max_attempts: row.max_attempts,
             task_type: row.task_type,
-            depends_on_names: row.depends_on_names,
+            join_state: row.join_state,
             input: row.input_json,
             output: row.output_json,
             error: row.error,

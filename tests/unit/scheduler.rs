@@ -461,7 +461,7 @@ fn claim() -> TaskRecord {
         attempt: 1,
         max_attempts: 1,
         task_type: "normal".into(),
-        depends_on_names: vec![],
+        join_state: Default::default(),
         input: json!(7),
         output: None,
         error: None,

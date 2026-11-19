@@ -9,7 +9,7 @@
 //! 也可接一条 `map` 边把 `Map` 换算成强类型输入。
 //!
 //! JOIN 的「等待同一运行、作用域内全部静态前驱完成」由 [`super::TaskType::Join`] 通知[`super::super::graph::Graph`]
-//! 与存储（`depends_on_names` 闸门）共同保证，节点本身不关心等待逻辑。
+//! 与存储（`join_state` 的预期来源和入边贡献）共同保证，节点本身不关心等待逻辑。
 
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ use super::{Node, NodeError, TaskType};
 /// 显式 JOIN 汇聚节点：透传已由存储合并好的 `Map {name: value}`。
 ///
 /// - `TASK_TYPE` 为 [`TaskType::Join`]，[`super::super::graph::Graph`] 据此为其声明静态前驱集合
-///   （`depends_on_names`），存储据以实现「全部前驱齐备才放行」的认领闸门。
+///   以及入边身份，存储据以实现「全部预期贡献到齐才放行」的认领闸门。
 /// - `execute` 保持纯函数：把输入的合并 `Map` 原样透传，作为本节点输出。
 pub struct JoinNode;
 

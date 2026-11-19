@@ -4,6 +4,11 @@
 //! before reading. This serializes competing claimers and fan-in updates without
 //! relying on PostgreSQL row locks or upgrading a deferred read transaction.
 
+use super::{join, scope};
+use crate::task::{
+    JoinState,
+    scope::{ScopeEntries, join_state},
+};
 use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
@@ -16,7 +21,7 @@ use crate::task::store::{LEASE_DURATION, merge_join_input};
 
 /// Columns suitable for application queries against the same task table.
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
-    claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
+    claimed_by, lease_until, attempt, max_attempts, task_type, join_state, \
     input_json, output_json, error, created_at, updated_at";
 
 /// Workflow task repository. Clones share the same connection pool.
@@ -54,159 +59,117 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
 
 /// Implements the JOIN predecessor/lease gate in [`crate::task::TaskStore::claim_many`]
 /// for both claim and recovery. Parent IDs record provenance, not execution dependencies.
-const EXECUTABLE_WHERE: &str = r#"
-    wt.status IN ('pending', 'running')
-    AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))
-    AND (
-        wt.task_type <> 'join'
-        OR NOT EXISTS (
-            SELECT 1 FROM json_each(wt.depends_on_names) AS predecessor
-            WHERE NOT (
-                EXISTS (
-                    SELECT 1 FROM tasks st
-                    WHERE st.workflow_id = wt.workflow_id
-                      AND st.run_id IS wt.run_id
-                      AND st.scope_id IS wt.scope_id
-                      AND st.name = predecessor.value
-                      AND st.status = 'succeeded'
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM tasks st
-                    WHERE st.workflow_id = wt.workflow_id
-                      AND st.run_id IS wt.run_id
-                      AND st.scope_id IS wt.scope_id
-                      AND st.name = predecessor.value
-                      AND st.status <> 'succeeded'
-                )
-            )
-        )
+fn executable_where() -> String {
+    format!(
+        "wt.status IN ('pending', 'running') AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now')) AND ({})",
+        join::ready()
     )
-"#;
+}
 
 /// The caller must already hold the write lock, normally via `BEGIN IMMEDIATE`.
-#[allow(clippy::too_many_arguments)]
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    workflow_id: &str,
-    run_id: Option<i64>,
-    scope_id: Option<i64>,
-    parent_task_ids: &[i64],
-    name: &str,
-    inputs: &[Value],
-    task_type: &str,
-    creates_scope: bool,
-    depends_on_names: &[String],
+    source: &TaskRecord,
+    plan: &FanoutPlan,
     max_attempts: i32,
-) -> Result<Vec<TaskRecord>, StorageError> {
-    if creates_scope && task_type == "join" {
+    entries: &mut ScopeEntries,
+) -> Result<(), StorageError> {
+    if plan.foreach && plan.task_type == "join" {
         return Err(StorageError::InvalidFanout {
             detail: "foreach cannot target a JOIN node".into(),
         });
     }
-    let mut rows = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let existing = if task_type == "join" {
+    for (index, input) in plan.inputs.iter().enumerate() {
+        let scope_id = scope::route(
+            tx,
+            &source.workflow_id,
+            source.run_id,
+            source.scope_id,
+            &plan.source_subgraph_path,
+            &plan.destination_subgraph_path,
+            source.task_id,
+            plan.foreach.then(|| (plan.edge_id.clone(), index)),
+            entries,
+        )
+        .await?;
+        let existing = if plan.task_type == "join" {
             sqlx::query_as::<_, TaskRow>(&format!(
-                r#"
-                SELECT {ROW_COLS} FROM tasks
-                WHERE workflow_id = ?1 AND name = ?2 AND run_id IS ?3
-                  AND scope_id IS ?4
-                  AND task_type = 'join' AND status IN ('pending', 'running')
-                ORDER BY task_id LIMIT 1
-                "#
-            ))
-            .bind(workflow_id)
-            .bind(name)
-            .bind(run_id)
-            .bind(scope_id)
-            .fetch_optional(&mut **tx)
-            .await?
+                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND name=?2 AND run_id IS ?3 AND scope_id IS ?4 AND task_type='join' AND status IN ('pending','running') ORDER BY task_id LIMIT 1"
+            )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
+              .fetch_optional(&mut **tx).await?
         } else {
             None
         };
-
-        let row = if let Some(existing) = existing {
+        if let Some(existing) = existing {
             let mut parents = existing.parent_task_ids;
-            for &parent_id in parent_task_ids {
-                if !parents.contains(&parent_id) {
-                    parents.push(parent_id);
-                }
+            if !parents.contains(&source.task_id) {
+                parents.push(source.task_id);
             }
-            let mut merged_input = existing.input_json;
-            merge_join_input(&mut merged_input, input);
-            sqlx::query_as::<_, TaskRow>(&format!(
-                r#"
-                UPDATE tasks
-                SET parent_task_ids = ?3, input_json = ?4,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE workflow_id = ?1 AND task_id = ?2
-                RETURNING {ROW_COLS}
-                "#
-            ))
-            .bind(workflow_id)
-            .bind(existing.task_id)
-            .bind(Json(&parents))
-            .bind(merged_input)
-            .fetch_one(&mut **tx)
-            .await?
+            let mut input_json = existing.input_json;
+            merge_join_input(&mut input_json, input);
+            let mut state = existing.join_state;
+            state.arrive(&plan.edge_id, source.task_id);
+            sqlx::query("UPDATE tasks SET parent_task_ids=?3, input_json=?4, join_state=?5, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE workflow_id=?1 AND task_id=?2")
+                .bind(&source.workflow_id).bind(existing.task_id).bind(Json(parents)).bind(input_json).bind(Json(state))
+                .execute(&mut **tx).await?;
         } else {
-            let failed_predecessor = if task_type == "join" {
-                sqlx::query_scalar::<_, bool>(
-                    r#"
-                    SELECT EXISTS (
-                        SELECT 1 FROM tasks
-                        WHERE workflow_id = ?1 AND run_id IS ?2
-                          AND scope_id IS ?4
-                          AND name IN (SELECT value FROM json_each(?3))
-                          AND status = 'failed'
-                    )
-                    "#,
-                )
-                .bind(workflow_id)
-                .bind(run_id)
-                .bind(Json(depends_on_names))
-                .bind(scope_id)
-                .fetch_one(&mut **tx)
-                .await?
+            let mut state = if plan.task_type == "join" {
+                let state = join_state(
+                    plan,
+                    &scope::chain(tx, &source.workflow_id, scope_id).await?,
+                )?;
+                for dependency in &state.expected {
+                    if let Some(id) = dependency.task_id {
+                        let name: String = sqlx::query_scalar(
+                            "SELECT name FROM tasks WHERE workflow_id=?1 AND task_id=?2",
+                        )
+                        .bind(&source.workflow_id)
+                        .bind(id)
+                        .fetch_one(&mut **tx)
+                        .await?;
+                        if name != dependency.name {
+                            return Err(StorageError::InvalidFanout {
+                                detail: format!(
+                                    "JOIN source {} is not the entry event ({name}) for this scope",
+                                    dependency.name
+                                ),
+                            });
+                        }
+                    }
+                }
+                state
             } else {
-                false
+                JoinState::default()
             };
-            let task_id = allocate_task_id(tx, workflow_id).await?;
-            sqlx::query_as::<_, TaskRow>(&format!(
-                r#"
-                INSERT INTO tasks
-                    (workflow_id, task_id, run_id, name, status,
-                     attempt, max_attempts, task_type, parent_task_ids, depends_on_names, input_json,
-                     scope_id)
-                VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)
-                RETURNING {ROW_COLS}
-                "#
-            ))
-            .bind(workflow_id)
-            .bind(task_id)
-            .bind(run_id)
-            .bind(name)
-            .bind(if failed_predecessor {
-                TaskStatus::Failed.as_str()
-            } else {
-                TaskStatus::Pending.as_str()
-            })
-            .bind(max_attempts)
-            .bind(task_type)
-            .bind(Json(parent_task_ids))
-            .bind(Json(depends_on_names))
-            .bind(input)
-            .bind(if creates_scope || task_type == "scope" {
-                Some(task_id)
-            } else {
-                scope_id
-            })
-            .fetch_one(&mut **tx)
-            .await?
-        };
-        rows.push(row.into());
+            if plan.task_type == "join" {
+                state.arrive(&plan.edge_id, source.task_id);
+            }
+            let task_id = allocate_task_id(tx, &source.workflow_id).await?;
+            sqlx::query("INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,task_type,parent_task_ids,join_state,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10)")
+                .bind(&source.workflow_id).bind(task_id).bind(source.run_id).bind(plan.dst)
+                .bind(max_attempts).bind(plan.task_type).bind(Json(vec![source.task_id])).bind(Json(state)).bind(input).bind(scope_id)
+                .execute(&mut **tx).await?;
+        }
     }
-    Ok(rows)
+
+    Ok(())
+}
+
+/// 包括晚创建的 JOIN 和间接等待者；不把其他实例的失败传播过来。
+async fn fail_blocked_joins(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workflow_id: &str,
+    run_id: Option<i64>,
+) -> Result<(), StorageError> {
+    loop {
+        let changed = sqlx::query(&format!(
+            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='pending' AND ({})", join::failed()
+        )).bind(workflow_id).bind(run_id).execute(&mut **tx).await?.rows_affected();
+        if changed == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 impl SqliteTaskRepo {
@@ -222,32 +185,41 @@ impl SqliteTaskRepo {
         task: &Task,
     ) -> Result<TaskRecord, StorageError> {
         let task_id = allocate_task_id(tx, &task.workflow_id).await?;
-        let row = sqlx::query_as::<_, TaskRow>(&format!(
-            r#"
-            INSERT INTO tasks
-                (workflow_id, task_id, run_id, name, status,
-                 attempt, max_attempts, parent_task_ids, depends_on_names, input_json, task_type,
-                 scope_id)
-            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9, ?10)
-            RETURNING {ROW_COLS}
-            "#
-        ))
-        .bind(&task.workflow_id)
-        .bind(task_id)
-        .bind(task.run_id.unwrap_or(task_id))
-        .bind(&task.name)
-        .bind(task.max_attempts)
-        .bind(Json(&task.parent_task_ids))
-        .bind(Json(&task.depends_on_names))
-        .bind(&task.input)
-        .bind(&task.task_type)
-        .bind(if task.task_type == "scope" {
-            Some(task_id)
-        } else {
-            task.scope_id
-        })
-        .fetch_one(&mut **tx)
+        let run_id = Some(task.run_id.unwrap_or(task_id));
+        let source_path: Vec<_> = scope::chain(tx, &task.workflow_id, task.scope_id)
+            .await?
+            .into_iter()
+            .map(|scope| scope.subgraph_id)
+            .collect();
+        let scope_id = scope::route(
+            tx,
+            &task.workflow_id,
+            run_id,
+            task.scope_id,
+            &source_path,
+            &task.subgraph_path,
+            task_id,
+            None,
+            &mut ScopeEntries::new(),
+        )
         .await?;
+        let state = JoinState::from_names(&task.depends_on_names, scope_id);
+        let row = sqlx::query_as::<_, TaskRow>(&format!(
+            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,parent_task_ids,join_state,input_json,task_type,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10) RETURNING {ROW_COLS}"
+        )).bind(&task.workflow_id).bind(task_id).bind(run_id).bind(&task.name).bind(task.max_attempts)
+          .bind(Json(&task.parent_task_ids)).bind(Json(state)).bind(&task.input).bind(&task.task_type).bind(scope_id)
+          .fetch_one(&mut **tx).await?;
+        if task.task_type == "join" {
+            fail_blocked_joins(tx, &task.workflow_id, run_id).await?;
+            let row = sqlx::query_as::<_, TaskRow>(&format!(
+                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND task_id=?2"
+            ))
+            .bind(&task.workflow_id)
+            .bind(task_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            return Ok(row.into());
+        }
         Ok(row.into())
     }
 
@@ -257,42 +229,6 @@ impl SqliteTaskRepo {
         let row = Self::insert_task(&mut tx, task).await?;
         tx.commit().await?;
         Ok(row)
-    }
-
-    /// Enqueue inputs atomically. Ordinary inputs each create a task; JOIN inputs
-    /// merge parent IDs and input within the same run and scope. Scope tasks and
-    /// foreach inputs start a fresh scope using their allocated task ID.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn enqueue_fanout(
-        &self,
-        workflow_id: &str,
-        run_id: Option<i64>,
-        scope_id: Option<i64>,
-        parent_task_ids: &[i64],
-        name: &str,
-        inputs: &[Value],
-        task_type: &str,
-        creates_scope: bool,
-        depends_on_names: &[String],
-        max_attempts: i32,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let rows = enqueue_fanout_in_tx(
-            &mut tx,
-            workflow_id,
-            run_id,
-            scope_id,
-            parent_task_ids,
-            name,
-            inputs,
-            task_type,
-            creates_scope,
-            depends_on_names,
-            max_attempts,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(rows)
     }
 
     /// Settle only the current, unexpired claim and enqueue successors in the same commit.
@@ -325,22 +261,18 @@ impl SqliteTaskRepo {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| claim_lost(task))?;
+        let mut entries = ScopeEntries::new();
         for fanout in fanouts {
             enqueue_fanout_in_tx(
                 &mut tx,
-                &task.workflow_id,
-                settled.run_id,
-                settled.scope_id,
-                &[task.task_id],
-                fanout.dst,
-                &fanout.inputs,
-                fanout.task_type,
-                fanout.creates_scope,
-                &fanout.depends_on_names,
+                &TaskRecord::from(settled.clone()),
+                fanout,
                 max_attempts,
+                &mut entries,
             )
             .await?;
         }
+        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id).await?;
         tx.commit().await?;
         Ok(settled.into())
     }
@@ -380,45 +312,18 @@ impl SqliteTaskRepo {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| claim_lost(task))?;
+        let mut entries = ScopeEntries::new();
         for fanout in fanouts {
             enqueue_fanout_in_tx(
                 &mut tx,
-                &task.workflow_id,
-                settled.run_id,
-                settled.scope_id,
-                &[task.task_id],
-                fanout.dst,
-                &fanout.inputs,
-                fanout.task_type,
-                fanout.creates_scope,
-                &fanout.depends_on_names,
+                &TaskRecord::from(settled.clone()),
+                fanout,
                 max_attempts,
+                &mut entries,
             )
             .await?;
         }
-        if fanouts.is_empty() {
-            sqlx::query(
-                r#"
-                UPDATE tasks
-                SET status = 'failed', error = ?3, lease_until = NULL,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE workflow_id = ?1 AND status = 'pending'
-                  AND EXISTS (
-                      SELECT 1 FROM tasks source
-                      WHERE source.workflow_id = tasks.workflow_id AND source.task_id = ?2
-                        AND source.run_id IS tasks.run_id
-                        AND source.scope_id IS tasks.scope_id
-                        AND tasks.task_type = 'join'
-                        AND source.name IN (SELECT value FROM json_each(tasks.depends_on_names))
-                  )
-                "#,
-            )
-            .bind(&task.workflow_id)
-            .bind(task.task_id)
-            .bind(format!("predecessor task {} failed", task.task_id))
-            .execute(&mut *tx)
-            .await?;
-        }
+        fail_blocked_joins(&mut tx, &task.workflow_id, settled.run_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -506,6 +411,7 @@ impl SqliteTaskRepo {
         worker: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
+        let executable_where = executable_where();
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -514,7 +420,7 @@ impl SqliteTaskRepo {
             r#"
             WITH candidate AS MATERIALIZED (
                 SELECT wt.task_id FROM tasks wt
-                WHERE wt.workflow_id = ?1 AND {EXECUTABLE_WHERE}
+                WHERE wt.workflow_id = ?1 AND {executable_where}
                 ORDER BY wt.task_id LIMIT ?4
             )
             UPDATE tasks
@@ -554,10 +460,11 @@ impl SqliteTaskRepo {
 
     /// Workflows with claimable execution or final failure settlement work.
     pub async fn executable_workflow_ids(&self) -> Result<Vec<String>, StorageError> {
+        let executable_where = executable_where();
         Ok(sqlx::query_scalar(&format!(
             r#"
             SELECT DISTINCT wt.workflow_id FROM tasks wt
-            WHERE {EXECUTABLE_WHERE}
+            WHERE {executable_where}
             ORDER BY wt.workflow_id
             "#
         ))

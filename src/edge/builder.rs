@@ -23,7 +23,7 @@ use super::{FailureEdge, SuccessEdge};
 pub struct EdgeImpl<SrcOut, DstIn> {
     src: &'static str,
     dst: &'static str,
-    creates_scope: bool,
+    is_foreach: bool,
     when: Option<Box<dyn Fn(&SrcOut) -> bool + Send + Sync>>,
     map: Option<Box<dyn Fn(&SrcOut) -> Vec<DstIn> + Send + Sync>>,
     marker: PhantomData<fn(SrcOut) -> DstIn>,
@@ -42,8 +42,8 @@ where
     fn dst(&self) -> &'static str {
         self.dst
     }
-    fn creates_scope(&self) -> bool {
-        self.creates_scope
+    fn is_foreach(&self) -> bool {
+        self.is_foreach
     }
     fn when(&self) -> Option<&(dyn Fn(&SrcOut) -> bool + Send + Sync)> {
         self.when.as_deref()
@@ -97,7 +97,7 @@ impl<SrcOut> WhenBuilder<SrcOut> {
         EdgeImpl {
             src: self.src,
             dst: self.dst,
-            creates_scope: false,
+            is_foreach: false,
             when: Some(self.condition),
             map: None,
             marker: PhantomData,
@@ -112,7 +112,7 @@ impl<SrcOut> WhenBuilder<SrcOut> {
         EdgeImpl {
             src: self.src,
             dst: self.dst,
-            creates_scope: false,
+            is_foreach: false,
             when: Some(self.condition),
             map: Some(Box::new(transform)),
             marker: PhantomData,
@@ -135,7 +135,7 @@ impl<SrcOut> WhenBuilder<SrcOut> {
         EdgeImpl {
             src: self.src,
             dst: to.name(),
-            creates_scope: false,
+            is_foreach: false,
             when: Some(self.condition),
             map: Some(Box::new(transform)),
             marker: PhantomData,
@@ -278,7 +278,7 @@ where
     EdgeImpl {
         src: from,
         dst: to,
-        creates_scope: false,
+        is_foreach: false,
         when: None,
         map: Some(Box::new(transform)),
         marker: PhantomData,
@@ -305,15 +305,15 @@ where
     EdgeImpl {
         src: from.name(),
         dst: to.name(),
-        creates_scope: false,
+        is_foreach: false,
         when: None,
         map: Some(Box::new(transform)),
         marker: PhantomData,
     }
 }
 
-/// 将数组逐项传给目标节点，每个目标任务以自身 task_id 建立独立作用域。
-/// 后继任务继承该作用域；空数组不创建任务。与 [`map`] 不同，本边明确建立分组边界。
+/// 将数组逐项传给目标子图，每个元素建立独立作用域。
+/// 子图定义确定边界；空数组不创建任务，组内后继继承实例。
 pub fn foreach<T>(from: &'static str, to: &'static str) -> EdgeImpl<Vec<T>, T>
 where
     T: Clone + 'static,
@@ -321,7 +321,7 @@ where
     EdgeImpl {
         src: from,
         dst: to,
-        creates_scope: true,
+        is_foreach: true,
         when: None,
         map: Some(Box::new(|items| items.clone())),
         marker: PhantomData,
@@ -449,7 +449,7 @@ where
     EdgeImpl {
         src: from.name(),
         dst: to.name(),
-        creates_scope: false,
+        is_foreach: false,
         when: None,
         map: None,
         marker: PhantomData,

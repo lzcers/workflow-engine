@@ -3,7 +3,7 @@
 //! 各数据库后端复用本模块的纯数据转换，并通过各自的 SQL、锁与事务落实 [`TaskStore`] 契约。
 
 use futures::future::BoxFuture;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use serde_json::Value;
 
@@ -18,16 +18,16 @@ pub const LEASE_DURATION: Duration = Duration::from_secs(300);
 pub struct FanoutPlan {
     /// 目标节点名。
     pub dst: &'static str,
-    /// 目标节点产出的任务类型（`normal` / `join` / `scope`），落库到 `task_type` 列。
+    /// 目标节点产出的任务类型（`normal` / `join` / `event`），落库到 `task_type` 列。
     pub task_type: &'static str,
-    /// 每条输入是否以新任务的 task_id 建立作用域；false 时继承上游作用域。
-    /// 不能与 task_type = join 同时使用。
-    pub creates_scope: bool,
-    /// 喂给目标节点的输入列表：普通/Scope 节点每条输入创建独立任务，JOIN 在同一运行、作用域内累积输入。
-    /// 空列表不创建任务。
+    pub edge_id: String,
+    pub foreach: bool,
+    pub source_subgraph_path: Vec<String>,
+    pub destination_subgraph_path: Vec<String>,
     pub inputs: Vec<Value>,
-    /// 目标节点的静态前驱节点名全集（仅 `task_type = join` 时用作等齐前驱的认领闸门）。
-    pub depends_on_names: Vec<String>,
+    pub predecessor_subgraph_paths: HashMap<String, Vec<String>>,
+    pub join_incoming_edges: HashMap<String, String>,
+    pub join_upstream_names: Vec<String>,
 }
 
 /// 将前驱贡献合并到 JOIN 的累积对象；同名 key 合为数组，已有数组及新贡献数组按元素追加。
@@ -72,7 +72,7 @@ pub trait TaskStore: Sync {
 
     /// 原子入队任务并确定运行身份，返回已持久化的任务快照。
     /// run_id 为 None 时，以新分配的 task_id 创建独立运行；Some(id) 则保留指定运行。
-    /// Scope 任务的 scope_id 设为自身 task_id，其他任务沿用输入 scope_id。
+    /// 按静态子图路径创建入口实例，任务仅保存 scope_id。
     /// 节点类型、来源任务、静态前驱和尝试预算沿用输入；任务及其运行、作用域身份必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
@@ -81,10 +81,8 @@ pub trait TaskStore: Sync {
     ///
     /// 待处理任务必须同时满足：
     /// - 状态为 pending / running，未持有租约或租约已过期。
-    /// - JOIN 要求记录中 `depends_on_names` 的每个前驱，在同一 `workflow_id + run_id + scope_id`
-    ///   下至少存在一个实例，且全部实例均已成功；run_id、scope_id 各自按 NULL 相等判定。
-    ///   skipped / failed / superseded 均不算成功。前驱集合为空时不增加此项限制
-    ///   （图规划的失败后继当前使用空集合）；普通任务不使用前驱名作认领闸门。
+    /// - JOIN 的预期来源必须全部成功并沿预期入边贡献输入；子图内仍可能生产来源的任务
+    ///   全部结束后才可认领。祖先或兄弟入口绑定精确触发任务，子图输出按父实例收集。
     /// `parent_task_ids` 只记录来源，不参与认领资格判断。
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
@@ -112,15 +110,11 @@ pub trait TaskStore: Sync {
     /// 在同一事务内写入产物、标记成功并入队全部成功后继。
     ///
     /// 必须校验当前有效认领且 attempt <= max_attempts；旧执行者和仅用于最终失败的认领不能提交成功。
-    /// 成功后继记录源任务 ID，并继承结算时最新的 run_id、scope_id；creates_scope 为 true
-    /// 或目标为 Scope 节点时改用自身 task_id 建立新作用域，二者同时出现仍只建立一个作用域。
-    /// creates_scope 为 true 的 JOIN 规划必须拒绝，不能在新作用域中等待外部前驱。
-    /// 普通/Scope 后继每条输入创建独立任务。JOIN 按同一 workflow、run、scope、节点名汇入已有
-    /// pending / running JOIN，parent_task_ids 取去重并集，输入通过 [`merge_join_input`] 累积。
-    /// 新任务的 parent_task_ids 为仅包含源任务 ID 的数组。
-    /// 前驱成功、来源累积、JOIN 输入合并与后继创建必须在同一事务提交，且并发首次
-    /// 汇入不能创建重复 JOIN。认领校验与原子结算保证同一父任务不会重复生成后继。
-    /// 新建 JOIN 如同作用域已有静态前驱永久 failed，应直接标记 failed。
+    /// 成功后继继承运行身份，作用域按子图边界进入、继承或退出。
+    /// 同一次结算的普通跨入边共享实例；foreach 按边及元素建立独立实例。
+    /// scope 创建、任务结算、JOIN 的预期来源及实际输入合并与后继创建在同一事务提交。
+    /// 普通任务逐项创建；JOIN 按 workflow、run、scope 和节点名累积。
+    /// 依赖永久失败会令已有及晚创建的 JOIN 失败，不影响其他实例。
     fn settle_success<'a>(
         &'a self,
         task: &'a TaskRecord,
@@ -131,7 +125,7 @@ pub trait TaskStore: Sync {
     /// 在同一事务内结算失败，并入队失败后继或级联已有依赖任务。
     ///
     /// `successors` 非空时标记 `superseded`；为空时标记 `failed`，并将同一工作流、
-    /// 同一 run、scope 内以源节点名为静态前驱的已有 pending JOIN 标记失败。
+    /// 同一 run 中按 join_state 依赖该实例来源的 pending JOIN 标记失败。
     /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
     /// 失败后继同样将源任务 ID 写入 parent_task_ids，使用与成功后继相同的创建和 JOIN 汇合规则。
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。

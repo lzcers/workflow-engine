@@ -386,9 +386,14 @@ impl From<Successor> for FanoutPlan {
         FanoutPlan {
             dst: s.dst,
             task_type: s.task_type.as_str(),
-            creates_scope: s.creates_scope,
+            edge_id: s.edge_id,
+            foreach: s.foreach,
+            source_subgraph_path: s.source_subgraph_path,
+            destination_subgraph_path: s.destination_subgraph_path,
+            predecessor_subgraph_paths: s.predecessor_subgraph_paths,
+            join_incoming_edges: s.join_incoming_edges,
+            join_upstream_names: s.join_upstream_names,
             inputs: s.inputs,
-            depends_on_names: s.depends_on_names,
         }
     }
 }

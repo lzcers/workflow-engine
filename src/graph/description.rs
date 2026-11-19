@@ -1,6 +1,7 @@
 //! 执行图的只读描述，不包含上下文、运行状态或节点载荷。
 
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 
 use super::{Graph, Trigger};
 
@@ -11,6 +12,7 @@ pub struct GraphDescription {
     pub title: String,
     pub nodes: Vec<NodeDescription>,
     pub edges: Vec<EdgeDescription>,
+    pub subgraphs: Vec<SubgraphDescription>,
 }
 
 /// 节点信息。输入输出字段为 Rust 类型名，不是 JSON Schema。
@@ -21,10 +23,19 @@ pub struct NodeDescription {
     pub title: String,
     pub description: String,
     pub task_type: String,
+    pub subgraph_id: Option<String>,
     /// Event 节点的外部触发声明；其他节点为 None。
     pub trigger: Option<Trigger>,
     pub input_type: String,
     pub output_type: String,
+}
+
+/// 静态子图定义；ID 为完整点路径，父级归属不依赖当前运行任务。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubgraphDescription {
+    pub id: String,
+    pub title: String,
+    pub parent_id: Option<String>,
 }
 
 /// 边的触发类型。
@@ -44,7 +55,7 @@ pub struct EdgeDescription {
     pub target: String,
     pub kind: EdgeKind,
     /// 成功边是否逐项建立执行作用域；普通边与失败边为 false。
-    pub creates_scope: bool,
+    pub foreach: bool,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -59,6 +70,7 @@ impl<Ctx> Graph<Ctx> {
                 description: entry.description.clone(),
                 task_type: entry.node.task_type().as_str().to_owned(),
                 trigger: entry.node.trigger(),
+                subgraph_id: entry.subgraph_id.clone(),
                 input_type: entry.node.in_type().name().to_owned(),
                 output_type: entry.node.out_type().name().to_owned(),
             })
@@ -74,7 +86,7 @@ impl<Ctx> Graph<Ctx> {
                 source: edge.src().to_owned(),
                 target: edge.dst().to_owned(),
                 kind: EdgeKind::Success,
-                creates_scope: edge.creates_scope(),
+                foreach: edge.is_foreach(),
             })
             .chain(
                 self.failure_edges
@@ -85,16 +97,106 @@ impl<Ctx> Graph<Ctx> {
                         source: edge.src().to_owned(),
                         target: edge.dst().to_owned(),
                         kind: EdgeKind::Failure,
-                        creates_scope: false,
+                        foreach: false,
                     }),
             )
             .collect();
 
+        let mut subgraphs = self.subgraphs.clone();
+        subgraphs.sort_by(|a, b| a.id.cmp(&b.id));
         GraphDescription {
             workflow_id: self.workflow_id.clone(),
             title: self.title.clone(),
             nodes,
             edges,
+            subgraphs,
         }
+    }
+}
+
+impl GraphDescription {
+    /// 校验静态归属以及 foreach 的边界。允许普通边直接连接子图内部节点。
+    pub fn validate_subgraphs(&self) -> Result<(), String> {
+        let mut groups = HashMap::new();
+        let node_ids: HashSet<_> = self.nodes.iter().map(|node| node.id.as_str()).collect();
+        for group in &self.subgraphs {
+            if group.id.is_empty() || group.title.trim().is_empty() {
+                return Err("subgraph id and title must not be empty".into());
+            }
+            if groups.insert(group.id.as_str(), group).is_some()
+                || node_ids.contains(group.id.as_str())
+            {
+                return Err(format!("duplicate subgraph id: {}", group.id));
+            }
+            if group.id.rsplit_once('.').map(|(parent, _)| parent) != group.parent_id.as_deref() {
+                return Err(format!(
+                    "subgraph {} must use its full parent-qualified name",
+                    group.id
+                ));
+            }
+        }
+        let mut paths = HashMap::new();
+        for group in &self.subgraphs {
+            let mut path = Vec::new();
+            let mut seen = HashSet::new();
+            let mut current = Some(group.id.as_str());
+            while let Some(id) = current {
+                if !seen.insert(id) {
+                    return Err(format!("subgraph hierarchy contains a cycle at {id}"));
+                }
+                let group = groups
+                    .get(id)
+                    .ok_or_else(|| format!("subgraph {id} not registered"))?;
+                path.push(id.to_owned());
+                current = group.parent_id.as_deref();
+            }
+            path.reverse();
+            paths.insert(group.id.as_str(), path);
+        }
+        let mut node_paths = HashMap::new();
+        for node in &self.nodes {
+            let path = match node.subgraph_id.as_deref() {
+                Some(id) => paths
+                    .get(id)
+                    .ok_or_else(|| format!("node {}: subgraph {id} not registered", node.id))?
+                    .clone(),
+                None => Vec::new(),
+            };
+            if let Some(id) = node.subgraph_id.as_deref() {
+                if node.id.rsplit_once('.').map(|(parent, _)| parent) != Some(id) {
+                    return Err(format!(
+                        "node {} must use its full subgraph-qualified name",
+                        node.id
+                    ));
+                }
+            }
+            node_paths.insert(node.id.as_str(), path);
+        }
+        for edge in &self.edges {
+            let source = node_paths
+                .get(edge.source.as_str())
+                .ok_or_else(|| format!("edge src={} not registered", edge.source))?;
+            let destination = node_paths
+                .get(edge.target.as_str())
+                .ok_or_else(|| format!("edge dst={} not registered", edge.target))?;
+            if edge.foreach
+                && self
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == edge.target && node.task_type == "join")
+            {
+                return Err(format!(
+                    "foreach edge must not target join node {}",
+                    edge.target
+                ));
+            }
+            if edge.foreach && source.starts_with(destination) {
+                return Err(format!(
+                    "foreach edge {} -> {} must enter a new subgraph",
+                    edge.source, edge.target
+                ));
+            }
+        }
+        Ok(())
     }
 }

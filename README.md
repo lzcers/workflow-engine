@@ -14,7 +14,7 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| [`graph`](src/graph) | `Graph`、构图接口、节点 `Node`、上下文 `NodeContext`、`JoinNode`、`ScopeNode`、成功/失败边与图描述 |
+| [`graph`](src/graph) | `Graph`、构图接口、节点 `Node`、上下文 `NodeContext`、`JoinNode`、成功/失败边与图描述 |
 | [`engine`](src/engine.rs) | `Engine` 按 URL 初始化共享存储，通过 `make` 为不同的图创建工作流实例；`EngineError` 描述初始化与提交错误 |
 | [`workflow`](src/workflow.rs) | 单图 `Workflow` 提交独立运行并自动执行，返回 `RunHandle` |
 | [`task`](src/task) | 任务输入 `Task`、任务快照 `TaskRecord` 与状态 `TaskStatus` |
@@ -42,35 +42,47 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 并通过认领校验阻止重复结算，因此不需要额外的实例编号去重。
 只有 JOIN 按 `workflow_id + run_id + scope_id + name` 汇入已有 pending / running JOIN，跨父任务
 累积输入，并将所有贡献者 ID 去重合并到 `parent_task_ids`。JOIN 是否就绪由
-`depends_on_names` 判断：同一运行、同一组内每个静态前驱至少存在一个实例，且已有实例全部成功。
+持久化的 `join_state` 判断，既检查预期输入，也等待仍可能产生输入的上游完成。
 
-## 执行分组
+## 子图与执行作用域
 
-支持两种建立执行组的方式：
+子图是 DSL 的静态嵌套结构，包含节点和边，不是一个执行节点：
 
-- `items -> process foreach,`：上游输出 `Vec<T>`，下游输入 `T`；每个元素创建一个下游任务，
-  以该任务的 `task_id` 创建 `scope_id`。`T` 需实现 `Clone`。命令式接口为
-  `graph::foreach::<T>("items", "process")`。空数组不创建任务，单元素数组也建立新组。
-- `ScopeNode<T>::new()`：输入输出均为 `T` 的纯透传节点，任务类型为 `scope`；每个 Scope
-  任务入队时以自己的 `task_id` 创建 `scope_id`，后续节点继承该组。
+```rust,ignore
+nodes { etfs => EtfCodesNode }
+subgraph analysis {
+    nodes { daily => DailyNode, signal => SignalNode, report_join => JoinNode, report => ReportNode }
+    edges {
+        daily -> signal,
+        daily -> report_join |> |bars| vec![json!({ "bars": bars })],
+        signal -> report_join |> |signals| vec![json!({ "signals": signals })],
+        report_join -> report,
+    }
+}
+edges { etfs -> analysis.daily foreach }
+```
 
-`foreach` 与普通扇出后经过 Scope 节点具有相同的下游分组隔离语义；后者多一层透传任务，
-因此任务数量、任务 ID 和来源链不同。两种方式均保留。`foreach` 的目标仍是原有节点类型，
-分组行为由边指定；图描述中的 `creates_scope` 标记该边，普通边及失败边为 `false`。
-同一目标的普通边和 `foreach` 边保留各自的分组行为。`|>` / `map` 只转换或扇出数据，
-始终继承当前组；不会根据输出数量自动建立新组。
+跨边界边直接引用真实节点的完整点路径。子图可以嵌套；例如内层 `analysis.detail` 的
+父子图为 `analysis`。`nodes` 块可以与 `subgraph` 交错，节点构造表达式按声明顺序求值。
+宏与源码编辑共用 `workflow-engine-dsl` 解析器；边仍通过类型化 NodeKey 在编译期检查。
 
-同一运行中的多份输入可以共用同一套节点，分别汇合并独立产出结果；JOIN 的查找、
-前驱就绪判断和失败级联均限定在同组。`scope_id = None` 表示该运行的默认组。
-重试和恢复保留任务已有的组；再次经 `foreach` 边或 Scope 节点创建的新任务会开启新组。
-`run_id` 和 `parent_task_ids` 仍分别表达整次运行和真实来源关系。
+任务只保存当前 `scope_id`，`scopes` 表保存每次子图调用的 `subgraph_id`、父 scope 和
+入口任务。根作用域为 NULL。进入子图创建实例，内部继承实例，退出时恢复目标层的父实例；
+输出立即触发普通后继，不等待整个子图完成。重试及进程恢复沿用已有实例。
 
-JOIN 的所有前驱必须在同组内，因此 `foreach` 不能直接指向 JOIN，构图时拒绝这种接线。
-例如代码数组经 `foreach` 连到日线节点，再由日线分别连接 MFI 和 JOIN，MFI 也连到 JOIN，
-即可共享一套分析和报表节点。执行组不声明结束边界，跨组结果不会自动返回父组收集。
+同一来源任务一次结算中的普通跨入边共享目标子图实例，不同来源任务不会自动合并。
+`foreach` 将源输出 `Vec<T>` 逐项传给目标，要求跨入显式子图，每个元素建立独立实例；
+不同 foreach 边不按下标隐式配对。`map` 只转换或扇出数据，不为每条输入单独分组。
+空数组不创建任务，`foreach` 不直接指向 JOIN。
 
-当前任务表包含 `scope_id` 列。DDL 只初始化当前 schema，不迁移旧表；使用新建数据库
-验证此版本，已有旧 schema 的数据库需另行重建。
+JOIN 在同一实例内聚合来源，并持久化预期依赖与实际到达的贡献。边界路由、scope 创建、
+源任务结算和后继入队在同一事务中完成。子图定义通过 `GraphDescription.subgraphs` 输出，
+节点通过 `subgraph_id` 声明归属；画布折叠不改变真实节点和边。
+
+组内 JOIN 按当前实例等待；外部入口贡献绑定创建该实例的具体任务，不自动关联不同入口事件。
+父层 JOIN 可收集其子图实例的输出，并等待相关上游生产结束；普通跨出边仍立即继续。
+
+DDL 只初始化当前 schema，不迁移旧表；旧 schema 数据库需要另行重建。
 
 ## 引擎与工作流实例
 

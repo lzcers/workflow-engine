@@ -13,6 +13,7 @@ pg = ["sqlx/postgres"]
 sqlite = ["dep:form_urlencoded", "sqlx/sqlite"]
 
 [dependencies]
+workflow-engine-macros = { path = "crates/workflow-engine-macros" }
 form_urlencoded = { version = "1.2.2", optional = true }
 futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -38,3 +39,7 @@ tokio = { version = "1.49.0", features = ["test-util"] }
 [[test]]
 name = "sqlite_backend"
 required-features = ["sqlite"]
+
+[workspace]
+members = ["crates/workflow-engine-dsl", "crates/workflow-engine-macros"]
+resolver = "3"

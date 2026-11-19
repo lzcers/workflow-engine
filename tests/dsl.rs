@@ -34,31 +34,33 @@ fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
         context: Ctx;
         nodes {
             source => Values,
-            destination => PassThrough,
+        }
+        subgraph analysis {
+            nodes { destination => PassThrough }
         }
         edges {
-            source -> destination |> |items| items.clone(),
-            source -> destination foreach,
-            destination -> source on_error |input, _| vec![vec![input.clone()]],
+            source -> analysis.destination |> |items| items.clone(),
+            source -> analysis.destination foreach,
+            analysis.destination -> source on_error |input, _| vec![vec![input.clone()]],
         }
     }
     .unwrap();
 
     let description = graph.describe();
-    assert!(!description.edges[0].creates_scope);
-    assert!(description.edges[1].creates_scope);
-    assert!(!description.edges[2].creates_scope);
+    assert!(!description.edges[0].foreach);
+    assert!(description.edges[1].foreach);
+    assert!(!description.edges[2].foreach);
     assert_eq!(
-        serde_json::to_value(description).unwrap()["edges"][1]["creates_scope"],
+        serde_json::to_value(description).unwrap()["edges"][1]["foreach"],
         true
     );
     for input in [serde_json::json!([1]), serde_json::json!([1, 2, 3])] {
         let plans = graph.plan_success("source", &input).unwrap();
         assert_eq!(plans.len(), 2);
-        assert!(!plans[0].creates_scope);
-        assert!(plans[1].creates_scope);
+        assert!(!plans[0].foreach);
+        assert!(plans[1].foreach);
         for plan in plans {
-            assert_eq!(plan.dst, "destination");
+            assert_eq!(plan.dst, "analysis.destination");
             assert_eq!(plan.task_type, TaskType::Normal);
             assert_eq!(&plan.inputs, input.as_array().unwrap());
         }
@@ -71,12 +73,12 @@ fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
     );
     let failure = graph
         .plan_failure(
-            "destination",
+            "analysis.destination",
             &serde_json::json!(1),
             &NodeError::retryable("retry"),
         )
         .unwrap();
-    assert!(!failure[0].creates_scope);
+    assert!(!failure[0].foreach);
 }
 
 #[test]
@@ -336,4 +338,88 @@ async fn infers_instance_and_context_types_and_evaluates_each_expression_once() 
         .plan_failure("destination", &output, &NodeError::retryable("retry"))
         .unwrap();
     assert_eq!(failure[0].inputs, vec![output]);
+}
+
+#[test]
+fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
+    let graph = workflow! {
+        workflow_id: "nested";
+        title: "Nested";
+        context: Ctx;
+        nodes { source => PassThrough }
+        subgraph batch {
+            nodes { fetch => PassThrough }
+            #[title = "信号分析"]
+            subgraph analysis {
+                nodes { signal => PassThrough, join => workflow_engine::JoinNode }
+                edges { signal -> join }
+            }
+            edges { fetch -> analysis.signal, fetch -> analysis.join }
+        }
+        nodes { output => PassThrough }
+        edges { source -> batch.fetch, batch.analysis.join -> output }
+    }
+    .unwrap();
+    let description = graph.describe();
+    assert_eq!(description.subgraphs.len(), 2);
+    assert_eq!(description.subgraphs[1].id, "batch.analysis");
+    assert_eq!(description.subgraphs[1].parent_id.as_deref(), Some("batch"));
+    assert_eq!(
+        graph.subgraph_path("batch.analysis.signal"),
+        ["batch", "batch.analysis"]
+    );
+    let plans = graph
+        .plan_success("batch.fetch", &serde_json::json!({}))
+        .unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0].source_subgraph_path, ["batch"]);
+    assert_eq!(
+        plans[0].destination_subgraph_path,
+        ["batch", "batch.analysis"]
+    );
+    let join = &plans[1];
+    assert_eq!(join.join_incoming_edges.len(), 2);
+    assert_eq!(
+        join.join_upstream_names,
+        ["batch.analysis.signal", "batch.fetch", "source"]
+    );
+    assert_eq!(
+        join.predecessor_subgraph_paths["source"],
+        Vec::<String>::new()
+    );
+    let exit = graph
+        .plan_success("batch.analysis.join", &serde_json::json!({}))
+        .unwrap();
+    assert!(exit[0].destination_subgraph_path.is_empty());
+}
+
+#[test]
+fn interleaved_subgraph_declarations_preserve_construction_order() {
+    let mut order = Vec::new();
+    let graph = workflow! {
+        workflow_id: "ordered";
+        title: "Ordered";
+        context: Ctx;
+        nodes { before => { order.push(1); PassThrough } }
+        subgraph inner {
+            nodes { middle => { order.push(2); PassThrough } }
+        }
+        nodes { after => { order.push(3); PassThrough } }
+        edges { before -> inner.middle, inner.middle -> after }
+    }
+    .unwrap();
+    assert_eq!(order, [1, 2, 3]);
+    assert_eq!(graph.describe().nodes.len(), 3);
+}
+
+#[test]
+fn foreach_requires_an_explicit_subgraph_boundary() {
+    let result = workflow! {
+        workflow_id: "unbounded";
+        title: "Unbounded";
+        context: Ctx;
+        nodes { source => Values, target => PassThrough }
+        edges { source -> target foreach }
+    };
+    assert!(result.err().unwrap().contains("must enter a new subgraph"));
 }

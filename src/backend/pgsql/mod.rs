@@ -19,9 +19,11 @@
 //! - [`crate::task::record`] / [`rows`]：数据库任务行与公共 [`crate::TaskRecord`]；
 //! - [`schema`]：引擎自有 DDL 与迁移入口。
 
+mod join;
 mod repo;
 mod rows;
 mod schema;
+mod scope;
 mod store;
 
 #[cfg(test)]
