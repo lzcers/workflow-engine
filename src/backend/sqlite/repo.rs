@@ -7,13 +7,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::{join, scope};
-use crate::task::scope::{ScopeEntries, dependency_names};
+use crate::task::{MAX_ATTEMPTS, scope::ScopeEntries};
 use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
-use crate::graph::{ErasedGraph, Successor};
+use crate::graph::{ErasedGraph, JoinRule, Successor};
 use crate::node::TaskType;
 use crate::{Task, TaskRecord, TaskStatus};
 
@@ -21,7 +21,7 @@ use crate::task::store::{LEASE_DURATION, merge_join_input};
 
 /// Columns suitable for application queries against the same task table.
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
-    claimed_by, lease_until, attempt, max_attempts, task_type, depends_on_names, \
+    lease_until, attempt, \
     input_json, output_json, error, created_at, updated_at";
 
 /// One graph's task repository. Clones share its connection pool and graph.
@@ -29,7 +29,6 @@ pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_
 pub struct SqliteTaskRepo {
     pool: SqlitePool,
     graph: Arc<dyn ErasedGraph>,
-    pub(super) max_attempts: i32,
 }
 
 /// Allocate a workflow-local task ID inside the caller's transaction.
@@ -61,10 +60,10 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
 
 /// Implements the JOIN predecessor/lease gate in [`crate::task::TaskStore::claim_many`]
 /// for both claim and recovery. Parent IDs record provenance, not execution dependencies.
-fn executable_where(upstream_parameter: &str) -> String {
+fn executable_where(rules_parameter: &str) -> String {
     format!(
         "wt.status IN ('pending', 'running') AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now')) AND ({})",
-        join::ready(upstream_parameter)
+        join::ready(rules_parameter)
     )
 }
 
@@ -74,7 +73,6 @@ async fn enqueue_fanout_in_tx(
     source: &TaskRecord,
     graph: &dyn ErasedGraph,
     plan: &Successor,
-    max_attempts: i32,
     entries: &mut ScopeEntries,
 ) -> Result<(), StorageError> {
     let task_type = graph
@@ -107,7 +105,7 @@ async fn enqueue_fanout_in_tx(
         .await?;
         let existing = if task_type == TaskType::Join {
             sqlx::query_as::<_, TaskRow>(&format!(
-                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND name=?2 AND run_id IS ?3 AND scope_id IS ?4 AND task_type='join' AND status IN ('pending','running') ORDER BY task_id LIMIT 1"
+                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND name=?2 AND run_id IS ?3 AND scope_id IS ?4 AND status IN ('pending','running') ORDER BY task_id LIMIT 1"
             )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
               .fetch_optional(&mut **tx).await?
         } else {
@@ -124,32 +122,10 @@ async fn enqueue_fanout_in_tx(
                 .bind(&source.workflow_id).bind(existing.task_id).bind(Json(parents)).bind(input_json)
                 .execute(&mut **tx).await?;
         } else {
-            let dependencies =
-                if task_type == TaskType::Join && source.status == TaskStatus::Succeeded {
-                    let chain = scope::chain(tx, &source.workflow_id, scope_id).await?;
-                    let mut entry_names = std::collections::HashMap::new();
-                    for scope in &chain {
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            entry_names.entry(scope.trigger_task_id)
-                        {
-                            let name: String = sqlx::query_scalar(
-                                "SELECT name FROM tasks WHERE workflow_id=?1 AND task_id=?2",
-                            )
-                            .bind(&source.workflow_id)
-                            .bind(scope.trigger_task_id)
-                            .fetch_one(&mut **tx)
-                            .await?;
-                            entry.insert(name);
-                        }
-                    }
-                    dependency_names(graph, plan.dst, &chain, &entry_names)?
-                } else {
-                    Vec::new()
-                };
             let task_id = allocate_task_id(tx, &source.workflow_id).await?;
-            sqlx::query("INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,task_type,parent_task_ids,depends_on_names,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10)")
+            sqlx::query("INSERT INTO tasks (workflow_id,task_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7)")
                 .bind(&source.workflow_id).bind(task_id).bind(source.run_id).bind(plan.dst)
-                .bind(max_attempts).bind(task_type.as_str()).bind(Json(vec![source.task_id])).bind(Json(dependencies)).bind(input).bind(scope_id)
+                .bind(Json(vec![source.task_id])).bind(input).bind(scope_id)
                 .execute(&mut **tx).await?;
         }
     }
@@ -162,12 +138,12 @@ async fn fail_blocked_joins(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
-    upstreams: &HashMap<String, Vec<String>>,
+    rules: &HashMap<String, JoinRule>,
 ) -> Result<(), StorageError> {
     loop {
         let changed = sqlx::query(&format!(
             "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='pending' AND ({})", join::failed("?3")
-        )).bind(workflow_id).bind(run_id).bind(Json(upstreams)).execute(&mut **tx).await?.rows_affected();
+        )).bind(workflow_id).bind(run_id).bind(Json(rules)).execute(&mut **tx).await?.rows_affected();
         if changed == 0 {
             break;
         }
@@ -177,11 +153,7 @@ async fn fail_blocked_joins(
 
 impl SqliteTaskRepo {
     pub fn new(pool: SqlitePool, graph: Arc<dyn ErasedGraph>) -> Self {
-        Self {
-            pool,
-            graph,
-            max_attempts: 3,
-        }
+        Self { pool, graph }
     }
 
     fn check_workflow(&self, workflow_id: &str) -> Result<(), StorageError> {
@@ -194,12 +166,6 @@ impl SqliteTaskRepo {
             });
         }
         Ok(())
-    }
-
-    /// 覆盖结算时创建的后继任务的最大尝试次数。
-    pub fn with_max_attempts(mut self, n: i32) -> Self {
-        self.max_attempts = n;
-        self
     }
 
     /// Insert a pending task in an application-owned transaction.
@@ -237,12 +203,12 @@ impl SqliteTaskRepo {
         )
         .await?;
         let row = sqlx::query_as::<_, TaskRow>(&format!(
-            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,attempt,max_attempts,parent_task_ids,depends_on_names,input_json,task_type,scope_id) VALUES (?1,?2,?3,?4,'pending',0,?5,?6,?7,?8,?9,?10) RETURNING {ROW_COLS}"
-        )).bind(&task.workflow_id).bind(task_id).bind(run_id).bind(&task.name).bind(task.max_attempts)
-          .bind(Json(&task.parent_task_ids)).bind(Json(&task.depends_on_names)).bind(&task.input).bind(task_type.as_str()).bind(scope_id)
+            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7) RETURNING {ROW_COLS}"
+        )).bind(&task.workflow_id).bind(task_id).bind(run_id).bind(&task.name)
+          .bind(Json(&task.parent_task_ids)).bind(&task.input).bind(scope_id)
           .fetch_one(&mut **tx).await?;
         if task_type == TaskType::Join {
-            fail_blocked_joins(tx, &task.workflow_id, run_id, self.graph.join_upstreams()).await?;
+            fail_blocked_joins(tx, &task.workflow_id, run_id, self.graph.join_rules()).await?;
             let row = sqlx::query_as::<_, TaskRow>(&format!(
                 "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND task_id=?2"
             ))
@@ -270,7 +236,6 @@ impl SqliteTaskRepo {
         task: &TaskRecord,
         output: &Value,
         fanouts: &[Successor],
-        max_attempts: i32,
     ) -> Result<TaskRecord, StorageError> {
         self.check_workflow(&task.workflow_id)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -280,8 +245,8 @@ impl SqliteTaskRepo {
             SET status = 'succeeded', output_json = ?3, error = NULL, lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
-              AND status = 'running' AND claimed_by = ?4 AND attempt = ?5
-              AND attempt <= max_attempts
+              AND status = 'running' AND attempt = ?4
+              AND attempt <= {MAX_ATTEMPTS}
               AND julianday(lease_until) > julianday('now')
             RETURNING {ROW_COLS}
             "#
@@ -289,7 +254,6 @@ impl SqliteTaskRepo {
         .bind(&task.workflow_id)
         .bind(task.task_id)
         .bind(output)
-        .bind(&task.claimed_by)
         .bind(task.attempt)
         .fetch_optional(&mut *tx)
         .await?
@@ -301,7 +265,6 @@ impl SqliteTaskRepo {
                 &TaskRecord::from(settled.clone()),
                 self.graph.as_ref(),
                 fanout,
-                max_attempts,
                 &mut entries,
             )
             .await?;
@@ -310,7 +273,7 @@ impl SqliteTaskRepo {
             &mut tx,
             &task.workflow_id,
             settled.run_id,
-            self.graph.join_upstreams(),
+            self.graph.join_rules(),
         )
         .await?;
         tx.commit().await?;
@@ -323,7 +286,6 @@ impl SqliteTaskRepo {
         task: &TaskRecord,
         error: &str,
         fanouts: &[Successor],
-        max_attempts: i32,
     ) -> Result<(), StorageError> {
         self.check_workflow(&task.workflow_id)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -335,7 +297,7 @@ impl SqliteTaskRepo {
             SET status = ?3, error = ?4, lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
-              AND status = 'running' AND claimed_by = ?5 AND attempt = ?6
+              AND status = 'running' AND attempt = ?5
               AND julianday(lease_until) > julianday('now')
             RETURNING {ROW_COLS}
             "#
@@ -348,7 +310,6 @@ impl SqliteTaskRepo {
             TaskStatus::Superseded.as_str()
         })
         .bind(error)
-        .bind(&task.claimed_by)
         .bind(task.attempt)
         .fetch_optional(&mut *tx)
         .await?
@@ -360,7 +321,6 @@ impl SqliteTaskRepo {
                 &TaskRecord::from(settled.clone()),
                 self.graph.as_ref(),
                 fanout,
-                max_attempts,
                 &mut entries,
             )
             .await?;
@@ -369,7 +329,7 @@ impl SqliteTaskRepo {
             &mut tx,
             &task.workflow_id,
             settled.run_id,
-            self.graph.join_upstreams(),
+            self.graph.join_rules(),
         )
         .await?;
         tx.commit().await?;
@@ -386,17 +346,16 @@ impl SqliteTaskRepo {
         let lease_until = sqlx::query_scalar(
             r#"
             UPDATE tasks
-            SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?5 || ' seconds'),
+            SET lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?4 || ' seconds'),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
-              AND claimed_by = ?3 AND attempt = ?4
+              AND attempt = ?3
               AND status = 'running' AND julianday(lease_until) > julianday('now')
             RETURNING lease_until
             "#,
         )
         .bind(&task.workflow_id)
         .bind(task.task_id)
-        .bind(&task.claimed_by)
         .bind(task.attempt)
         .bind(LEASE_DURATION.as_secs() as i64)
         .fetch_optional(&mut *tx)
@@ -412,13 +371,12 @@ impl SqliteTaskRepo {
             UPDATE tasks SET lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
-              AND status = 'running' AND claimed_by = ?3 AND attempt = ?4
+              AND status = 'running' AND attempt = ?3
               AND julianday(lease_until) > julianday('now')
             "#,
         )
         .bind(&task.workflow_id)
         .bind(task.task_id)
-        .bind(&task.claimed_by)
         .bind(task.attempt)
         .execute(&self.pool)
         .await?;
@@ -428,39 +386,16 @@ impl SqliteTaskRepo {
         Ok(())
     }
 
-    /// Release leases belonging to a stopped worker in this workflow.
-    /// Stop and await that worker first; its old claim snapshots become invalid.
-    pub async fn release_claims(
-        &self,
-        workflow_id: &str,
-        worker_id: &str,
-    ) -> Result<u64, StorageError> {
-        Ok(sqlx::query(
-            r#"
-            UPDATE tasks SET lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND claimed_by = ?2
-              AND status = 'running' AND lease_until IS NOT NULL
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(worker_id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected())
-    }
-
     /// Claim a bounded batch, including expired tasks that need final failure settlement.
-    /// Each claim advances the fencing generation. Claims above max_attempts may only settle failure;
+    /// Each claim advances the fencing generation. Claims above the retry budget may only settle failure;
     /// they never execute the node again. The write transaction serializes competing workers.
     pub async fn claim_many(
         &self,
         workflow_id: &str,
-        worker: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
         self.check_workflow(workflow_id)?;
-        let executable_where = executable_where("?5");
+        let executable_where = executable_where("?4");
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -470,16 +405,16 @@ impl SqliteTaskRepo {
             WITH candidate AS MATERIALIZED (
                 SELECT wt.task_id FROM tasks wt
                 WHERE wt.workflow_id = ?1 AND {executable_where}
-                ORDER BY wt.task_id LIMIT ?4
+                ORDER BY wt.task_id LIMIT ?3
             )
             UPDATE tasks
-            SET status = 'running', claimed_by = ?2,
-                error = CASE WHEN attempt >= max_attempts THEN COALESCE(error,
+            SET status = 'running',
+                error = CASE WHEN attempt >= {MAX_ATTEMPTS} THEN COALESCE(error,
                     CASE WHEN lease_until IS NOT NULL
                          THEN 'task lease expired; retry budget exhausted'
                          ELSE 'task retry budget exhausted' END)
                     ELSE error END,
-                lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?3 || ' seconds'),
+                lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?2 || ' seconds'),
                 attempt = attempt + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id IN (SELECT task_id FROM candidate)
@@ -487,10 +422,9 @@ impl SqliteTaskRepo {
             "#
         ))
         .bind(workflow_id)
-        .bind(worker)
         .bind(LEASE_DURATION.as_secs() as i64)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .bind(Json(self.graph.join_upstreams()))
+        .bind(Json(self.graph.join_rules()))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -523,7 +457,7 @@ impl SqliteTaskRepo {
             "#
         ))
         .bind(workflow_id)
-        .bind(Json(self.graph.join_upstreams()))
+        .bind(Json(self.graph.join_rules()))
         .fetch_all(&self.pool)
         .await?)
     }
@@ -549,13 +483,11 @@ impl SqliteTaskRepo {
         task: &TaskRecord,
         output: &Value,
     ) -> Result<TaskRecord, StorageError> {
-        self.succeed_and_enqueue(task, output, &[], task.max_attempts)
-            .await
+        self.succeed_and_enqueue(task, output, &[]).await
     }
 
     pub async fn fail(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
-        self.fail_and_enqueue(task, error, &[], task.max_attempts)
-            .await
+        self.fail_and_enqueue(task, error, &[]).await
     }
 
     pub async fn supersede(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
@@ -579,8 +511,8 @@ impl SqliteTaskRepo {
             UPDATE tasks SET status = ?3, error = ?4, lease_until = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE workflow_id = ?1 AND task_id = ?2
-              AND status = 'running' AND claimed_by = ?5 AND attempt = ?6
-              AND (attempt <= max_attempts OR ?3 IN ('failed', 'superseded'))
+              AND status = 'running' AND attempt = ?5
+              AND (attempt <= ?6 OR ?3 IN ('failed', 'superseded'))
               AND julianday(lease_until) > julianday('now')
             "#,
         )
@@ -588,8 +520,8 @@ impl SqliteTaskRepo {
         .bind(task.task_id)
         .bind(status)
         .bind(error)
-        .bind(&task.claimed_by)
         .bind(task.attempt)
+        .bind(MAX_ATTEMPTS)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {

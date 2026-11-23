@@ -5,6 +5,7 @@
 //!
 //! [`GraphBuilder`] 负责注册节点、追加边、组装并校验。
 
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -34,6 +35,20 @@ struct GraphNode<Ctx> {
     subgraph_id: Option<String>,
 }
 
+/// JOIN 的直接前驱与仍可能创建输入的全部上游，在图构建后固定。
+#[derive(Debug, Serialize)]
+pub struct JoinRule {
+    pub predecessors: Vec<JoinPredecessor>,
+    pub upstreams: Vec<String>,
+}
+
+/// 外部前驱只对应触发当前子图实例的入口任务。深度从最外层子图的 0 开始。
+#[derive(Debug, Serialize)]
+pub struct JoinPredecessor {
+    pub name: String,
+    pub entry_depth: Option<usize>,
+}
+
 /// 图引擎：节点注册表 + 成功/失败边集合，持有上下文与节点实例，负责执行、后继规划、静态校验。
 ///
 /// 成功边与失败边分置两个集合，
@@ -46,7 +61,7 @@ pub struct Graph<Ctx> {
     subgraphs: Vec<SubgraphDescription>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
-    join_upstreams: HashMap<String, Vec<String>>,
+    join_rules: HashMap<String, JoinRule>,
 }
 
 /// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
@@ -191,22 +206,42 @@ impl<Ctx> Graph<Ctx> {
         Ok(plans)
     }
 
-    /// 构建后固定的 JOIN 上游范围，供所有执行和存储调用共享。
-    pub fn join_upstreams(&self) -> &HashMap<String, Vec<String>> {
-        &self.join_upstreams
+    /// 存储在认领和传播失败时使用这些规则，并按当前任务的作用域匹配来源。
+    pub fn join_rules(&self) -> &HashMap<String, JoinRule> {
+        &self.join_rules
     }
 
-    fn compute_join_upstreams(&self) -> HashMap<String, Vec<String>> {
+    fn compute_join_rules(&self) -> HashMap<String, JoinRule> {
         self.nodes
             .iter()
             .filter(|(_, entry)| entry.node.task_type() == TaskType::Join)
-            .map(|(&name, _)| (name.to_owned(), self.upstream_names(name)))
+            .map(|(&name, _)| (name.to_owned(), self.join_rule(name)))
             .collect()
     }
 
-    fn upstream_names(&self, dst: &str) -> Vec<String> {
-        let mut seen = HashSet::new();
+    fn join_rule(&self, dst: &str) -> JoinRule {
+        let target = self.subgraph_path(dst).expect("validated JOIN node");
         let mut pending = self.predecessors_of(dst).expect("validated JOIN node");
+        let predecessors = pending
+            .iter()
+            .map(|name| {
+                let source = self
+                    .subgraph_path(name)
+                    .expect("validated JOIN predecessor");
+                let entry_depth = (!source.starts_with(&target)).then(|| {
+                    source
+                        .iter()
+                        .zip(&target)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                });
+                JoinPredecessor {
+                    name: name.clone(),
+                    entry_depth,
+                }
+            })
+            .collect();
+        let mut seen = HashSet::new();
         while let Some(name) = pending.pop() {
             if !seen.insert(name.clone()) {
                 continue;
@@ -218,9 +253,12 @@ impl<Ctx> Graph<Ctx> {
                     .map(|edge| edge.src().to_owned()),
             );
         }
-        let mut names: Vec<_> = seen.into_iter().collect();
-        names.sort();
-        names
+        let mut upstreams: Vec<_> = seen.into_iter().collect();
+        upstreams.sort();
+        JoinRule {
+            predecessors,
+            upstreams,
+        }
     }
 
     /// 节点的静态前驱节点名集合：返回所有成功边汇入 `dst` 的源节点名全集。

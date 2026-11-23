@@ -54,6 +54,8 @@ pub struct EdgeDescription {
     pub source: String,
     pub target: String,
     pub kind: EdgeKind,
+    /// 是否通过 map 转换输入。foreach 和透传边为 false。
+    pub map: bool,
     /// 成功边是否逐项建立执行作用域；普通边与失败边为 false。
     pub foreach: bool,
 }
@@ -86,6 +88,7 @@ impl<Ctx> Graph<Ctx> {
                 source: edge.src().to_owned(),
                 target: edge.dst().to_owned(),
                 kind: EdgeKind::Success,
+                map: edge.is_map(),
                 foreach: edge.is_foreach(),
             })
             .chain(
@@ -97,6 +100,7 @@ impl<Ctx> Graph<Ctx> {
                         source: edge.src().to_owned(),
                         target: edge.dst().to_owned(),
                         kind: EdgeKind::Failure,
+                        map: edge.is_map(),
                         foreach: false,
                     }),
             )

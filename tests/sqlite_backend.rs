@@ -112,7 +112,6 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
             observed.push((
                 task.run_id.unwrap(),
                 task.name,
-                task.task_type,
                 task.parent_task_ids,
                 task.input.as_i64().unwrap(),
                 output.as_i64().unwrap(),
@@ -124,32 +123,17 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
     .expect("each event executes its entry and successor, alongside a manual submission");
     observed.sort();
     let mut expected = vec![
-        (first.run_id, "tick".into(), "event".into(), vec![], 10, 20),
-        (
-            first.run_id,
-            "process".into(),
-            "normal".into(),
-            vec![first.task_id],
-            20,
-            21,
-        ),
-        (second.run_id, "tick".into(), "event".into(), vec![], 20, 30),
+        (first.run_id, "tick".into(), vec![], 10, 20),
+        (first.run_id, "process".into(), vec![first.task_id], 20, 21),
+        (second.run_id, "tick".into(), vec![], 20, 30),
         (
             second.run_id,
             "process".into(),
-            "normal".into(),
             vec![second.task_id],
             30,
             31,
         ),
-        (
-            manual.run_id,
-            "process".into(),
-            "normal".into(),
-            vec![],
-            30,
-            31,
-        ),
+        (manual.run_id, "process".into(), vec![], 30, 31),
     ];
     expected.sort();
     assert_eq!(observed, expected);
@@ -163,9 +147,9 @@ async fn make_recovers_persisted_tasks_without_submit() {
     let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
     sqlx::query(
         "INSERT INTO tasks (workflow_id, run_id, task_id, name, status, input_json,
-                            claimed_by, attempt, lease_until)
-         VALUES ('recovery', 1, 1, 'start', 'pending', '10', NULL, 0, NULL),
-                ('recovery', 2, 2, 'start', 'running', '20', 'old-worker', 1,
+                            attempt, lease_until)
+         VALUES ('recovery', 1, 1, 'start', 'pending', '10', 0, NULL),
+                ('recovery', 2, 2, 'start', 'running', '20', 1,
                  '2000-01-01T00:00:00Z')",
     )
     .execute(&pool)
@@ -193,8 +177,6 @@ async fn make_recovers_persisted_tasks_without_submit() {
         for _ in 0..2 {
             let (task, output) = results.recv().await.unwrap();
             assert_eq!(task.workflow_id, "recovery");
-            assert!(task.claimed_by.is_some());
-            assert_ne!(task.claimed_by.as_deref(), Some("old-worker"));
             recovered.push((
                 task.task_id,
                 task.run_id,

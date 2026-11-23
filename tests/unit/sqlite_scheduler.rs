@@ -123,9 +123,12 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     assert!(root.parent_task_ids.is_empty());
     assert_eq!(other_root.run_id, Some(other_root.task_id));
     assert_ne!(root.run_id, other_root.run_id);
-    let store = repo.clone().with_max_attempts(5);
-    let scheduler = Scheduler::new(graph.clone(), Arc::new(store), Duration::from_millis(2))
-        .with_max_concurrency(3);
+    let scheduler = Scheduler::new(
+        graph.clone(),
+        Arc::new(repo.clone()),
+        Duration::from_millis(2),
+    )
+    .with_max_concurrency(3);
     tokio::time::timeout(Duration::from_secs(5), async {
         tokio::select! {
             _ = scheduler.run() => panic!("scheduler must run until cancelled"),
@@ -162,9 +165,6 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         assert_eq!(task.attempt, 1);
         assert!(task.error.is_none());
         assert!(task.lease_until.is_none());
-        if task.task_id != root.task_id {
-            assert_eq!(task.max_attempts, 5);
-        }
     }
     assert_eq!(tasks[0].output, Some(json!(1)));
 
@@ -187,10 +187,6 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         1
     );
     let join = tasks.iter().find(|task| task.name == "collect").unwrap();
-    assert_eq!(join.task_type, "join");
-    let mut predecessors = join.depends_on_names.clone();
-    predecessors.sort();
-    assert_eq!(predecessors, ["summary", "worker"]);
     let mut parent_ids = join.parent_task_ids.clone();
     parent_ids.sort_unstable();
     let mut expected_ids = vec![workers[0].task_id, workers[1].task_id, summary.task_id];
@@ -461,7 +457,6 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
             .collect();
         assert_eq!(scopes.len(), 3);
         for scope in scopes {
-            assert_eq!(scope.task_type, "normal");
             assert!(scope.scope_id.is_some());
             let source = tasks
                 .iter()
@@ -487,9 +482,6 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                 .iter()
                 .find(|task| task.name == "analysis.collect")
                 .unwrap();
-            let mut predecessors = join.depends_on_names.clone();
-            predecessors.sort();
-            assert_eq!(predecessors, ["analysis.per_item", "analysis.worker"]);
             let mut parents = join.parent_task_ids.clone();
             parents.sort_unstable();
             assert_eq!(parents, [scope.task_id, worker.task_id]);
@@ -633,9 +625,6 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
                 .iter()
                 .find(|task| task.name == "analysis.collect" && task.scope_id == worker.scope_id)
                 .unwrap();
-            assert_eq!(join.depends_on_names.len(), 2);
-            assert!(join.depends_on_names.contains(&source.name));
-            assert!(join.depends_on_names.contains(&worker.name));
             let mut parents = join.parent_task_ids.clone();
             parents.sort_unstable();
             assert_eq!(parents, [source.task_id, worker.task_id]);
@@ -674,8 +663,6 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
         scope_id: None,
         parent_task_ids: vec![],
         name: "slow".into(),
-        max_attempts: 3,
-        depends_on_names: vec![],
         input: json!(0),
     };
     let slow_started = Arc::new(Notify::new());

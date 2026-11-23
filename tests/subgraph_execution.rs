@@ -116,8 +116,8 @@ async fn recover_nested(url: &str) {
     execute_sql(url, &"INSERT INTO task_counters(workflow_id,next_task_id) VALUES('scope-recovery',3);
         INSERT INTO scopes(workflow_id,scope_id,run_id,subgraph_id,parent_scope_id,trigger_task_id)
         VALUES('scope-recovery',1,3,'outer',NULL,3),('scope-recovery',2,3,'outer.inner',1,3);
-        INSERT INTO tasks(workflow_id,task_id,run_id,scope_id,name,status,input_json,attempt,claimed_by,lease_until)
-        VALUES('scope-recovery',3,3,2,'outer.inner.start','running','8',1,'interrupted','2000-01-01T00:00:00Z');".replace("scope-recovery", &workflow_id)).await;
+        INSERT INTO tasks(workflow_id,task_id,run_id,scope_id,name,status,input_json,attempt,lease_until)
+        VALUES('scope-recovery',3,3,2,'outer.inner.start','running','8',1,'2000-01-01T00:00:00Z');".replace("scope-recovery", &workflow_id)).await;
     drop(engine);
     let engine = Engine::new(url).await.unwrap();
     let (results, mut receiver) = mpsc::unbounded_channel();

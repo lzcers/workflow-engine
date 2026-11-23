@@ -142,10 +142,10 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
             subgraphs: self.subgraphs,
             success_edges: self.success_edges,
             failure_edges: self.failure_edges,
-            join_upstreams: Default::default(),
+            join_rules: Default::default(),
         };
         graph.validate()?;
-        graph.join_upstreams = graph.compute_join_upstreams();
+        graph.join_rules = graph.compute_join_rules();
         Ok(graph)
     }
 }

@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 用于任务定位、依赖引用和状态结算；同一任务重新认领时保持不变。
     task_id INTEGER NOT NULL CHECK (task_id > 0),
     -- 来源任务 ID JSON 数组；入口为空，成功和失败后继均记录源任务，JOIN 累积并去重所有贡献者。
-    -- 引用同一 workflow_id 下的 task_id，仅用于溯源，不要求来源任务成功。
+    -- 引用同一 workflow_id 下的 task_id；首个来源为 superseded 时，JOIN 由失败边创建。
     parent_task_ids TEXT NOT NULL DEFAULT '[]'
         CHECK (json_valid(parent_task_ids) AND json_type(parent_task_ids) = 'array'),
     -- 工作流图中注册的节点名；调度器据此选择执行节点，同一节点可产生多条任务记录。
@@ -32,21 +32,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL CHECK (
         status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'superseded')
     ),
-    -- 最近一次认领任务的 worker 标识；未认领时为 NULL，结算后保留，不代表租约仍有效。
-    claimed_by TEXT,
     -- 本次认领的租约截止时间（UTC 文本），执行及结算期间持续续租；NULL 表示无有效租约，结算或释放时清空。
     -- pending/running 任务在无租约或到期后可按依赖重新认领。
     lease_until TEXT,
-    -- 认领代次，从 0 开始，每次认领加 1；超过 max_attempts 后只处理最终失败，不再执行业务。
+    -- 认领代次，从 0 开始，每次认领加 1；超过引擎重试预算 后只处理最终失败，不再执行业务。
     attempt INTEGER NOT NULL DEFAULT 0,
-    -- 该任务行的业务执行次数上限（含首次）；耗尽后重新认领并通过统一失败流程结算。
-    -- 失败边新建的任务单独计数。
-    max_attempts INTEGER NOT NULL DEFAULT 3,
-    -- 节点声明的任务类型：normal 普通节点；event 外部事件入口；join 汇合节点。
-    task_type TEXT NOT NULL DEFAULT 'normal' CHECK (task_type IN ('normal', 'join', 'event')),
-    -- JOIN 当前调用需要等待的前驱节点名；匹配范围由 scopes 父子关系确定。
-    depends_on_names TEXT NOT NULL DEFAULT '[]'
-        CHECK (json_valid(depends_on_names) AND json_type(depends_on_names) = 'array'),
     -- 节点输入的 JSON 文本；结构由节点输入类型决定，JOIN 输入按前驱节点名汇聚。
     input_json TEXT NOT NULL CHECK (json_valid(input_json)),
     -- 节点成功输出的 JSON 文本；结构由节点输出类型决定，尚未写入输出时为 SQL NULL。

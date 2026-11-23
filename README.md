@@ -30,20 +30,20 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 `pending`、`running`、`succeeded`、`failed`、`skipped`、`superseded`；数据库中的未知状态
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
-`Task::new(workflow_id, name, input)` 默认创建无依赖的独立运行入口，尝试预算为 3；
-入队前可设置 `run_id`、`scope_id`、`parent_task_ids`、`depends_on_names` 和 `max_attempts`。
+`Task::new(workflow_id, name, input)` 默认创建独立运行入口，每条任务最多执行业务 3 次。
+入队前可设置 `run_id`、`scope_id` 和 `parent_task_ids`。
 节点类型、静态子图路径与前驱定义统一从绑定图查询；任务输入不重复携带这些静态定义。
 存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
 业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
 
 `parent_task_ids` 记录来源任务 ID 集合，独立入口为空数组。成功和失败后继均由
-引擎自动填写；它只表达来源关系，不要求来源任务成功，也不参与认领资格判断。
+引擎按贡献顺序填写。首个来源为 `superseded` 时，JOIN 走失败恢复路径，可直接执行。
 普通节点每条输入创建独立任务，以 `task_id` 标识；同一父任务的多个子任务共享
 `parent_task_ids = [源任务 ID]`，不同父任务的同名后继也独立存在。父任务结算与后继创建原子提交，
 并通过认领校验阻止重复结算，因此不需要额外的实例编号去重。
 只有 JOIN 按 `workflow_id + run_id + scope_id + name` 汇入已有 pending / running JOIN，跨父任务
 累积输入，并将所有贡献者 ID 去重合并到 `parent_task_ids`。JOIN 是否就绪由
-`depends_on_names`、`scopes` 父子关系和任务状态共同判断。可能继续产生输入的上游范围
+图中的前驱、`scopes` 的入口和任务状态共同判断。无父任务且 `task_id = run_id` 的运行入口直接执行。可能继续产生输入的上游范围
 在图构建时计算并保存在图中，不写入任务表。仓储直接查询共享图，后继规划只包含
 目标节点、输入和是否为每条输入创建作用域，不复制节点类型、路径或前驱集合。
 同一 Engine 的不同工作流共享数据库连接池，各自绑定自己的图。
@@ -79,7 +79,7 @@ edges { etfs -> analysis.daily foreach }
 不同 foreach 边不按下标隐式配对。`map` 只转换或扇出数据，不为每条输入单独分组。
 空数组不创建任务，`foreach` 不直接指向 JOIN。
 
-JOIN 在同一实例内聚合来源，以 `depends_on_names` 保存该次调用的有效前驱名。边界路由、scope 创建、
+JOIN 在同一实例内聚合来源，认领时按作用域入口筛选本次调用的有效前驱。边界路由、scope 创建、
 源任务结算和后继入队在同一事务中完成。子图定义通过 `GraphDescription.subgraphs` 输出，
 节点通过 `subgraph_id` 声明归属；画布折叠不改变真实节点和边。
 
@@ -148,7 +148,7 @@ RunHandle 保存 `workflow_id`、`run_id` 和入口任务的 `task_id`，`status
 
 进程重启后，连接同一持久化数据库并为相同 `workflow_id` 重新 `make(graph)`，即可恢复
 存量任务，无需新的 `submit`。遗留的 `running` 任务等待旧租约过期后重新认领并从节点
-开头执行，最多执行业务节点 `max_attempts` 次。预算耗尽后取得的新认领只处理最终失败，
+开头执行，每条任务最多执行业务 3 次。预算耗尽后取得的新认领只处理最终失败，
 通过失败边生成后继，或标记失败并传播依赖失败。引擎只调度已创建实例的图，不会从
 数据库自动发现并重建其他图。SQLite 内存及临时数据库不支持跨进程恢复。
 
@@ -167,16 +167,16 @@ RunHandle 保存 `workflow_id`、`run_id` 和入口任务的 `task_id`，`status
   释放租约，任务下一轮被重认领（重执行一次的代价即引擎既有的 at-least-once 语义），杜绝
   「已成功但后继从未入队」的静默停摆。
   无失败后继时，源任务失败与已有直接依赖任务的失败级联也在同一事务内完成。
-- **自动续租**：每次启动 Scheduler 都分配唯一 worker ID，每次认领递增 `attempt`，
+- **自动续租**：每次认领递增 `attempt`，
   并按数据库时间设置 300 秒的 `lease_until`。上下文准备、业务执行和结算期间每 100 秒
   续租一次，续租不增加 `attempt`。租约确认失效，或到期前未能确认续租成功时，取消本地
-  future 并释放执行槽，未结算任务允许重新认领。续租、结算和释放均校验当前状态、worker、
+  future 并释放执行槽，未结算任务允许重新认领。续租、结算和释放均校验当前状态、
   attempt 和数据库时间下的租约有效性，过期租约不能复活，旧执行者不能提交结果。
   引擎不限制节点运行时长；业务超时由节点自行控制。终态提交后停止续租，回调仍占执行槽，
   由节点自行控制回调时长，并随 Workflow 释放而取消。
-- **统一最终失败**：`attempt` 是认领代次，`max_attempts` 限制业务执行次数；
-  `attempt > max_attempts` 的认领只进行最终失败处理，不调用 `on_start` 和 `execute`。
-  最后一次租约过期时记录租约失效原因，提前释放或零预算记录预算耗尽原因；恢复认领保留原因。
+- **统一最终失败**：`attempt` 是认领代次，引擎统一限制业务执行次数。
+  `attempt > MAX_ATTEMPTS` 的认领只进行最终失败处理，不调用 `on_start` 和 `execute`。
+  最后一次租约过期时记录租约失效原因，提前释放记录预算耗尽原因；恢复认领保留原因。
   调度器同步规划失败后继，再原子提交 `superseded` 与失败后继，或提交 `failed` 与依赖失败传播。
   失败提交后才调用 `on_error`；正常业务失败沿用执行上下文，恢复处理此时才 `fork` 回调上下文，
   避免上下文准备或回调卡住最终结算。恢复过程在提交前崩溃或结算失败后可重新认领继续处理，
@@ -275,6 +275,8 @@ let description = graph.describe();
 
 节点可通过 `.node(...)`、`.node_with_key(...)` 或 DSL 注册；重复节点名在 `build()` 时返回错误。
 成功边和失败边分别以 `kind: "success"` / `"failure"` 标识，平行边独立保留。
+成功边与失败边都通过 `map` 字段标记显式转换。逐项进入子图的边标记为
+`foreach: true`、`map: false`。透传边的两个标记均为 `false`，包括带条件的透传边。
 边 ID 为 `success:0`、`failure:0` 等当前图内编号；注册顺序变化后不保证跨版本稳定。
 工作流身份和标题只在图中定义；应用注册表直接索引完整的图描述，不重复指定身份和名称。
 运行状态仍由任务存储管理，无需另外维护一份画布拓扑。

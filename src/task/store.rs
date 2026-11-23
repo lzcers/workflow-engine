@@ -56,7 +56,7 @@ pub trait TaskStore: Sync {
     /// 原子入队任务并确定运行身份，返回已持久化的任务快照。
     /// run_id 为 None 时，以新分配的 task_id 创建独立运行；Some(id) 则保留指定运行。
     /// 从绑定图查询节点类型与静态归属，按子图路径创建入口实例，任务仅保存 scope_id。
-    /// 来源任务、有效前驱和尝试预算沿用输入；任务及其运行、作用域身份必须在同一事务内提交。
+    /// 来源任务沿用输入；任务及其运行、作用域身份必须在同一事务内提交。
     fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
@@ -64,25 +64,24 @@ pub trait TaskStore: Sync {
     ///
     /// 待处理任务必须同时满足：
     /// - 状态为 pending / running，未持有租约或租约已过期。
-    /// - JOIN 的 depends_on_names 匹配来源必须全部成功；当前图中仍可能生产来源的任务
+    /// - JOIN 在图和当前作用域中匹配的前驱必须全部成功；当前图中仍可能生产来源的任务
     ///   全部结束后才可认领。祖先或兄弟入口绑定精确触发任务，子图输出按父实例收集。
-    /// `parent_task_ids` 只记录来源，不参与认领资格判断。
+    /// 独立运行入口和失败路由创建的 JOIN 可直接认领。
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
-    /// worker_id 必须唯一标识此次执行器生命周期；每次认领递增 attempt 并写入 300 秒租约。
-    /// 返回的 attempt <= max_attempts 时执行业务；超过上限时只做最终失败结算，不再执行节点。
+    /// 每次认领递增 attempt 并写入 300 秒租约。
+    /// 返回的 attempt <= MAX_ATTEMPTS 时执行业务；超过上限时只做最终失败结算，不再执行节点。
     /// 首次认领耗尽任务时必须持久化 error：末次租约过期记录租约失效，无租约则记录预算耗尽。
     /// 后续认领保留该原因，使最终失败处理在崩溃或结算失败后仍可恢复。
     fn claim_many<'a>(
         &'a self,
         workflow_id: &'a str,
-        worker_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>>;
 
     /// 将仍有效的认领延长至数据库当前时间 + LEASE_DURATION，返回新截止时间。
     ///
-    /// 原子校验 workflow_id、task_id、claimed_by、attempt、running 状态和尚未过期的租约。
+    /// 原子校验 workflow_id、task_id、attempt、running 状态和尚未过期的租约。
     /// 失权、已结算或过期返回 None，不能复活过期认领；数据库错误单独返回 Err。
     /// 续租不递增 attempt，也适用于超过业务尝试预算的最终失败结算认领。
     fn renew_claim<'a>(
@@ -92,10 +91,10 @@ pub trait TaskStore: Sync {
 
     /// 在同一事务内写入产物、标记成功并入队全部成功后继。
     ///
-    /// 必须校验当前有效认领且 attempt <= max_attempts；旧执行者和仅用于最终失败的认领不能提交成功。
+    /// 必须校验当前有效认领且 attempt <= MAX_ATTEMPTS；旧执行者和仅用于最终失败的认领不能提交成功。
     /// 成功后继继承运行身份，作用域按子图边界进入、继承或退出。
     /// 同一次结算的普通跨入边共享实例；foreach 按边及元素建立独立实例。
-    /// scope 创建、任务结算、JOIN 的前驱名称及输入合并与后继创建在同一事务提交。
+    /// scope 创建、任务结算、JOIN 输入合并与后继创建在同一事务提交。
     /// 普通任务逐项创建；JOIN 按 workflow、run、scope 和节点名累积。
     /// 依赖永久失败会令已有及晚创建的 JOIN 失败，不影响其他实例。
     fn settle_success<'a>(

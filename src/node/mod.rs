@@ -264,8 +264,7 @@ impl From<String> for NodeError {
 /// 节点声明的任务类型：Event 为外部事件入口，JOIN 等待关联来源。
 /// Event 入队后的认领与执行沿用普通任务规则；事件监听和注册由宿主负责。
 ///
-/// 由节点经 [`Node::TASK_TYPE`] 常量声明，作为**类型级自描述**（编译期确定），
-/// 而非运行时询问。DB `tasks.task_type` 列以 [`TaskType::as_str`] 的字符串承载。
+/// 由节点经 [`Node::TASK_TYPE`] 声明。调度和图描述都从图定义读取类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskType {
     /// 普通节点：无需等齐前驱，fan-in 任一前驱成功即触发。
@@ -277,7 +276,7 @@ pub enum TaskType {
 }
 
 impl TaskType {
-    /// 落库用的字符串表示（对应 `tasks.task_type` 列值）。
+    /// 图描述中使用的节点类型名称。
     pub const fn as_str(self) -> &'static str {
         match self {
             TaskType::Normal => "normal",

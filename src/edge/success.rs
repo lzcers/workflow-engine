@@ -43,6 +43,8 @@ pub trait AnySuccessEdge: Send + Sync {
     fn dst(&self) -> &'static str;
     /// 每条输入是否为目标任务建立独立作用域。
     fn is_foreach(&self) -> bool;
+    /// 边是否显式声明 map 转换。foreach 单独标记。
+    fn is_map(&self) -> bool;
     /// 成功规划：条件命中经 `map` 产出 `dst` 输入（已序列化为 `Value`）。
     ///
     /// - `Ok(Vec)` 为空 = 正常剪枝（`when` 不命中 / `map` 返回空，**不产出任何下游实例**）。
@@ -69,6 +71,9 @@ where
     }
     fn is_foreach(&self) -> bool {
         SuccessEdge::is_foreach(self)
+    }
+    fn is_map(&self) -> bool {
+        !SuccessEdge::is_foreach(self) && self.map().is_some()
     }
 
     fn src_out_type(&self) -> TypeFingerprint {

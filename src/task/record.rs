@@ -60,23 +60,15 @@ pub struct TaskRecord {
     pub run_id: Option<i64>,
     /// 当前子图执行实例；父子关系保存在 scopes 表，None 为运行根作用域。
     pub scope_id: Option<i64>,
-    /// 来源任务 ID 集合；入口为空，普通后继记录源任务，JOIN 累积并去重所有贡献者。
+    /// 来源任务按贡献顺序去重，首项标识创建 JOIN 的来源。独立入口为空。
     /// 失败后继同样记录来源；此字段不要求来源任务成功。
     pub parent_task_ids: Vec<i64>,
     pub name: String,
     pub status: TaskStatus,
-    /// 最近一次认领的执行器身份；Scheduler 每次启动生成新的 UUID。
-    pub claimed_by: Option<String>,
     /// 读取快照时的租约截止时间；执行与结算期间由调度器续租，不代表节点运行时限。
     pub lease_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// 每次认领递增的代次，用于写入校验；超过 max_attempts 后只处理最终失败。
+    /// 每次认领递增的代次，用于写入校验；超过统一上限后只处理最终失败。
     pub attempt: i32,
-    /// 业务执行的最大尝试次数；最终失败的恢复认领不再执行业务。
-    pub max_attempts: i32,
-    /// 节点声明的任务类型（`normal`/`join`/`event`）；仅 JOIN 额外检查静态前驱。
-    pub task_type: String,
-    /// 当前调用需要等待的前驱节点完整名称。
-    pub depends_on_names: Vec<String>,
     /// 任务输入因 name 而异，暂保留为通用 JSON。
     pub input: Value,
     /// 节点输出直接以 JSON 落库（由节点类型化 `In`/`Out` 序列化），因 name 而异。
@@ -94,12 +86,9 @@ pub struct Task {
     pub run_id: Option<i64>,
     /// 直接入队的父实例，None 为根作用域。
     pub scope_id: Option<i64>,
-    /// 来源任务 ID 集合；独立入口为空，不作为认领时的成功条件。
+    /// 来源任务按贡献顺序排列。无父任务且 task_id 等于 run_id 时是独立运行入口。
     pub parent_task_ids: Vec<i64>,
     pub name: String,
-    pub max_attempts: i32,
-    /// JOIN 静态前驱节点名全集（普通节点默认空集）。
-    pub depends_on_names: Vec<String>,
     pub input: Value,
 }
 
@@ -112,8 +101,6 @@ impl Task {
             scope_id: None,
             parent_task_ids: Vec::new(),
             name: name.into(),
-            max_attempts: 3,
-            depends_on_names: Vec::new(),
             input,
         }
     }

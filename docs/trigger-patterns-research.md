@@ -27,7 +27,7 @@ Temporal 还将重叠执行策略和迟到补发窗口作为 Schedule 行为显�
 
 完整路径：宿主读取触发声明 → 注册触发器 → 接收并验证事件 → `workflow.submit(node_id, input)` → 持久化入口任务并唤醒 Scheduler → 执行 Event 节点及其后继。
 
-`Workflow::submit` 在同一事务内确定独立 `run_id`、保存输入及节点声明的 `task_type`。Event 任务创建后按普通任务执行，`execute` 可以透传或处理事件；Scheduler 不等待外部事件。`Workflow` 管理自身调度器生命周期，宿主管理外部触发源生命周期。[TaskStore](../src/task/store.rs)、[Scheduler](../src/scheduler.rs)
+`Workflow::submit` 在同一事务内确定独立 `run_id`、保存入口节点名和输入。Event 任务创建后按普通任务执行，`execute` 可以透传或处理事件；Scheduler 不等待外部事件。`Workflow` 管理自身调度器生命周期，宿主管理外部触发源生命周期。[TaskStore](../src/task/store.rs)、[Scheduler](../src/scheduler.rs)
 
 ## 责任边界
 

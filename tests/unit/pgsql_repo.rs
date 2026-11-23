@@ -11,6 +11,7 @@ use crate::graph::{
     Successor,
     TaskType::{Event, Join, Normal},
 };
+use crate::task::MAX_ATTEMPTS;
 use crate::{Task, TaskRecord, TaskStatus};
 
 #[path = "graph_fixture.rs"]
@@ -54,7 +55,14 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     .fetch_all(database.pool())
     .await
     .unwrap();
-    assert!(columns.iter().any(|name| name == "depends_on_names"));
+    for removed in [
+        "task_type",
+        "depends_on_names",
+        "claimed_by",
+        "max_attempts",
+    ] {
+        assert!(!columns.iter().any(|column| column == removed));
+    }
     assert!(!columns.iter().any(|name| name == "join_state"));
     let workflow_id = "enqueue-runs";
     let repo = PgTaskRepo::new(
@@ -76,16 +84,11 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     assert_eq!(first.run_id, Some(first.task_id));
     assert_eq!(second.run_id, Some(second.task_id));
     assert_ne!(first.run_id, second.run_id);
-    assert_eq!(first.task_type, "event");
-    assert_eq!(second.task_type, "event");
-    assert_eq!(first.max_attempts, 3);
 
     let child = Task {
         run_id: first.run_id,
         scope_id: None,
-        max_attempts: 7,
         parent_task_ids: vec![first.task_id],
-        depends_on_names: vec![first.name.clone()],
         ..Task::new(workflow_id, "child", json!({"input": 2}))
     };
     let inserted = repo.enqueue(&child).await.unwrap();
@@ -97,10 +100,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     assert_eq!(stored.run_id, first.run_id);
     assert_eq!(stored.scope_id, child.scope_id);
     assert_eq!(stored.name, child.name);
-    assert_eq!(stored.task_type, "normal");
-    assert_eq!(stored.max_attempts, child.max_attempts);
     assert_eq!(stored.parent_task_ids, child.parent_task_ids);
-    assert_eq!(stored.depends_on_names[0], child.depends_on_names[0]);
     assert_eq!(stored.input, child.input);
     assert_eq!(stored.status, TaskStatus::Pending);
     assert_eq!(stored.attempt, 0);
@@ -167,18 +167,12 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
         run_id: None,
         scope_id: None,
         name: "image_prompt".to_string(),
-        max_attempts: 3,
         parent_task_ids: vec![],
-        depends_on_names: vec![],
         input: json!({"prompts": ["a", "b"]}),
     })
     .await
     .unwrap();
-    let source = repo
-        .claim_many(workflow_id, "worker", 5)
-        .await
-        .unwrap()
-        .remove(0);
+    let source = repo.claim_many(workflow_id, 5).await.unwrap().remove(0);
 
     let settled = repo
         .succeed_and_enqueue(
@@ -195,7 +189,6 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
                     ..plan("images.image_generate", vec![json!({"prompt": "c"})])
                 },
             ],
-            3,
         )
         .await
         .unwrap();
@@ -262,7 +255,7 @@ async fn normal_fanout_creates_each_input_independently() {
                 .enqueue(&Task::new(&workflow_id, "root", json!({})))
                 .await
                 .unwrap();
-            let claims = repo.claim_many(&workflow_id, "worker", 20).await.unwrap();
+            let claims = repo.claim_many(&workflow_id, 20).await.unwrap();
             let source = claims
                 .iter()
                 .find(|task| task.task_id == root.task_id)
@@ -275,7 +268,7 @@ async fn normal_fanout_creates_each_input_independently() {
             };
             let mut fanout = plan(destination, inputs.clone());
             fanout.new_scope_per_input = foreach;
-            repo.succeed_and_enqueue(source, &json!({}), &[fanout], 3)
+            repo.succeed_and_enqueue(source, &json!({}), &[fanout])
                 .await
                 .unwrap();
             let rows = repo.list_all(&workflow_id).await.unwrap();
@@ -316,7 +309,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
     );
     seed(&repo, workflow_id, "source", Some(42)).await;
     seed(&repo, workflow_id, "source", Some(42)).await;
-    let sources = repo.claim_many(workflow_id, "worker", 2).await.unwrap();
+    let sources = repo.claim_many(workflow_id, 2).await.unwrap();
     assert_eq!(sources.len(), 2);
     for (index, source) in sources.iter().enumerate() {
         let contribution = json!({"source": source.task_id});
@@ -327,17 +320,11 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
                 "collect",
                 vec![contribution.clone(), json!({"extra": source.task_id})],
             )],
-            3,
         )
         .await
         .unwrap();
         if index == 0 {
-            assert!(
-                repo.claim_many(workflow_id, "join-worker", 1)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(repo.claim_many(workflow_id, 1).await.unwrap().is_empty());
         }
     }
     let rows = repo.list_all(workflow_id).await.unwrap();
@@ -359,10 +346,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
             "extra": [sources[0].task_id, sources[1].task_id],
         })
     );
-    let claims = repo
-        .claim_many(workflow_id, "join-worker", 10)
-        .await
-        .unwrap();
+    let claims = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].task_id, join.task_id);
 }
@@ -399,23 +383,16 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         run_id: None,
         scope_id: None,
         name: "commit_scene".to_string(),
-        max_attempts: 3,
         parent_task_ids: vec![],
-        depends_on_names: vec![],
         input: json!({"proposal": {}}),
     })
     .await
     .unwrap();
-    let retried = repo
-        .claim_many(workflow_id, "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let retried = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     repo.fail_and_enqueue(
         &retried,
         "validation failed",
         &[plan("scene_proposal", vec![json!({"Retry": {}})])],
-        3,
     )
     .await
     .unwrap();
@@ -442,15 +419,13 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
             run_id: None,
             scope_id: None,
             name: "audio_generate".to_string(),
-            max_attempts: 3,
             parent_task_ids: vec![],
-            depends_on_names: vec![],
             input: json!({}),
         })
         .await
         .unwrap();
     let failed = repo
-        .claim_many(workflow_id, "worker", 10)
+        .claim_many(workflow_id, 10)
         .await
         .unwrap()
         .into_iter()
@@ -468,13 +443,11 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
                 run_id,
                 scope_id: None,
                 name: name.to_string(),
-                max_attempts: 3,
                 parent_task_ids: if is_join {
                     vec![]
                 } else {
                     vec![failed.task_id]
                 },
-                depends_on_names: vec![failed.name.clone()],
                 input: json!({}),
             })
             .await
@@ -491,7 +464,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     .await
     .unwrap();
     assert!(
-        repo.fail_and_enqueue(&failed, "budget exhausted", &[], 3)
+        repo.fail_and_enqueue(&failed, "budget exhausted", &[])
             .await
             .is_err()
     );
@@ -511,7 +484,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         .await
         .unwrap();
 
-    repo.fail_and_enqueue(&failed, "budget exhausted", &[], 3)
+    repo.fail_and_enqueue(&failed, "budget exhausted", &[])
         .await
         .unwrap();
     let settled = repo
@@ -526,7 +499,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
             .await
             .unwrap()
             .unwrap();
-        let expected = if dependent.task_type == "join" && dependent.run_id == failed.run_id {
+        let expected = if dependent.name == "audio_join" && dependent.run_id == failed.run_id {
             TaskStatus::Failed
         } else {
             TaskStatus::Pending
@@ -535,19 +508,19 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     }
 }
 
-/// 批量释放：同一工作流的在跑任务全部立即回到可认领，且只影响本工作流。
+/// 释放认领只影响指定工作流中的任务。
 #[tokio::test]
-async fn release_claims_returns_every_running_task_in_the_workflow() {
+async fn releasing_a_claim_stays_in_its_workflow() {
     let Some(database) = connect_test().await else {
         return;
     };
     let repo = PgTaskRepo::new(
         database.pool().clone(),
-        graph("release_claims_all", &[("narration", Normal, None)], &[]),
+        graph("release_ours", &[("narration", Normal, None)], &[]),
     );
     let other_repo = PgTaskRepo::new(
         database.pool().clone(),
-        graph("release_claims_other", &[("narration", Normal, None)], &[]),
+        graph("release_other", &[("narration", Normal, None)], &[]),
     );
     async fn enqueue(repo: &PgTaskRepo, workflow_id: &str) -> TaskRecord {
         repo.enqueue(&Task {
@@ -555,30 +528,22 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
             run_id: None,
             scope_id: None,
             name: "narration".to_string(),
-            max_attempts: 3,
             parent_task_ids: vec![],
-            depends_on_names: vec![],
             input: json!({}),
         })
         .await
         .unwrap()
     }
-    let ours = enqueue(&repo, "release_claims_all").await;
-    let other = enqueue(&other_repo, "release_claims_other").await;
-    assert_eq!(
-        repo.claim_many("release_claims_all", "worker", 5)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
+    let ours = enqueue(&repo, "release_ours").await;
+    let other = enqueue(&other_repo, "release_other").await;
+    let our_claim = repo.claim_many("release_ours", 1).await.unwrap().remove(0);
     let other_claim = other_repo
-        .claim_many("release_claims_other", "worker", 1)
+        .claim_many("release_other", 1)
         .await
         .unwrap()
         .remove(0);
     assert!(matches!(
-        repo.claim_many("release_claims_other", "worker", 1).await,
+        repo.claim_many("release_other", 1).await,
         Err(StorageError::InvalidFanout { .. })
     ));
     assert!(matches!(
@@ -590,16 +555,8 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
         Err(StorageError::InvalidFanout { .. })
     ));
 
-    assert_eq!(
-        repo.release_claims("release_claims_all", "worker")
-            .await
-            .unwrap(),
-        1
-    );
-    let reclaimed = repo
-        .claim_many("release_claims_all", "worker", 5)
-        .await
-        .unwrap();
+    repo.release_claim(&our_claim).await.unwrap();
+    let reclaimed = repo.claim_many("release_ours", 5).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].task_id, ours.task_id);
     assert_eq!(reclaimed[0].attempt, 2, "重认领照常递增 attempt");
@@ -607,13 +564,13 @@ async fn release_claims_returns_every_running_task_in_the_workflow() {
     // 其它工作流不受影响：它的任务租约还在（认领不到，状态仍是在跑）。
     assert!(
         other_repo
-            .claim_many("release_claims_other", "worker", 5)
+            .claim_many("release_other", 5)
             .await
             .unwrap()
             .is_empty()
     );
     let untouched = repo
-        .get("release_claims_other", other.task_id)
+        .get("release_other", other.task_id)
         .await
         .unwrap()
         .unwrap();
@@ -661,26 +618,14 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     let dep = insert_task(&blocked_repo, blocked, "commit_scene").await;
     let mut join = Task::new(blocked, "collect", json!({}));
     join.run_id = dep.run_id;
-    join.depends_on_names = vec![dep.name];
     blocked_repo.enqueue(&join).await.unwrap();
-    assert_eq!(
-        blocked_repo
-            .claim_many(blocked, "worker", 5)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(blocked_repo.claim_many(blocked, 5).await.unwrap().len(), 1);
 
     // 已全部成功：无 pending/running → 不命中。
     let done = "exec_sess_done";
     let done_repo = repository(done);
     insert_task(&done_repo, done, "narration").await;
-    let finished = done_repo
-        .claim_many(done, "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let finished = done_repo.claim_many(done, 1).await.unwrap().remove(0);
     done_repo.succeed(&finished, &json!({})).await.unwrap();
 
     // 预算耗尽后仍需认领，以通过图的统一失败流程结算。
@@ -689,7 +634,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     insert_task(&exhausted_repo, exhausted, "narration").await;
     for _ in 0..3 {
         let claim = exhausted_repo
-            .claim_many(exhausted, "worker", 5)
+            .claim_many(exhausted, 5)
             .await
             .unwrap()
             .remove(0);
@@ -732,45 +677,29 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
             &[],
         ),
     );
-    let mut input = Task::new(workflow_id, "source", json!({}));
-    input.max_attempts = 1;
+    let input = Task::new(workflow_id, "source", json!({}));
     let root = repo.enqueue(&input).await.unwrap();
-    let old = repo
-        .claim_many(workflow_id, "old", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    assert_eq!(old.attempt, 1);
-    assert!(
-        repo.claim_many(workflow_id, "recovery", 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    for _ in 1..MAX_ATTEMPTS {
+        let previous = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+        repo.release_claim(&previous).await.unwrap();
+    }
+    let old = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+    assert_eq!(old.attempt, MAX_ATTEMPTS);
+    assert!(repo.claim_many(workflow_id, 1).await.unwrap().is_empty());
     sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1")
         .bind(workflow_id).execute(database.pool()).await.unwrap();
     assert_eq!(
         repo.executable_workflow_ids(workflow_id).await.unwrap(),
         [workflow_id]
     );
-    let recovery = repo
-        .claim_many(workflow_id, "recovery", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let recovery = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     assert_eq!(recovery.task_id, root.task_id);
-    assert_eq!(recovery.attempt, 2);
+    assert_eq!(recovery.attempt, MAX_ATTEMPTS + 1);
     assert_eq!(recovery.status, TaskStatus::Running);
     assert_eq!(recovery.error.as_deref(), Some(LEASE_EXPIRED_ERR));
     reject_stale_writes(&repo, &old).await;
     assert!(matches!(
         repo.succeed(&recovery, &json!("forbidden")).await,
-        Err(StorageError::ClaimLost { .. })
-    ));
-    let mut forged_budget = recovery.clone();
-    forged_budget.max_attempts = 100;
-    assert!(matches!(
-        repo.succeed(&forged_budget, &json!("forbidden")).await,
         Err(StorageError::ClaimLost { .. })
     ));
 
@@ -784,7 +713,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     .await
     .unwrap();
     assert!(
-        repo.fail_and_enqueue(&recovery, LEASE_EXPIRED_ERR, &[fanout.clone(), invalid], 3)
+        repo.fail_and_enqueue(&recovery, LEASE_EXPIRED_ERR, &[fanout.clone(), invalid])
             .await
             .is_err()
     );
@@ -800,15 +729,11 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
 
     // 失败结算自身也允许重新认领，首次保存的超时原因不能被释放租约覆盖。
     repo.release_claim(&recovery).await.unwrap();
-    let next = repo
-        .claim_many(workflow_id, "next", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    assert_eq!(next.attempt, 3);
+    let next = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+    assert_eq!(next.attempt, MAX_ATTEMPTS + 2);
     assert_eq!(next.error.as_deref(), Some(LEASE_EXPIRED_ERR));
     reject_stale_writes(&repo, &recovery).await;
-    repo.fail_and_enqueue(&next, LEASE_EXPIRED_ERR, &[fanout], 3)
+    repo.fail_and_enqueue(&next, LEASE_EXPIRED_ERR, &[fanout])
         .await
         .unwrap();
     let rows = repo.list_all(workflow_id).await.unwrap();
@@ -829,22 +754,28 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
             &[("source", "dependent")],
         ),
     );
-    let mut input = Task::new("zero-budget", "source", json!({}));
-    input.max_attempts = 0;
+    let input = Task::new("zero-budget", "source", json!({}));
     let zero = zero_repo.enqueue(&input).await.unwrap();
     let mut child = Task::new("zero-budget", "dependent", json!({}));
     child.run_id = zero.run_id;
-    child.depends_on_names = vec![zero.name.clone()];
     let child = zero_repo.enqueue(&child).await.unwrap();
+    for _ in 0..MAX_ATTEMPTS {
+        let previous = zero_repo
+            .claim_many("zero-budget", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        zero_repo.release_claim(&previous).await.unwrap();
+    }
     let claim = zero_repo
-        .claim_many("zero-budget", "recovery", 1)
+        .claim_many("zero-budget", 1)
         .await
         .unwrap()
         .remove(0);
-    assert_eq!(claim.attempt, 1);
+    assert_eq!(claim.attempt, MAX_ATTEMPTS + 1);
     assert_eq!(claim.error.as_deref(), Some(BUDGET_EXHAUSTED_ERR));
     zero_repo
-        .fail_and_enqueue(&claim, BUDGET_EXHAUSTED_ERR, &[], 3)
+        .fail_and_enqueue(&claim, BUDGET_EXHAUSTED_ERR, &[])
         .await
         .unwrap();
     for task_id in [zero.task_id, child.task_id] {
@@ -885,9 +816,7 @@ async fn task_ready_notifications_carry_workflow_id() {
             run_id: None,
             scope_id: None,
             name: "scene_proposal".to_string(),
-            max_attempts: 3,
             parent_task_ids: vec![],
-            depends_on_names: vec![],
             input: json!({}),
         })
         .await
@@ -895,28 +824,19 @@ async fn task_ready_notifications_carry_workflow_id() {
     recv_ready(&mut listener, workflow_id).await;
 
     // 2) 扇出后继（原子结算路径同样经此通知）。
-    let source = repo
-        .claim_many(workflow_id, "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let source = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     assert_eq!(source.task_id, root.task_id);
     repo.succeed_and_enqueue(
         &source,
         &json!({}),
         &[plan("commit_scene", vec![json!({})])],
-        3,
     )
     .await
     .unwrap();
     recv_ready(&mut listener, workflow_id).await;
 
     // 3) 释放租约（原子结算回滚后的立即重入）。
-    let claimed = repo
-        .claim_many(workflow_id, "worker", 5)
-        .await
-        .unwrap()
-        .remove(0);
+    let claimed = repo.claim_many(workflow_id, 5).await.unwrap().remove(0);
     repo.release_claim(&claimed).await.unwrap();
     recv_ready(&mut listener, workflow_id).await;
 }
@@ -927,9 +847,7 @@ async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i
         run_id,
         scope_id: None,
         name: name.into(),
-        max_attempts: 5,
         parent_task_ids: vec![],
-        depends_on_names: vec![],
         input: json!({}),
     })
     .await
@@ -944,16 +862,16 @@ async fn reject_stale_writes(repo: &PgTaskRepo, task: &TaskRecord) {
         Err(StorageError::ClaimLost { .. })
     ));
     assert!(matches!(
-        repo.succeed_and_enqueue(task, &json!("stale"), &fanouts, 3)
+        repo.succeed_and_enqueue(task, &json!("stale"), &fanouts)
             .await,
         Err(StorageError::ClaimLost { .. })
     ));
     assert!(matches!(
-        repo.fail_and_enqueue(task, "stale", &fanouts, 3).await,
+        repo.fail_and_enqueue(task, "stale", &fanouts).await,
         Err(StorageError::ClaimLost { .. })
     ));
     assert!(matches!(
-        repo.fail_and_enqueue(task, "stale", &[], 3).await,
+        repo.fail_and_enqueue(task, "stale", &[]).await,
         Err(StorageError::ClaimLost { .. })
     ));
     assert!(matches!(
@@ -979,21 +897,21 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
     let Some(database) = connect_test().await else {
         return;
     };
-    for max_attempts in [3, 0] {
-        let workflow_id = format!("renew-{max_attempts}");
+    for previous_attempts in [0, MAX_ATTEMPTS] {
+        let workflow_id = format!("renew-{previous_attempts}");
         let repo = PgTaskRepo::new(
             database.pool().clone(),
             graph(&workflow_id, &[("root", Normal, None)], &[]),
         );
-        let mut task = Task::new(&workflow_id, "root", json!({}));
-        task.max_attempts = max_attempts;
+        let task = Task::new(&workflow_id, "root", json!({}));
+
         let pending = repo.enqueue(&task).await.unwrap();
+        for _ in 0..previous_attempts {
+            let previous = repo.claim_many(&workflow_id, 1).await.unwrap().remove(0);
+            repo.release_claim(&previous).await.unwrap();
+        }
         assert!(repo.renew_claim(&pending).await.unwrap().is_none());
-        let claim = repo
-            .claim_many(&workflow_id, "worker", 1)
-            .await
-            .unwrap()
-            .remove(0);
+        let claim = repo.claim_many(&workflow_id, 1).await.unwrap().remove(0);
         let shortened: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
             "UPDATE tasks SET lease_until = clock_timestamp() + interval '10 seconds' WHERE workflow_id = $1 RETURNING lease_until"
         ).bind(&workflow_id).fetch_one(database.pool()).await.unwrap();
@@ -1006,22 +924,16 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
             .unwrap();
         assert_eq!(current.lease_until, Some(renewed));
         assert_eq!(current.attempt, claim.attempt);
-        assert_eq!(current.claimed_by, claim.claimed_by);
         assert_eq!(current.error, claim.error);
-        assert!(
-            repo.claim_many(&workflow_id, "other", 1)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(repo.claim_many(&workflow_id, 1).await.unwrap().is_empty());
         let mut wrong_workflow = claim.clone();
         wrong_workflow.workflow_id = "missing".into();
         assert!(repo.renew_claim(&wrong_workflow).await.unwrap().is_none());
         let mut wrong_task = claim.clone();
         wrong_task.task_id += 1;
         assert!(repo.renew_claim(&wrong_task).await.unwrap().is_none());
-        if max_attempts == 0 {
-            repo.fail_and_enqueue(&claim, "budget exhausted", &[], 3)
+        if previous_attempts == MAX_ATTEMPTS {
+            repo.fail_and_enqueue(&claim, "budget exhausted", &[])
                 .await
                 .unwrap();
         } else {
@@ -1049,40 +961,23 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
             &[("root", "dependent"), ("root", "another")],
         ),
     );
-    let root = seed(&repo, workflow_id, "root", Some(7)).await;
-    let old = repo
-        .claim_many(workflow_id, "worker-a", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    seed(&repo, workflow_id, "root", Some(7)).await;
+    let old = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     let mut dependent = Task {
         workflow_id: workflow_id.into(),
         run_id: Some(7),
         scope_id: None,
         name: "dependent".into(),
-        max_attempts: 3,
         parent_task_ids: vec![],
-        depends_on_names: vec![root.name.clone()],
         input: json!({}),
     };
     repo.enqueue(&dependent).await.unwrap();
     sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1 AND task_id = $2")
         .bind(workflow_id).bind(old.task_id).execute(database.pool()).await.unwrap();
     reject_stale_writes(&repo, &old).await;
-    let current = repo
-        .claim_many(workflow_id, "worker-b", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let current = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     assert_eq!(current.attempt, old.attempt + 1);
     reject_stale_writes(&repo, &old).await;
-    // Even a matching owner cannot reuse the preceding claim generation.
-    let mut wrong_attempt = current.clone();
-    wrong_attempt.attempt = old.attempt;
-    reject_stale_writes(&repo, &wrong_attempt).await;
-    let mut wrong_owner = current.clone();
-    wrong_owner.claimed_by = Some("worker-a".into());
-    reject_stale_writes(&repo, &wrong_owner).await;
     let rows = repo.list_all(workflow_id).await.unwrap();
     assert_eq!(rows.len(), 2, "stale settlement cannot create successors");
     assert_eq!(
@@ -1095,7 +990,6 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(unchanged.claimed_by, current.claimed_by);
     assert_eq!(unchanged.attempt, current.attempt);
     assert_eq!(unchanged.lease_until, current.lease_until);
     repo.succeed(&current, &json!("current")).await.unwrap();
@@ -1106,23 +1000,12 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         .unwrap()
         .unwrap();
     assert_eq!(settled.output, Some(json!("current")));
-    // Bulk cleanup is restricted to the stopped worker, including within one workflow.
+    // Releasing one task leaves the other claim valid.
     dependent.name = "another".into();
     repo.enqueue(&dependent).await.unwrap();
-    let a = repo
-        .claim_many(workflow_id, "worker-a", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    let b = repo
-        .claim_many(workflow_id, "worker-b", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    assert_eq!(
-        repo.release_claims(workflow_id, "worker-a").await.unwrap(),
-        1
-    );
+    let a = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+    let b = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+    repo.release_claim(&a).await.unwrap();
     assert!(matches!(
         repo.release_claim(&a).await,
         Err(StorageError::ClaimLost { .. })
@@ -1206,16 +1089,8 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
     );
     seed(&repo, workflow_id, "left", Some(42)).await;
     seed(&repo, workflow_id, "right", Some(42)).await;
-    let left = repo
-        .claim_many(workflow_id, "worker-a", 1)
-        .await
-        .unwrap()
-        .remove(0);
-    let right = repo
-        .claim_many(workflow_id, "worker-b", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let left = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+    let right = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     // Freeze ID allocation: both parents reach the missing-JOIN window concurrently.
     let mut blocker = database.pool().begin().await.unwrap();
     sqlx::query("SELECT next_task_id FROM task_counters WHERE workflow_id = $1 FOR UPDATE")
@@ -1237,7 +1112,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
                 .into_iter()
                 .map(|name| plan(name, vec![json!({ source.name.clone(): source.task_id })]))
                 .collect();
-            repo.succeed_and_enqueue(&source, &json!(source.task_id), &fanouts, 3)
+            repo.succeed_and_enqueue(&source, &json!(source.task_id), &fanouts)
                 .await
         });
     }
@@ -1252,7 +1127,10 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
     .expect("opposite successor order must not deadlock");
     let rows = repo.list_all(workflow_id).await.unwrap();
     assert_eq!(rows.len(), 4, "two source tasks and exactly two JOIN tasks");
-    for join in rows.iter().filter(|task| task.task_type == "join") {
+    for join in rows
+        .iter()
+        .filter(|task| matches!(task.name.as_str(), "join-a" | "join-b"))
+    {
         assert_eq!(
             join.input,
             json!({"left": left.task_id, "right": right.task_id})
@@ -1261,13 +1139,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
         parents.sort_unstable();
         assert_eq!(parents, [left.task_id, right.task_id]);
     }
-    assert_eq!(
-        repo.claim_many(workflow_id, "join-worker", 10)
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
+    assert_eq!(repo.claim_many(workflow_id, 10).await.unwrap().len(), 2);
     alternate_pool.close().await;
 }
 
@@ -1283,11 +1155,7 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
             graph(&workflow_id, &[("root", Normal, None)], &[]),
         );
         seed(&repo, &workflow_id, "root", None).await;
-        let claim = repo
-            .claim_many(&workflow_id, "worker", 1)
-            .await
-            .unwrap()
-            .remove(0);
+        let claim = repo.claim_many(&workflow_id, 1).await.unwrap().remove(0);
         sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() + interval '300 milliseconds' WHERE workflow_id = $1")
             .bind(&workflow_id).execute(database.pool()).await.unwrap();
         let mut blocker = database.pool().begin().await.unwrap();
@@ -1301,11 +1169,7 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
             let result = match operation {
                 0 => worker_repo.release_claim(&claim).await,
                 1 => worker_repo.succeed(&claim, &json!({})).await.map(|_| ()),
-                2 => {
-                    worker_repo
-                        .fail_and_enqueue(&claim, "expired", &[], 3)
-                        .await
-                }
+                2 => worker_repo.fail_and_enqueue(&claim, "expired", &[]).await,
                 _ => return worker_repo.renew_claim(&claim).await.unwrap().is_none(),
             };
             matches!(result, Err(StorageError::ClaimLost { .. }))
@@ -1349,11 +1213,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
         ),
     );
     seed(&repo, workflow_id, "root", Some(42)).await;
-    let root = repo
-        .claim_many(workflow_id, "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let root = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     repo.succeed_and_enqueue(
         &root,
         &json!(["a", "b", "c"]),
@@ -1361,19 +1221,18 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
             new_scope_per_input: true,
             ..plan("analysis.entry", vec![json!("a"), json!("b"), json!("c")])
         }],
-        3,
     )
     .await
     .unwrap();
-    let scopes = repo.claim_many(workflow_id, "worker", 3).await.unwrap();
+    let scopes = repo.claim_many(workflow_id, 3).await.unwrap();
     for scope in &scopes {
         let fanouts =
             ["analysis.left", "analysis.right"].map(|dst| plan(dst, vec![scope.input.clone()]));
-        repo.succeed_and_enqueue(scope, &scope.input, &fanouts, 3)
+        repo.succeed_and_enqueue(scope, &scope.input, &fanouts)
             .await
             .unwrap();
     }
-    let branches = repo.claim_many(workflow_id, "worker", 6).await.unwrap();
+    let branches = repo.claim_many(workflow_id, 6).await.unwrap();
     assert_eq!(branches.len(), 6);
     assert!(branches.iter().all(|task| task.run_id == Some(42)));
     for scope in &scopes {
@@ -1399,35 +1258,24 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     };
     for item in ["a", "b"] {
         let left = branch(item, "analysis.left");
-        repo.succeed_and_enqueue(left, &left.input, &[contribution(left)], 3)
+        repo.succeed_and_enqueue(left, &left.input, &[contribution(left)])
             .await
             .unwrap();
     }
-    assert!(
-        repo.claim_many(workflow_id, "join-worker", 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(repo.claim_many(workflow_id, 10).await.unwrap().is_empty());
 
     // Reclaiming the same task must retain its branch, including after a restart.
     let right_a = branch("a", "analysis.right");
     repo.release_claim(right_a).await.unwrap();
-    let reclaimed = repo
-        .claim_many(workflow_id, "restarted-worker", 10)
-        .await
-        .unwrap();
+    let reclaimed = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
     let right_a = &reclaimed[0];
     assert_eq!(right_a.task_id, branch("a", "analysis.right").task_id);
     assert_eq!(right_a.scope_id, branch("a", "analysis.right").scope_id);
-    repo.succeed_and_enqueue(right_a, &right_a.input, &[contribution(right_a)], 3)
+    repo.succeed_and_enqueue(right_a, &right_a.input, &[contribution(right_a)])
         .await
         .unwrap();
-    let ready = repo
-        .claim_many(workflow_id, "join-worker", 10)
-        .await
-        .unwrap();
+    let ready = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(
         ready.len(),
         1,
@@ -1439,19 +1287,18 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
         &ready[0],
         &ready[0].input,
         &[plan("analysis.report", vec![ready[0].input.clone()])],
-        3,
     )
     .await
     .unwrap();
 
     // Branch b already has a waiting JOIN; branch c's JOIN arrives after failure.
     for item in ["b", "c"] {
-        repo.fail_and_enqueue(branch(item, "analysis.right"), "failed signal", &[], 3)
+        repo.fail_and_enqueue(branch(item, "analysis.right"), "failed signal", &[])
             .await
             .unwrap();
     }
     let left_c = branch("c", "analysis.left");
-    repo.succeed_and_enqueue(left_c, &left_c.input, &[contribution(left_c)], 3)
+    repo.succeed_and_enqueue(left_c, &left_c.input, &[contribution(left_c)])
         .await
         .unwrap();
     let rows = repo.list_all(workflow_id).await.unwrap();
@@ -1474,10 +1321,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
         .unwrap();
     assert_eq!(report.scope_id, scopes[0].scope_id);
     assert_eq!(report.input, json!({"left": "a", "right": "a"}));
-    let ready = repo
-        .claim_many(workflow_id, "report-worker", 10)
-        .await
-        .unwrap();
+    let ready = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].task_id, report.task_id);
 }

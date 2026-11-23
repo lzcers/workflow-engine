@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::{
     graph::{Graph, Successor},
     node::{NodeContext, NodeError},
-    task::{TaskRecord, TaskStore, store::LEASE_DURATION},
+    task::{MAX_ATTEMPTS, TaskRecord, TaskStore, store::LEASE_DURATION},
 };
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -73,10 +73,8 @@ where
     /// Workflow 释放时取消此 future；取消会中止在途节点，无法等待结算。
     /// 调度循环 panic 时取消并等待全部在途任务，再传播 panic。
     pub async fn run(&self) {
-        // 每次启动都有独立身份，重启后不会沿用上一次的认领归属。
-        let worker_id = uuid::Uuid::new_v4().to_string();
         let mut in_flight = JoinSet::new();
-        let outcome = AssertUnwindSafe(self.run_loop(&mut in_flight, &worker_id))
+        let outcome = AssertUnwindSafe(self.run_loop(&mut in_flight))
             .catch_unwind()
             .await;
         if let Err(panic) = outcome {
@@ -85,7 +83,7 @@ where
         }
     }
 
-    async fn run_loop(&self, in_flight: &mut JoinSet<()>, worker_id: &str) {
+    async fn run_loop(&self, in_flight: &mut JoinSet<()>) {
         loop {
             while let Some(result) = in_flight.try_join_next() {
                 if let Err(e) = result {
@@ -94,7 +92,7 @@ where
             }
 
             let available = self.max_concurrency - in_flight.len();
-            if available > 0 && self.claim_and_spawn(in_flight, worker_id, available).await > 0 {
+            if available > 0 && self.claim_and_spawn(in_flight, available).await > 0 {
                 continue;
             }
 
@@ -113,19 +111,10 @@ where
     }
 
     /// 按空槽数认领并启动任务，返回本批数量。
-    async fn claim_and_spawn(
-        &self,
-        in_flight: &mut JoinSet<()>,
-        worker_id: &str,
-        limit: usize,
-    ) -> usize {
+    async fn claim_and_spawn(&self, in_flight: &mut JoinSet<()>, limit: usize) -> usize {
         // 从请求发出时计时，比数据库真正写入租约更早，不受应用与数据库时钟偏差影响。
         let lease_deadline = Instant::now() + LEASE_DURATION;
-        match self
-            .store
-            .claim_many(self.graph.workflow_id(), worker_id, limit)
-            .await
-        {
+        match self.store.claim_many(self.graph.workflow_id(), limit).await {
             Ok(tasks) => {
                 let count = tasks.len();
                 if count > 0 {
@@ -171,7 +160,6 @@ enum ExecutionOutcome<Ctx> {
         workflow_id = %task.workflow_id,
         task_id = task.task_id,
         attempt = task.attempt,
-        worker_id = task.claimed_by.as_deref(),
         name = task.name.as_str(),
     )
 )]
@@ -281,7 +269,7 @@ where
     Ctx: NodeContext + Sync,
 {
     let name = task.name.as_str();
-    if task.attempt > task.max_attempts {
+    if task.attempt > MAX_ATTEMPTS {
         let error = NodeError::permanent(
             task.error
                 .as_deref()

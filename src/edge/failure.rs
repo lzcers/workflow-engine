@@ -41,6 +41,8 @@ pub trait AnyFailureEdge: Send + Sync {
     fn src(&self) -> &'static str;
     /// 目标节点名。
     fn dst(&self) -> &'static str;
+    /// 边是否显式声明 map 转换。
+    fn is_map(&self) -> bool;
     /// 失败规划：条件命中后经 `map` 产出 `dst` 输入（已序列化为 `Value`），
     /// 对称于成功边的 [`super::success::AnySuccessEdge::plan_success`]。
     ///
@@ -65,6 +67,9 @@ where
     }
     fn dst(&self) -> &'static str {
         FailureEdge::dst(self)
+    }
+    fn is_map(&self) -> bool {
+        self.map().is_some()
     }
 
     fn src_in_type(&self) -> TypeFingerprint {

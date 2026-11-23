@@ -2,7 +2,7 @@
 
 use std::{any::Any, collections::HashMap};
 
-use super::{Graph, GraphDescription, TaskType, Trigger};
+use super::{Graph, GraphDescription, JoinRule, TaskType, Trigger};
 
 /// 工作流持有的原始图接口，可通过 [`crate::Workflow::graph`] 访问。
 ///
@@ -27,8 +27,8 @@ pub trait ErasedGraph: Any + Send + Sync {
     /// 直接成功前驱；不存在的节点为 None。
     fn predecessors_of(&self, name: &str) -> Option<Vec<String>>;
 
-    /// 图构建时计算的 JOIN 传递上游，不在仓储中重复保存。
-    fn join_upstreams(&self) -> &HashMap<String, Vec<String>>;
+    /// 图构建时计算的 JOIN 前驱、入口深度及传递上游，不在仓储中重复保存。
+    fn join_rules(&self) -> &HashMap<String, JoinRule>;
 
     /// 按节点名排序的外部触发声明。
     fn triggers(&self) -> Vec<(&str, Trigger)>;
@@ -59,8 +59,8 @@ impl<Ctx: Send + Sync + 'static> ErasedGraph for Graph<Ctx> {
         Graph::predecessors_of(self, name)
     }
 
-    fn join_upstreams(&self) -> &HashMap<String, Vec<String>> {
-        Graph::join_upstreams(self)
+    fn join_rules(&self) -> &HashMap<String, JoinRule> {
+        Graph::join_rules(self)
     }
 
     fn triggers(&self) -> Vec<(&str, Trigger)> {

@@ -32,8 +32,6 @@ fn task() -> Task {
         scope_id: None,
         parent_task_ids: vec![],
         name: "start".into(),
-        max_attempts: 3,
-        depends_on_names: vec![],
         input: json!({"persisted": true}),
     }
 }

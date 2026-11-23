@@ -6,7 +6,7 @@ use crate::{
     task::scope::{ScopeEntries, ScopeRecord},
 };
 
-pub(super) async fn chain(
+async fn chain(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     mut scope_id: Option<i64>,

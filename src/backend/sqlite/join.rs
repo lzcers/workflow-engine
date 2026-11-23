@@ -1,68 +1,83 @@
-//! JOIN 按前驱名称及作用域查询；上游生产范围由执行图传入，不写入任务表。
+//! JOIN 条件从执行图和当前调用的作用域推导，认领与失败传播共用来源选择。
 
-/// 组内及后代实例。节点完整名称继续限制具体来源，不混入其他节点。
-const LOCAL_SCOPE: &str = r#"(st.scope_id IS wt.scope_id OR st.scope_id IN (
-    WITH RECURSIVE children(scope_id) AS (
-        SELECT scope_id FROM scopes
-        WHERE workflow_id = wt.workflow_id AND run_id IS wt.run_id
-          AND parent_scope_id IS wt.scope_id
-        UNION ALL
-        SELECT child.scope_id FROM scopes child JOIN children parent
-          ON child.parent_scope_id = parent.scope_id
-        WHERE child.workflow_id = wt.workflow_id AND child.run_id IS wt.run_id
-    ) SELECT scope_id FROM children
-))"#;
-
-/// 外部输入只对应当前实例入口链中的具体任务，不匹配其他调用的同名入口。
-const ENTRY_TASK: &str = r#"st.task_id IN (
-    WITH RECURSIVE ancestors(scope_id, parent_scope_id, trigger_task_id) AS (
-        SELECT scope_id, parent_scope_id, trigger_task_id FROM scopes
-        WHERE workflow_id = wt.workflow_id AND run_id IS wt.run_id AND scope_id = wt.scope_id
-        UNION ALL
-        SELECT parent.scope_id, parent.parent_scope_id, parent.trigger_task_id
-        FROM scopes parent JOIN ancestors child ON parent.scope_id = child.parent_scope_id
-        WHERE parent.workflow_id = wt.workflow_id AND parent.run_id IS wt.run_id
-    ) SELECT trigger_task_id FROM ancestors
-)"#;
-
-fn source_matches() -> String {
+fn matches_rule(rules: &str, condition: &str) -> String {
     format!(
-        "st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id AND st.name = dep.value AND ({LOCAL_SCOPE} OR {ENTRY_TASK})"
+        r#"EXISTS (
+            SELECT 1 FROM json_each({rules}) AS rule
+            WHERE rule.key = wt.name
+              AND (wt.task_id IS NOT wt.run_id OR json_array_length(wt.parent_task_ids) > 0)
+              AND NOT EXISTS (
+                  SELECT 1 FROM tasks creator
+                  WHERE creator.workflow_id = wt.workflow_id
+                    AND creator.task_id = json_extract(wt.parent_task_ids, '$[0]')
+                    AND creator.status = 'superseded'
+              )
+              AND EXISTS (
+                WITH RECURSIVE
+                local_scopes(scope_id) AS (
+                    SELECT wt.scope_id
+                    UNION ALL
+                    SELECT child.scope_id FROM scopes child JOIN local_scopes parent
+                      ON child.parent_scope_id IS parent.scope_id
+                    WHERE child.workflow_id = wt.workflow_id AND child.run_id IS wt.run_id
+                ),
+                ancestors(parent_scope_id, trigger_task_id, distance) AS (
+                    SELECT parent_scope_id, trigger_task_id, 0 FROM scopes
+                    WHERE workflow_id = wt.workflow_id AND run_id IS wt.run_id AND scope_id = wt.scope_id
+                    UNION ALL
+                    SELECT parent.parent_scope_id, parent.trigger_task_id, child.distance + 1
+                    FROM scopes parent JOIN ancestors child ON parent.scope_id = child.parent_scope_id
+                    WHERE parent.workflow_id = wt.workflow_id AND parent.run_id IS wt.run_id
+                ),
+                entries AS (
+                    SELECT trigger_task_id, row_number() OVER (ORDER BY distance DESC) - 1 AS depth
+                    FROM ancestors
+                ),
+                predecessors AS (
+                    SELECT json_extract(value, '$.name') AS name, json_extract(value, '$.entry_depth') AS depth
+                    FROM json_each(rule.value, '$.predecessors')
+                ),
+                required AS (
+                    SELECT p.name, e.trigger_task_id FROM predecessors p
+                    LEFT JOIN entries e ON e.depth = p.depth
+                    LEFT JOIN tasks t ON t.workflow_id = wt.workflow_id AND t.task_id = e.trigger_task_id
+                    WHERE p.depth IS NULL OR p.name = t.name
+                ),
+                sources AS (
+                    SELECT r.name, st.status FROM required r JOIN tasks st
+                      ON st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id AND st.name = r.name
+                    WHERE st.task_id = r.trigger_task_id OR (
+                        r.trigger_task_id IS NULL AND EXISTS (SELECT 1 FROM local_scopes WHERE scope_id IS st.scope_id)
+                    )
+                ),
+                upstreams AS (
+                    SELECT st.status FROM json_each(rule.value, '$.upstreams') upstream JOIN tasks st
+                      ON st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id AND st.name = upstream.value
+                    WHERE EXISTS (SELECT 1 FROM local_scopes WHERE scope_id IS st.scope_id)
+                )
+                SELECT 1 WHERE EXISTS (SELECT 1 FROM required) AND ({condition})
+              )
+        )"#
     )
 }
 
-/// 参数是当前执行图的 JOIN 名 -> 全部上游名称映射。
-pub(super) fn ready(upstream_parameter: &str) -> String {
-    format!(
-        r#"wt.task_type <> 'join' OR json_array_length(wt.depends_on_names) = 0 OR (
-            NOT EXISTS (
-                SELECT 1 FROM json_each({upstream_parameter}) graph, json_each(graph.value) upstream
-                JOIN tasks st ON st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id
-                  AND st.name = upstream.value AND {LOCAL_SCOPE}
-                WHERE graph.key = wt.name AND st.status IN ('pending', 'running')
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM json_each(wt.depends_on_names) dep
-                WHERE NOT EXISTS (SELECT 1 FROM tasks st WHERE {matches} AND st.status = 'succeeded')
-                   OR EXISTS (SELECT 1 FROM tasks st WHERE {matches} AND st.status <> 'succeeded')
-            )
-        )"#,
-        matches = source_matches()
-    )
+/// 等待所有有效前驱成功，以及仍可能产生输入的上游结束。
+pub(super) fn ready(rules: &str) -> String {
+    let blocked = matches_rule(
+        rules,
+        r#"EXISTS (SELECT 1 FROM upstreams WHERE status IN ('pending','running'))
+           OR EXISTS (SELECT 1 FROM required r WHERE NOT EXISTS (
+               SELECT 1 FROM sources s WHERE s.name = r.name AND s.status = 'succeeded'
+           ))
+           OR EXISTS (SELECT 1 FROM sources WHERE status <> 'succeeded')"#,
+    );
+    format!("NOT {blocked}")
 }
 
-pub(super) fn failed(upstream_parameter: &str) -> String {
-    format!(
-        r#"wt.task_type = 'join' AND json_array_length(wt.depends_on_names) > 0 AND (
-            EXISTS (SELECT 1 FROM json_each(wt.depends_on_names) dep
-                    JOIN tasks st ON {matches} WHERE st.status = 'failed')
-            OR EXISTS (
-                SELECT 1 FROM json_each({upstream_parameter}) graph, json_each(graph.value) upstream
-                JOIN tasks st ON st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id
-                  AND st.name = upstream.value AND {LOCAL_SCOPE}
-                WHERE graph.key = wt.name AND st.status = 'failed'
-            )
-        )"#,
-        matches = source_matches()
+pub(super) fn failed(rules: &str) -> String {
+    matches_rule(
+        rules,
+        "EXISTS (SELECT 1 FROM upstreams WHERE status = 'failed')
+         OR EXISTS (SELECT 1 FROM sources WHERE status = 'failed')",
     )
 }

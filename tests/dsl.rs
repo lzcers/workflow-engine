@@ -50,6 +50,9 @@ fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
     assert!(!description.edges[0].foreach);
     assert!(description.edges[1].foreach);
     assert!(!description.edges[2].foreach);
+    assert!(description.edges[0].map);
+    assert!(!description.edges[1].map);
+    assert!(description.edges[2].map);
     assert_eq!(
         serde_json::to_value(description).unwrap()["edges"][1]["foreach"],
         true

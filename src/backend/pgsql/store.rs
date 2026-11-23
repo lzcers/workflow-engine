@@ -22,10 +22,9 @@ impl TaskStore for PgTaskRepo {
     fn claim_many<'a>(
         &'a self,
         workflow_id: &'a str,
-        worker_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(PgTaskRepo::claim_many(self, workflow_id, worker_id, limit))
+        Box::pin(PgTaskRepo::claim_many(self, workflow_id, limit))
     }
 
     fn renew_claim<'a>(
@@ -43,7 +42,7 @@ impl TaskStore for PgTaskRepo {
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            self.succeed_and_enqueue(task, output, successors, self.max_attempts)
+            self.succeed_and_enqueue(task, output, successors)
                 .await
                 .map(|_| ())
         })
@@ -56,10 +55,7 @@ impl TaskStore for PgTaskRepo {
         message: &'a str,
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(async move {
-            self.fail_and_enqueue(task, message, successors, self.max_attempts)
-                .await
-        })
+        Box::pin(self.fail_and_enqueue(task, message, successors))
     }
 
     /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务下一轮认领即可重入。

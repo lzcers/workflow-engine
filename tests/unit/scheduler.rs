@@ -152,14 +152,13 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         .unwrap(),
     );
     let repo = SqliteTaskRepo::new(pool.clone(), graph.clone());
-    let mut input = Task::new("timeout", "pending", json!(41));
-    input.max_attempts = 1;
+    let input = Task::new("timeout", "pending", json!(41));
     repo.enqueue(&input).await.unwrap();
-    let claim = repo
-        .claim_many("timeout", "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    for _ in 1..crate::task::MAX_ATTEMPTS {
+        let previous = repo.claim_many("timeout", 1).await.unwrap().remove(0);
+        repo.release_claim(&previous).await.unwrap();
+    }
+    let claim = repo.claim_many("timeout", 1).await.unwrap().remove(0);
     let claim = set_deadline(
         &pool,
         &repo,
@@ -179,7 +178,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     ));
     let seen = timeout(Duration::from_secs(5), async {
         tokio::select! {
-            _ = scheduler.run_loop(&mut in_flight, "worker") => panic!("scheduler exited"),
+            _ = scheduler.run_loop(&mut in_flight) => panic!("scheduler exited"),
             seen = async {
                 let mut seen = Vec::new();
                 loop {
@@ -197,7 +196,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     .expect("the lost claim must release the slot so recovery can execute");
     in_flight.shutdown().await;
 
-    // The first attempt can enter business while the renewal query is in flight;
+    // The last business attempt can enter business while the renewal query is in flight;
     // the recovery claim must not start business again after the budget is exhausted.
     assert!(
         seen.iter()
@@ -216,7 +215,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     assert_eq!(tasks.len(), 2);
     assert_eq!(tasks[0].task_id, claim.task_id);
     assert_eq!(tasks[0].status, TaskStatus::Superseded);
-    assert_eq!(tasks[0].attempt, 2);
+    assert_eq!(tasks[0].attempt, crate::task::MAX_ATTEMPTS + 1);
     assert_eq!(tasks[1].status, TaskStatus::Succeeded);
     assert_eq!(tasks[1].output, Some(json!(42)));
     assert_eq!(tasks[1].parent_task_ids, [claim.task_id]);
@@ -245,11 +244,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
     repo.enqueue(&Task::new("expired", "pending", json!(0)))
         .await
         .unwrap();
-    let claim = repo
-        .claim_many("expired", "worker", 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let claim = repo.claim_many("expired", 1).await.unwrap().remove(0);
     let claim = set_deadline(
         &pool,
         &repo,
@@ -316,7 +311,6 @@ impl TaskStore for Store {
     fn claim_many<'a>(
         &'a self,
         _: &'a str,
-        _: &'a str,
         _: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>> {
         Box::pin(async { unreachable!("run_task receives an existing claim") })
@@ -328,7 +322,6 @@ impl TaskStore for Store {
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error>> {
         Box::pin(async move {
             assert_eq!(task.attempt, 1, "renewal must not create another attempt");
-            assert_eq!(task.claimed_by.as_deref(), Some("worker"));
             self.renewals.fetch_add(1, Ordering::SeqCst);
             if self.committed.load(Ordering::SeqCst) {
                 return Ok(None);
@@ -456,12 +449,8 @@ fn claim() -> TaskRecord {
         parent_task_ids: vec![],
         name: "node".into(),
         status: TaskStatus::Running,
-        claimed_by: Some("worker".into()),
         lease_until: Some(now + chrono::Duration::seconds(300)),
         attempt: 1,
-        max_attempts: 1,
-        task_type: "normal".into(),
-        depends_on_names: Vec::new(),
         input: json!(7),
         output: None,
         error: None,
