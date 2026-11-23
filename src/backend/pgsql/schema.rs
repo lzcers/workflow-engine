@@ -14,6 +14,12 @@ pub const SCHEMA_DDL: &str = include_str!("../../../migrations/pgsql/0001_workfl
 
 /// 执行引擎 schema 迁移（幂等，可每次启动执行）。
 pub async fn migrate(pool: &PgPool) -> Result<(), StorageError> {
-    sqlx::raw_sql(SCHEMA_DDL).execute(pool).await?;
+    let mut tx = pool.begin().await?;
+    // IF NOT EXISTS alone races on catalog rows when several processes start together.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || '.workflow_engine_ddl', 0))")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(SCHEMA_DDL).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }

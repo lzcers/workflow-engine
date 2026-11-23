@@ -19,6 +19,7 @@
 //! - [`crate::task::record`] / [`rows`]：数据库任务行与公共 [`crate::TaskRecord`]；
 //! - [`schema`]：引擎自有 DDL 与迁移入口。
 
+pub mod distributed;
 mod join;
 mod repo;
 mod rows;

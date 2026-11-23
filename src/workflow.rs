@@ -52,6 +52,11 @@ impl Workflow {
         }
     }
 
+    /// 后台调度器已终止时为 true，可供宿主报告 worker 健康状态。
+    pub fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
     /// 访问与调度器共享的原始图，可查询身份、描述、节点类型和触发声明。
     pub fn graph(&self) -> &dyn ErasedGraph {
         self.graph.as_ref()

@@ -153,6 +153,20 @@ where
 
 上述示例使用默认 SQLite 后端，PostgreSQL 使用 `pg` feature 和对应连接 URL。
 
+### PostgreSQL 跨进程执行
+
+控制面和 worker 可分别连接同一个 PostgreSQL 数据库。每个进程启动时调用
+`postgres::initialize(&pool).await`；并发初始化通过数据库事务锁串行执行。
+
+- worker 发布 `graph.describe()` 和不可变的 revision，再调用
+  `postgres::worker(pool, graph, revision, worker_id)` 启动同版本任务的认领。
+  宿主持有返回的 `Workflow`，可通过 `is_finished()` 检查后台调度器是否退出。
+- 控制面反序列化已发布的 `GraphDescription`，在自己的 PostgreSQL 事务内
+  调用 `postgres::submit(&mut tx, &description, revision, entry, &input).await`。
+  提交该事务后，其他进程即可认领。调度去重、图版本选择和运行入队可在同一事务完成。
+- 每次运行的入口与后继使用同一 revision；每次认领写入最新的 worker_id。
+  新版本与旧版本可以并行消费各自的任务。旧版本运行尚未完成时需保持对应的 worker 可用。
+
 ## 关键机制
 
 完整调度流程见 [Scheduler 设计文档](docs/scheduler-design.md)，包含主循环与单任务流程图、

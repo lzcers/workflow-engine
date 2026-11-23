@@ -1,12 +1,12 @@
 //! 执行图的只读描述，不包含上下文、运行状态或节点载荷。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use super::{Graph, Trigger};
 
 /// 已构建执行图的可序列化拓扑。节点按 ID 排序，边按成功/失败及各自注册顺序输出。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphDescription {
     pub workflow_id: String,
     pub title: String,
@@ -16,7 +16,7 @@ pub struct GraphDescription {
 }
 
 /// 节点信息。输入输出字段为 Rust 类型名，不是 JSON Schema。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeDescription {
     /// 图中注册的节点名，与任务的 name 对应。
     pub id: String,
@@ -31,7 +31,7 @@ pub struct NodeDescription {
 }
 
 /// 静态子图定义；ID 为完整点路径，父级归属不依赖当前运行任务。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubgraphDescription {
     pub id: String,
     pub title: String,
@@ -39,7 +39,7 @@ pub struct SubgraphDescription {
 }
 
 /// 边的触发类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     Success,
@@ -47,7 +47,7 @@ pub enum EdgeKind {
 }
 
 /// 一条实际注册的边。相同端点的多条边仍保留为独立记录。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeDescription {
     /// 当前图内唯一的编号，如 success:0；注册顺序改变后不保证跨版本稳定。
     pub id: String,

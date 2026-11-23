@@ -74,42 +74,6 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
     }
 }
 
-/// 先等行锁，再在后续写语句中检查数据库当前时间，避免等锁期间租约已过期。
-async fn lock_task(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    task: &TaskRecord,
-) -> Result<TaskRow, StorageError> {
-    sqlx::query_as::<_, TaskRow>(&format!(
-        "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = $1 AND task_id = $2 FOR UPDATE"
-    ))
-    .bind(&task.workflow_id)
-    .bind(task.task_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| claim_lost(task))
-}
-
-/// 读取业务回填后的运行身份，再按统一顺序获取运行锁和任务锁。
-async fn lock_settlement(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    task: &TaskRecord,
-) -> Result<(), StorageError> {
-    let run_id = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT run_id FROM tasks WHERE workflow_id = $1 AND task_id = $2",
-    )
-    .bind(&task.workflow_id)
-    .bind(task.task_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| claim_lost(task))?;
-    lock_run(tx, &task.workflow_id, run_id).await?;
-    let current = lock_task(tx, task).await?;
-    if current.run_id != run_id {
-        return Err(claim_lost(task));
-    }
-    Ok(())
-}
-
 /// 仅当前有效认领可以提交终态。持有行锁后再检查租约，返回最新身份供后继使用。
 async fn settle_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -147,6 +111,7 @@ async fn settle_in_tx(
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     graph: &dyn ErasedGraph,
+    revision: Option<&str>,
     source: &TaskRecord,
     plan: &Successor,
     entries: &mut ScopeEntries,
@@ -199,9 +164,9 @@ async fn enqueue_fanout_in_tx(
                 .bind(&source.workflow_id).bind(existing.task_id).bind(parents).bind(input_json)
                 .execute(&mut **tx).await?;
         } else {
-            sqlx::query("INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            sqlx::query("INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id,revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
                 .bind(&source.workflow_id).bind(source.run_id).bind(plan.dst).bind(status.as_str())
-                .bind(vec![source.task_id]).bind(input).bind(scope_id)
+                .bind(vec![source.task_id]).bind(input).bind(scope_id).bind(revision)
                 .execute(&mut **tx).await?;
         }
     }
@@ -232,6 +197,8 @@ async fn fail_blocked_joins(
 pub struct PgTaskRepo {
     pool: PgPool,
     graph: Arc<dyn ErasedGraph>,
+    revision: Option<String>,
+    worker_id: Option<String>,
 }
 
 /// 实现 [`crate::task::TaskStore::claim_many`] 的可执行契约，`wt` 为 `tasks` 别名。
@@ -247,9 +214,73 @@ fn executable_where(rules_parameter: &str) -> String {
     )
 }
 
+/// 入口入队与工作流句柄共享同一事务语义，包括深层子图入口的 scope 链。
+pub(super) async fn insert_task_at_path(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: &Task,
+    revision: Option<&str>,
+    destination_path: &[String],
+    status: TaskStatus,
+) -> Result<TaskRecord, StorageError> {
+    // 子图入口需要在写入作用域时引用即将创建的任务。
+    let task_id: i64 =
+        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('tasks', 'task_id'))")
+            .fetch_one(&mut **tx)
+            .await?;
+    let run_id = Some(task.run_id.unwrap_or(task_id));
+    let scope_id = scope::route(
+        tx,
+        &task.workflow_id,
+        run_id,
+        task.scope_id,
+        destination_path,
+        task_id,
+        false,
+        &mut ScopeEntries::new(),
+    )
+    .await?;
+    let sql = format!(
+        "INSERT INTO tasks
+         (workflow_id, task_id, run_id, name, status, parent_task_ids, input_json, scope_id, revision)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING {ROW_COLS}"
+    );
+    let row = sqlx::query_as::<_, TaskRow>(&sql)
+        .bind(&task.workflow_id)
+        .bind(task_id)
+        .bind(run_id)
+        .bind(&task.name)
+        .bind(status.as_str())
+        .bind(&task.parent_task_ids)
+        .bind(&task.input)
+        .bind(scope_id)
+        .bind(revision)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(row.into())
+}
+
 impl PgTaskRepo {
     pub fn new(pool: PgPool, graph: Arc<dyn ErasedGraph>) -> Self {
-        Self { pool, graph }
+        Self {
+            pool,
+            graph,
+            revision: None,
+            worker_id: None,
+        }
+    }
+
+    pub(crate) fn for_worker(
+        pool: PgPool,
+        graph: Arc<dyn ErasedGraph>,
+        revision: &str,
+        worker_id: &str,
+    ) -> Self {
+        Self {
+            pool,
+            graph,
+            revision: Some(revision.to_owned()),
+            worker_id: Some(worker_id.to_owned()),
+        }
     }
 
     fn check_workflow(&self, workflow_id: &str) -> Result<(), StorageError> {
@@ -260,6 +291,52 @@ impl PgTaskRepo {
                     self.graph.workflow_id()
                 ),
             });
+        }
+        Ok(())
+    }
+
+    /// 先等行锁，再在后续写语句中检查数据库当前时间，避免等锁期间租约已过期。
+    async fn lock_task(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        task: &TaskRecord,
+    ) -> Result<TaskRow, StorageError> {
+        if self.graph.workflow_id() != task.workflow_id {
+            return Err(claim_lost(task));
+        }
+        sqlx::query_as::<_, TaskRow>(&format!(
+            "SELECT {ROW_COLS} FROM tasks
+         WHERE workflow_id = $1 AND task_id = $2
+           AND revision IS NOT DISTINCT FROM $3 AND worker_id IS NOT DISTINCT FROM $4
+         FOR UPDATE"
+        ))
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(&self.revision)
+        .bind(&self.worker_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| claim_lost(task))
+    }
+
+    /// 读取业务回填后的运行身份，再按统一顺序获取运行锁和任务锁。
+    async fn lock_settlement(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        task: &TaskRecord,
+    ) -> Result<(), StorageError> {
+        let run_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT run_id FROM tasks WHERE workflow_id = $1 AND task_id = $2",
+        )
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| claim_lost(task))?;
+        lock_run(tx, &task.workflow_id, run_id).await?;
+        let current = self.lock_task(tx, task).await?;
+        if current.run_id != run_id {
+            return Err(claim_lost(task));
         }
         Ok(())
     }
@@ -282,23 +359,6 @@ impl PgTaskRepo {
         if task.run_id.is_some() {
             lock_run(tx, &task.workflow_id, task.run_id).await?;
         }
-        // 子图入口需要在写入作用域时引用即将创建的任务。
-        let task_id: i64 =
-            sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('tasks', 'task_id'))")
-                .fetch_one(&mut **tx)
-                .await?;
-        let run_id = Some(task.run_id.unwrap_or(task_id));
-        let scope_id = scope::route(
-            tx,
-            &task.workflow_id,
-            run_id,
-            task.scope_id,
-            &destination_path,
-            task_id,
-            false,
-            &mut ScopeEntries::new(),
-        )
-        .await?;
         let status = if self.graph.join_rules().contains_key(&task.name)
             && (task.run_id.is_some() || !task.parent_task_ids.is_empty())
         {
@@ -306,23 +366,26 @@ impl PgTaskRepo {
         } else {
             TaskStatus::Pending
         };
-        let row = sqlx::query_as::<_, TaskRow>(&format!(
-            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING {ROW_COLS}"
-        )).bind(&task.workflow_id).bind(task_id).bind(run_id).bind(&task.name).bind(status.as_str())
-          .bind(&task.parent_task_ids).bind(&task.input).bind(scope_id)
-          .fetch_one(&mut **tx).await?;
+        let row = insert_task_at_path(
+            tx,
+            task,
+            self.revision.as_deref(),
+            &destination_path,
+            status,
+        )
+        .await?;
         if status == TaskStatus::Collecting {
-            fail_blocked_joins(tx, &task.workflow_id, run_id, self.graph.join_rules()).await?;
+            fail_blocked_joins(tx, &task.workflow_id, row.run_id, self.graph.join_rules()).await?;
             let row = sqlx::query_as::<_, TaskRow>(&format!(
                 "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=$1 AND task_id=$2"
             ))
             .bind(&task.workflow_id)
-            .bind(task_id)
+            .bind(row.task_id)
             .fetch_one(&mut **tx)
             .await?;
             return Ok(row.into());
         }
-        Ok(row.into())
+        Ok(row)
     }
 
     /// 入队任务，随事务提交任务就绪通知。
@@ -348,13 +411,20 @@ impl PgTaskRepo {
             .pool
             .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await?;
-        lock_settlement(&mut tx, task).await?;
+        self.lock_settlement(&mut tx, task).await?;
         let settled =
             settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
         let mut entries = ScopeEntries::new();
         for fanout in fanouts {
-            enqueue_fanout_in_tx(&mut tx, self.graph.as_ref(), &settled, fanout, &mut entries)
-                .await?;
+            enqueue_fanout_in_tx(
+                &mut tx,
+                self.graph.as_ref(),
+                self.revision.as_deref(),
+                &settled,
+                fanout,
+                &mut entries,
+            )
+            .await?;
         }
         fail_blocked_joins(
             &mut tx,
@@ -380,7 +450,7 @@ impl PgTaskRepo {
             .pool
             .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await?;
-        lock_settlement(&mut tx, task).await?;
+        self.lock_settlement(&mut tx, task).await?;
         let status = if fanouts.is_empty() {
             TaskStatus::Failed
         } else {
@@ -389,8 +459,15 @@ impl PgTaskRepo {
         let settled = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
         let mut entries = ScopeEntries::new();
         for fanout in fanouts {
-            enqueue_fanout_in_tx(&mut tx, self.graph.as_ref(), &settled, fanout, &mut entries)
-                .await?;
+            enqueue_fanout_in_tx(
+                &mut tx,
+                self.graph.as_ref(),
+                self.revision.as_deref(),
+                &settled,
+                fanout,
+                &mut entries,
+            )
+            .await?;
         }
         fail_blocked_joins(
             &mut tx,
@@ -409,7 +486,7 @@ impl PgTaskRepo {
         task: &TaskRecord,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
         let mut tx = self.pool.begin().await?;
-        match lock_task(&mut tx, task).await {
+        match self.lock_task(&mut tx, task).await {
             Ok(_) => {}
             Err(StorageError::ClaimLost { .. }) => return Ok(None),
             Err(error) => return Err(error),
@@ -438,7 +515,7 @@ impl PgTaskRepo {
     /// 仅释放当前有效认领；旧 worker 不能释放新 owner 的租约。
     pub async fn release_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;
-        lock_task(&mut tx, task).await?;
+        self.lock_task(&mut tx, task).await?;
         let result = sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL, updated_at = clock_timestamp()
@@ -482,14 +559,14 @@ impl PgTaskRepo {
             WITH candidate AS (
                 SELECT wt.task_id
                 FROM tasks wt
-                WHERE wt.workflow_id = $1
+                WHERE wt.workflow_id = $1 AND wt.revision IS NOT DISTINCT FROM $7
                   AND {executable_where}
                 ORDER BY wt.task_id
                 LIMIT $3
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE tasks
-            SET status = 'running',
+            SET status = 'running', worker_id = $8,
                 error = CASE WHEN attempt >= {MAX_ATTEMPTS} THEN
                     COALESCE(error, CASE WHEN lease_until IS NOT NULL THEN $4 ELSE $5 END)
                     ELSE error END,
@@ -508,6 +585,8 @@ impl PgTaskRepo {
             .bind(LEASE_EXPIRED_ERR)
             .bind(BUDGET_EXHAUSTED_ERR)
             .bind(Json(self.graph.join_rules()))
+            .bind(&self.revision)
+            .bind(&self.worker_id)
             .fetch_all(&mut *tx)
             .await?;
 
@@ -538,12 +617,13 @@ impl PgTaskRepo {
             r#"
             SELECT DISTINCT wt.workflow_id
             FROM tasks wt
-            WHERE wt.workflow_id = $1 AND {executable_where}
+            WHERE wt.workflow_id = $1 AND wt.revision IS NOT DISTINCT FROM $3 AND {executable_where}
             "#
         );
         let rows: Vec<(String,)> = sqlx::query_as(&sql)
             .bind(workflow_id)
             .bind(Json(self.graph.join_rules()))
+            .bind(&self.revision)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(|(workflow_id,)| workflow_id).collect())
@@ -591,7 +671,7 @@ impl PgTaskRepo {
         error: &str,
     ) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;
-        lock_settlement(&mut tx, task).await?;
+        self.lock_settlement(&mut tx, task).await?;
         settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
         tx.commit().await?;
         Ok(())

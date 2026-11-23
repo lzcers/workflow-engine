@@ -73,6 +73,22 @@ pub struct Successor {
     pub new_scope_per_input: bool,
 }
 
+pub(crate) fn subgraph_path<'a>(
+    subgraphs: &'a [SubgraphDescription],
+    mut current: Option<&'a str>,
+) -> Vec<String> {
+    let mut path = Vec::new();
+    while let Some(id) = current {
+        path.push(id.to_owned());
+        current = subgraphs
+            .iter()
+            .find(|subgraph| subgraph.id == id)
+            .and_then(|subgraph| subgraph.parent_id.as_deref());
+    }
+    path.reverse();
+    path
+}
+
 impl<Ctx> Graph<Ctx> {
     /// 构建工作流图；稳定 ID 和展示标题由图定义统一声明。
     pub fn builder(
@@ -153,18 +169,10 @@ impl<Ctx> Graph<Ctx> {
 
     /// 节点所属子图路径；根节点为 Some([])，不存在的节点为 None。
     pub fn subgraph_path(&self, name: &str) -> Option<Vec<String>> {
-        let mut path = Vec::new();
-        let mut current = self.nodes.get(name)?.subgraph_id.as_deref();
-        while let Some(id) = current {
-            path.push(id.to_owned());
-            current = self
-                .subgraphs
-                .iter()
-                .find(|subgraph| subgraph.id == id)
-                .and_then(|subgraph| subgraph.parent_id.as_deref());
-        }
-        path.reverse();
-        Some(path)
+        Some(subgraph_path(
+            &self.subgraphs,
+            self.nodes.get(name)?.subgraph_id.as_deref(),
+        ))
     }
 
     /// 所有成功边分别规划；不同 foreach 边不合并，也不按下标隐式配对。

@@ -139,6 +139,95 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
     }
 }
 
+#[tokio::test]
+async fn published_revision_routes_scoped_runs_and_recovered_claims() {
+    let Some(database) = connect_test().await else {
+        return;
+    };
+    let pool = database.pool();
+    let workflow_id = "distributed";
+    let graph = graph(
+        workflow_id,
+        &[
+            ("analysis.entry", Normal, Some("analysis")),
+            ("finish", Normal, None),
+        ],
+        &[("analysis.entry", "finish")],
+    );
+    let mut tx = pool.begin().await.unwrap();
+    let submitted = crate::postgres::submit(
+        &mut tx,
+        &graph.describe(),
+        "v1",
+        "analysis.entry",
+        &json!(1),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let other_version = PgTaskRepo::for_worker(pool.clone(), graph.clone(), "v2", "other");
+    let first = PgTaskRepo::for_worker(pool.clone(), graph.clone(), "v1", "first");
+    let replacement = PgTaskRepo::for_worker(pool.clone(), graph, "v1", "replacement");
+    assert!(
+        other_version
+            .claim_many(workflow_id, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let root = first
+        .claim_many(workflow_id, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(root.run_id, Some(submitted.run_id));
+    assert!(root.scope_id.is_some());
+    // Even a copy of the current claim cannot be used by a different worker or revision.
+    for foreign in [&replacement, &other_version] {
+        assert!(foreign.renew_claim(&root).await.unwrap().is_none());
+        assert!(foreign.release_claim(&root).await.is_err());
+        assert!(foreign.succeed(&root, &json!(1)).await.is_err());
+    }
+    first.release_claim(&root).await.unwrap();
+    let recovered = replacement
+        .claim_many(workflow_id, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(recovered.attempt, root.attempt + 1);
+    assert!(first.succeed(&root, &json!(1)).await.is_err());
+    replacement
+        .succeed_and_enqueue(&recovered, &json!(1), &[plan("finish", vec![json!(1)])])
+        .await
+        .unwrap();
+    assert!(
+        other_version
+            .claim_many(workflow_id, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let child = first
+        .claim_many(workflow_id, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(child.run_id, root.run_id);
+    assert_eq!(child.scope_id, None);
+    let workers: Vec<String> = sqlx::query_scalar(
+        "SELECT worker_id FROM tasks WHERE run_id=$1 AND revision='v1' ORDER BY task_id",
+    )
+    .bind(submitted.run_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(workers, ["replacement", "first"]);
+}
+
 /// 原子成功结算：succeed + 全部后继（单条及批量输入）在同一事务内落库，
 /// 后继继承源任务 run_id、parent_task_ids 记录源任务。
 #[tokio::test]
