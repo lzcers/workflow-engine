@@ -1,8 +1,7 @@
 //! SQLite persistence for workflow tasks, claims, settlement, and fanout.
 //!
-//! Read/modify/write operations acquire SQLite's write lock with `BEGIN IMMEDIATE`
-//! before reading. This serializes competing claimers and fan-in updates without
-//! relying on PostgreSQL row locks or upgrading a deferred read transaction.
+//! Each task transaction starts with INSERT or UPDATE. That statement acquires the
+//! write lock before any reads used to plan fanout or merge JOIN contributions.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -31,26 +30,6 @@ pub struct SqliteTaskRepo {
     graph: Arc<dyn ErasedGraph>,
 }
 
-/// Allocate a workflow-local task ID inside the caller's transaction.
-/// Allocation is rolled back with the transaction.
-pub async fn allocate_task_id(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    workflow_id: &str,
-) -> Result<i64, StorageError> {
-    Ok(sqlx::query_scalar(
-        r#"
-        INSERT INTO task_counters (workflow_id, next_task_id)
-        VALUES (?1, 1)
-        ON CONFLICT (workflow_id)
-        DO UPDATE SET next_task_id = task_counters.next_task_id + 1
-        RETURNING next_task_id
-        "#,
-    )
-    .bind(workflow_id)
-    .fetch_one(&mut **tx)
-    .await?)
-}
-
 fn claim_lost(task: &TaskRecord) -> StorageError {
     StorageError::ClaimLost {
         workflow_id: task.workflow_id.clone(),
@@ -62,12 +41,13 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
 /// for both claim and recovery. Parent IDs record provenance, not execution dependencies.
 fn executable_where(rules_parameter: &str) -> String {
     format!(
-        "wt.status IN ('pending', 'running') AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now')) AND ({})",
+        "(wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))
+         AND (wt.status IN ('pending', 'running') OR (wt.status = 'collecting' AND ({})))",
         join::ready(rules_parameter)
     )
 }
 
-/// The caller must already hold the write lock, normally via `BEGIN IMMEDIATE`.
+/// The source settlement has already acquired the write lock in this transaction.
 async fn enqueue_fanout_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     source: &TaskRecord,
@@ -91,6 +71,11 @@ async fn enqueue_fanout_in_tx(
             detail: "foreach cannot target a JOIN node".into(),
         });
     }
+    let initial_status = if task_type == TaskType::Join && source.status == TaskStatus::Succeeded {
+        TaskStatus::Collecting
+    } else {
+        TaskStatus::Pending
+    };
     for input in &plan.inputs {
         let scope_id = scope::route(
             tx,
@@ -103,9 +88,9 @@ async fn enqueue_fanout_in_tx(
             entries,
         )
         .await?;
-        let existing = if task_type == TaskType::Join {
+        let existing = if initial_status == TaskStatus::Collecting {
             sqlx::query_as::<_, TaskRow>(&format!(
-                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND name=?2 AND run_id IS ?3 AND scope_id IS ?4 AND status IN ('pending','running') ORDER BY task_id LIMIT 1"
+                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND name=?2 AND run_id IS ?3 AND scope_id IS ?4 AND status='collecting' ORDER BY task_id LIMIT 1"
             )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
               .fetch_optional(&mut **tx).await?
         } else {
@@ -117,15 +102,14 @@ async fn enqueue_fanout_in_tx(
                 parents.push(source.task_id);
             }
             let mut input_json = existing.input_json;
-            merge_join_input(&mut input_json, input);
+            merge_join_input(&mut input_json, input)?;
             sqlx::query("UPDATE tasks SET parent_task_ids=?3, input_json=?4, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE workflow_id=?1 AND task_id=?2")
                 .bind(&source.workflow_id).bind(existing.task_id).bind(Json(parents)).bind(input_json)
                 .execute(&mut **tx).await?;
         } else {
-            let task_id = allocate_task_id(tx, &source.workflow_id).await?;
-            sqlx::query("INSERT INTO tasks (workflow_id,task_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7)")
-                .bind(&source.workflow_id).bind(task_id).bind(source.run_id).bind(plan.dst)
-                .bind(Json(vec![source.task_id])).bind(input).bind(scope_id)
+            sqlx::query("INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES (?1,?2,?3,?4,?5,?6,?7)")
+                .bind(&source.workflow_id).bind(source.run_id).bind(plan.dst).bind(initial_status.as_str())
+                .bind(Json([source.task_id])).bind(input).bind(scope_id)
                 .execute(&mut **tx).await?;
         }
     }
@@ -142,7 +126,7 @@ async fn fail_blocked_joins(
 ) -> Result<(), StorageError> {
     loop {
         let changed = sqlx::query(&format!(
-            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='pending' AND ({})", join::failed("?3")
+            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='collecting' AND ({})", join::failed("?3")
         )).bind(workflow_id).bind(run_id).bind(Json(rules)).execute(&mut **tx).await?.rows_affected();
         if changed == 0 {
             break;
@@ -168,9 +152,9 @@ impl SqliteTaskRepo {
         Ok(())
     }
 
-    /// Insert a pending task in an application-owned transaction.
+    /// Insert a task in an application-owned transaction.
     /// Without an explicit run ID, the allocated task ID starts a new run.
-    /// Start with `pool.begin_with("BEGIN IMMEDIATE")` when the transaction also reads.
+    /// Insertion acquires the write lock before routing into the destination scope.
     pub async fn insert_task(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -189,7 +173,24 @@ impl SqliteTaskRepo {
                 .ok_or_else(|| StorageError::InvalidFanout {
                     detail: format!("unknown destination node {}", task.name),
                 })?;
-        let task_id = allocate_task_id(tx, &task.workflow_id).await?;
+        let initial_status = if task_type == TaskType::Join
+            && (task.run_id.is_some() || !task.parent_task_ids.is_empty())
+        {
+            TaskStatus::Collecting
+        } else {
+            TaskStatus::Pending
+        };
+        let task_id: i64 = sqlx::query_scalar(
+            "INSERT INTO tasks (workflow_id,name,status,parent_task_ids,input_json)
+             VALUES (?1,?2,?3,?4,?5) RETURNING task_id",
+        )
+        .bind(&task.workflow_id)
+        .bind(&task.name)
+        .bind(initial_status.as_str())
+        .bind(Json(&task.parent_task_ids))
+        .bind(&task.input)
+        .fetch_one(&mut **tx)
+        .await?;
         let run_id = Some(task.run_id.unwrap_or(task_id));
         let scope_id = scope::route(
             tx,
@@ -203,11 +204,14 @@ impl SqliteTaskRepo {
         )
         .await?;
         let row = sqlx::query_as::<_, TaskRow>(&format!(
-            "INSERT INTO tasks (workflow_id,task_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7) RETURNING {ROW_COLS}"
-        )).bind(&task.workflow_id).bind(task_id).bind(run_id).bind(&task.name)
-          .bind(Json(&task.parent_task_ids)).bind(&task.input).bind(scope_id)
-          .fetch_one(&mut **tx).await?;
-        if task_type == TaskType::Join {
+            "UPDATE tasks SET run_id=?1, scope_id=?2 WHERE task_id=?3 RETURNING {ROW_COLS}"
+        ))
+        .bind(run_id)
+        .bind(scope_id)
+        .bind(task_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if initial_status == TaskStatus::Collecting {
             fail_blocked_joins(tx, &task.workflow_id, run_id, self.graph.join_rules()).await?;
             let row = sqlx::query_as::<_, TaskRow>(&format!(
                 "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND task_id=?2"
@@ -223,7 +227,7 @@ impl SqliteTaskRepo {
 
     /// Enqueue in the supplied run, or atomically create a run using the new task ID.
     pub async fn enqueue(&self, task: &Task) -> Result<TaskRecord, StorageError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin().await?;
         let row = self.insert_task(&mut tx, task).await?;
         tx.commit().await?;
         Ok(row)
@@ -238,7 +242,7 @@ impl SqliteTaskRepo {
         fanouts: &[Successor],
     ) -> Result<TaskRecord, StorageError> {
         self.check_workflow(&task.workflow_id)?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin().await?;
         let settled = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
             UPDATE tasks
@@ -288,7 +292,7 @@ impl SqliteTaskRepo {
         fanouts: &[Successor],
     ) -> Result<(), StorageError> {
         self.check_workflow(&task.workflow_id)?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin().await?;
         // Settle first so a failure self-edge creates a fresh pending task instead
         // of merging its retry input into the still-running source task.
         let settled = sqlx::query_as::<_, TaskRow>(&format!(
@@ -342,7 +346,7 @@ impl SqliteTaskRepo {
         &self,
         task: &TaskRecord,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin().await?;
         let lease_until = sqlx::query_scalar(
             r#"
             UPDATE tasks
@@ -399,7 +403,7 @@ impl SqliteTaskRepo {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin().await?;
         let mut rows = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
             WITH candidate AS MATERIALIZED (

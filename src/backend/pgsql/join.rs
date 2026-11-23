@@ -1,13 +1,13 @@
 //! 用图中的 JOIN 规则和当前运行的作用域、任务状态判定就绪与失败。
 
-/// 已经出现但仍在运行的上游，可能继续创建直接前驱。
+/// collecting 状态的 JOIN 等待全部有效前驱成功，以及仍可能生产输入的上游结束。
 pub(super) fn ready(rules: &str) -> String {
     format!(
         "NOT ({})",
         blocked(
             rules,
             "source.status IS DISTINCT FROM 'succeeded'",
-            "upstream.status IN ('pending', 'running')"
+            "upstream.status IN ('pending', 'collecting', 'running')"
         )
     )
 }
@@ -23,13 +23,6 @@ pub(super) fn failed(rules: &str) -> String {
 fn blocked(rules: &str, source_status: &str, upstream_status: &str) -> String {
     format!(
         r#"{rules}::jsonb ? wt.name
-        AND NOT (wt.run_id IS NOT DISTINCT FROM wt.task_id AND cardinality(wt.parent_task_ids) = 0)
-        AND NOT EXISTS (
-            SELECT 1 FROM tasks first_parent
-            WHERE first_parent.workflow_id = wt.workflow_id
-              AND first_parent.task_id = wt.parent_task_ids[1]
-              AND first_parent.status = 'superseded'
-        )
         AND EXISTS (
             WITH RECURSIVE
             children(scope_id) AS (
@@ -66,7 +59,7 @@ fn blocked(rules: &str, source_status: &str, upstream_status: &str) -> String {
                     SELECT 1 FROM deps
                     LEFT JOIN tasks source ON source.workflow_id = wt.workflow_id
                         AND source.run_id IS NOT DISTINCT FROM wt.run_id
-                        AND source.name = deps.name AND (
+                        AND source.name = deps.name AND source.status <> 'superseded' AND (
                             source.task_id = deps.task_id OR (deps.task_id IS NULL AND EXISTS (
                                 SELECT 1 FROM children WHERE scope_id IS NOT DISTINCT FROM source.scope_id
                             ))

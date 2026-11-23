@@ -5,13 +5,6 @@ fn matches_rule(rules: &str, condition: &str) -> String {
         r#"EXISTS (
             SELECT 1 FROM json_each({rules}) AS rule
             WHERE rule.key = wt.name
-              AND (wt.task_id IS NOT wt.run_id OR json_array_length(wt.parent_task_ids) > 0)
-              AND NOT EXISTS (
-                  SELECT 1 FROM tasks creator
-                  WHERE creator.workflow_id = wt.workflow_id
-                    AND creator.task_id = json_extract(wt.parent_task_ids, '$[0]')
-                    AND creator.status = 'superseded'
-              )
               AND EXISTS (
                 WITH RECURSIVE
                 local_scopes(scope_id) AS (
@@ -45,7 +38,8 @@ fn matches_rule(rules: &str, condition: &str) -> String {
                 ),
                 sources AS (
                     SELECT r.name, st.status FROM required r JOIN tasks st
-                      ON st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id AND st.name = r.name
+                      ON st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id
+                        AND st.name = r.name AND st.status <> 'superseded'
                     WHERE st.task_id = r.trigger_task_id OR (
                         r.trigger_task_id IS NULL AND EXISTS (SELECT 1 FROM local_scopes WHERE scope_id IS st.scope_id)
                     )
@@ -61,11 +55,11 @@ fn matches_rule(rules: &str, condition: &str) -> String {
     )
 }
 
-/// 等待所有有效前驱成功，以及仍可能产生输入的上游结束。
+/// 检查收集中的 JOIN 是否已等齐上游。
 pub(super) fn ready(rules: &str) -> String {
     let blocked = matches_rule(
         rules,
-        r#"EXISTS (SELECT 1 FROM upstreams WHERE status IN ('pending','running'))
+        r#"EXISTS (SELECT 1 FROM upstreams WHERE status IN ('pending','collecting','running'))
            OR EXISTS (SELECT 1 FROM required r WHERE NOT EXISTS (
                SELECT 1 FROM sources s WHERE s.name = r.name AND s.status = 'succeeded'
            ))

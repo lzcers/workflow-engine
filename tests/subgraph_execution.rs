@@ -113,11 +113,20 @@ async fn execute_sql(url: &str, sql: &str) {
 async fn recover_nested(url: &str) {
     let workflow_id = format!("scope-recovery-{}", uuid::Uuid::new_v4());
     let engine = Engine::new(url).await.unwrap();
-    execute_sql(url, &"INSERT INTO task_counters(workflow_id,next_task_id) VALUES('scope-recovery',3);
-        INSERT INTO scopes(workflow_id,scope_id,run_id,subgraph_id,parent_scope_id,trigger_task_id)
-        VALUES('scope-recovery',1,3,'outer',NULL,3),('scope-recovery',2,3,'outer.inner',1,3);
-        INSERT INTO tasks(workflow_id,task_id,run_id,scope_id,name,status,input_json,attempt,lease_until)
-        VALUES('scope-recovery',3,3,2,'outer.inner.start','running','8',1,'2000-01-01T00:00:00Z');".replace("scope-recovery", &workflow_id)).await;
+    let fixture = format!(
+        "INSERT INTO tasks(workflow_id,name,status,input_json,attempt,lease_until)
+         VALUES('{workflow_id}','outer.inner.start','running','8',1,'2000-01-01T00:00:00Z');
+         INSERT INTO scopes(workflow_id,run_id,subgraph_id,trigger_task_id)
+         SELECT workflow_id,task_id,'outer',task_id FROM tasks WHERE workflow_id='{workflow_id}';
+         INSERT INTO scopes(workflow_id,run_id,subgraph_id,parent_scope_id,trigger_task_id)
+         SELECT workflow_id,run_id,'outer.inner',scope_id,trigger_task_id FROM scopes
+         WHERE workflow_id='{workflow_id}' AND subgraph_id='outer';
+         UPDATE tasks SET run_id=task_id, scope_id=(
+             SELECT scope_id FROM scopes WHERE workflow_id='{workflow_id}' AND subgraph_id='outer.inner'
+         ) WHERE workflow_id='{workflow_id}';"
+    );
+    execute_sql(url, &fixture).await;
+    let scopes = read_scopes(url, &workflow_id).await;
     drop(engine);
     let engine = Engine::new(url).await.unwrap();
     let (results, mut receiver) = mpsc::unbounded_channel();
@@ -145,10 +154,10 @@ async fn recover_nested(url: &str) {
     .expect("restart must restore ancestors from scopes and resume the old task");
     assert_eq!(
         records.iter().map(|r| r.0.scope_id).collect::<Vec<_>>(),
-        vec![Some(2), Some(1), None]
+        vec![Some(scopes[1].scope_id), Some(scopes[0].scope_id), None]
     );
     assert_eq!(records[0].0.attempt, 2);
-    assert_eq!(records[0].0.task_id, 3);
+    assert_eq!(records[0].0.task_id, scopes[1].trigger_task_id);
     assert_eq!(
         read_scopes(url, &workflow_id).await.len(),
         2,
@@ -374,7 +383,7 @@ async fn waits_for_later_upstream_tasks(url: &str) {
         tokio::time::timeout(Duration::from_millis(1200), receiver.recv())
             .await
             .is_err(),
-        "JOIN must stay pending across a scheduler poll while its producer is running"
+        "JOIN must keep collecting across a scheduler poll while its producer is running"
     );
     release.add_permits(1);
     let output = tokio::time::timeout(Duration::from_secs(8), async {
@@ -402,6 +411,7 @@ async fn sqlite_nested_scopes_and_entry_correlation() {
     entry_and_foreach(&url).await;
     recover_nested(&url).await;
     waits_for_later_upstream_tasks(&url).await;
+    retry_and_recovery_join(&url).await;
     let _ = std::fs::remove_file(path);
 }
 #[cfg(feature = "pg")]
@@ -414,4 +424,79 @@ async fn postgres_nested_scopes_and_entry_correlation() {
     entry_and_foreach(&url).await;
     recover_nested(&url).await;
     waits_for_later_upstream_tasks(&url).await;
+    retry_and_recovery_join(&url).await;
+}
+
+struct RetryWork(Arc<Semaphore>);
+impl Node<Context> for RetryWork {
+    type In = i32;
+    type Out = i32;
+
+    async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
+        if input == 0 {
+            return Err(NodeError::permanent("return to prepare"));
+        }
+        self.0.acquire().await.unwrap().forget();
+        Ok(input)
+    }
+}
+
+struct RecoveryJoin {
+    allow_retry: Arc<Semaphore>,
+    release_recovery: Arc<Semaphore>,
+}
+impl Node<Context> for RecoveryJoin {
+    type In = Value;
+    type Out = Value;
+    const TASK_TYPE: workflow_engine::graph::TaskType = workflow_engine::graph::TaskType::Join;
+
+    async fn execute(&self, _: &mut Context, input: Value) -> Result<Value, NodeError> {
+        if input.get("recovery").is_some() {
+            // The successful contribution must arrive while this claim is still running.
+            self.allow_retry.add_permits(1);
+            self.release_recovery.acquire().await.unwrap().forget();
+        }
+        Ok(input)
+    }
+}
+
+async fn retry_and_recovery_join(url: &str) {
+    let engine = Engine::new(url).await.unwrap();
+    let (results, mut receiver) = mpsc::unbounded_channel();
+    let allow_retry = Arc::new(Semaphore::new(0));
+    let release_recovery = Arc::new(Semaphore::new(0));
+    let graph = workflow! {
+        workflow_id: format!("retry-and-recovery-{}", uuid::Uuid::new_v4());
+        title: "Successful retry and simultaneous recovery at one JOIN";
+        context: Context { task: None, results };
+        nodes {
+            prepare => pass::<i32>(), work => RetryWork(allow_retry.clone()),
+            joined => RecoveryJoin { allow_retry, release_recovery: release_recovery.clone() },
+            finish => pass::<Value>()
+        }
+        edges {
+            prepare -> work,
+            work -> prepare on_error |_, _| vec![1],
+            work -> joined on_error |_, _| vec![json!({"recovery": true})],
+            work -> joined |> |value| vec![json!({"work": value})],
+            joined -> finish,
+        }
+    }
+    .unwrap();
+    let workflow = engine.make(graph);
+    workflow.submit("prepare", 0).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        for expected in [json!({"work": 1}), json!({"recovery": true})] {
+            loop {
+                let (task, output) = receiver.recv().await.unwrap();
+                if task.name == "finish" {
+                    assert_eq!(output, expected);
+                    break;
+                }
+            }
+            release_recovery.add_permits(1);
+        }
+    })
+    .await
+    .expect("the successful retry and recovery invocation must each reach finish");
 }

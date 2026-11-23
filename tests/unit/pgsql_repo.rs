@@ -335,6 +335,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
         "different parents must contribute to the same JOIN"
     );
     let join = joins[0];
+    assert_eq!(join.status, TaskStatus::Collecting);
     assert_eq!(
         join.parent_task_ids,
         [sources[0].task_id, sources[1].task_id]
@@ -470,14 +471,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     );
     for task in std::iter::once(&failed).chain(&dependents) {
         let unchanged = repo.get(workflow_id, task.task_id).await.unwrap().unwrap();
-        assert_eq!(
-            unchanged.status,
-            if task.task_id == failed.task_id {
-                TaskStatus::Running
-            } else {
-                TaskStatus::Pending
-            }
-        );
+        assert_eq!(unchanged.status, task.status);
     }
     sqlx::query("ALTER TABLE tasks DROP CONSTRAINT reject_cascade")
         .execute(database.pool())
@@ -502,7 +496,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         let expected = if dependent.name == "audio_join" && dependent.run_id == failed.run_id {
             TaskStatus::Failed
         } else {
-            TaskStatus::Pending
+            dependent.status
         };
         assert_eq!(settled.status, expected);
     }
@@ -610,7 +604,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     let claimable_repo = repository(claimable);
     insert_task(&claimable_repo, claimable, "narration").await;
 
-    // JOIN 被前驱阻塞：后继 pending 但前驱未成功 → 不命中。先把前驱认领掉
+    // JOIN 被前驱阻塞：后继 collecting 且前驱未成功 → 不命中。先把前驱认领掉
     // （running + 租约未过期 → 前驱自身也不可认领），否则前驱的 pending 行
     // 本身就会让工作流命中，测试的「阻塞」前提不成立。
     let blocked = "exec_sess_blocked";
@@ -621,7 +615,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     blocked_repo.enqueue(&join).await.unwrap();
     assert_eq!(blocked_repo.claim_many(blocked, 5).await.unwrap().len(), 1);
 
-    // 已全部成功：无 pending/running → 不命中。
+    // 已全部成功：无可认领任务。
     let done = "exec_sess_done";
     let done_repo = repository(done);
     insert_task(&done_repo, done, "narration").await;
@@ -982,7 +976,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     assert_eq!(rows.len(), 2, "stale settlement cannot create successors");
     assert_eq!(
         rows[1].status,
-        TaskStatus::Pending,
+        TaskStatus::Collecting,
         "stale failure cannot cascade"
     );
     let unchanged = repo
@@ -1091,9 +1085,9 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
     seed(&repo, workflow_id, "right", Some(42)).await;
     let left = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     let right = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
-    // Freeze ID allocation: both parents reach the missing-JOIN window concurrently.
+    // Hold the source rows until both settlements are waiting to create the first JOIN.
     let mut blocker = database.pool().begin().await.unwrap();
-    sqlx::query("SELECT next_task_id FROM task_counters WHERE workflow_id = $1 FOR UPDATE")
+    sqlx::query("SELECT task_id FROM tasks WHERE workflow_id = $1 FOR UPDATE")
         .bind(workflow_id)
         .execute(&mut *blocker)
         .await

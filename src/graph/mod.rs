@@ -172,6 +172,17 @@ impl<Ctx> Graph<Ctx> {
         let mut plans = Vec::new();
         for edge in self.success_edges.iter().filter(|edge| edge.src() == name) {
             let inputs = edge.plan_success(out)?;
+            if self.join_rules.contains_key(edge.dst())
+                && inputs.iter().any(|input| !input.is_object())
+            {
+                return Err(EdgeError::BadDstIn {
+                    src: edge.src(),
+                    detail: format!(
+                        "JOIN {} requires a JSON object for each contribution",
+                        edge.dst()
+                    ),
+                });
+            }
             if inputs.is_empty() {
                 continue;
             }

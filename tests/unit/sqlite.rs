@@ -102,10 +102,10 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         repo.claim_many("other", 1).await,
         Err(StorageError::InvalidFanout { .. })
     ));
-    assert_eq!(first.task_id, 1);
-    assert_eq!(second.task_id, 2);
+    assert_ne!(first.task_id, second.task_id);
     assert_eq!(second.run_id, Some(second.task_id));
-    assert_eq!(other.task_id, 1, "task IDs are scoped to each workflow");
+    assert_ne!(other.task_id, first.task_id);
+    assert_ne!(other.task_id, second.task_id);
     assert_eq!(other.run_id, Some(other.task_id));
     assert_eq!(first.name, "root");
     assert!(first.parent_task_ids.is_empty());
@@ -116,7 +116,10 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert!(first.created_at <= first.updated_at);
 
     let rows = repo.list_all("workflow").await.unwrap();
-    assert_eq!(rows.iter().map(|t| t.task_id).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(
+        rows.iter().map(|t| t.task_id).collect::<Vec<_>>(),
+        [first.task_id, second.task_id]
+    );
     assert_eq!(rows[0].input, input.input);
     assert_eq!(rows[0].run_id, Some(42));
     assert_eq!(rows[1].run_id, second.run_id);
@@ -142,10 +145,6 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
             .is_none()
     );
     let next = store.enqueue(&new_task("workflow", "next")).await.unwrap();
-    assert_eq!(
-        next.task_id, rolled_back.task_id,
-        "allocation rolls back with insertion"
-    );
     assert_eq!(next.run_id, Some(next.task_id));
     assert_ne!(next.run_id, second.run_id);
 
@@ -198,6 +197,7 @@ async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
     let child = repo.enqueue(&child).await.unwrap();
     assert_eq!(child.run_id, root.run_id);
     assert_eq!(child.parent_task_ids, [root.task_id]);
+    assert_eq!(child.status, TaskStatus::Collecting);
     let mut missing = new_task("deps", "missing_dependency");
     missing.run_id = root.run_id;
 
@@ -225,17 +225,19 @@ async fn join_claims_require_all_named_predecessors_including_missing_tasks() {
     let claimed = repo.claim_many("deps", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, child.task_id);
-    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Pending);
+    assert_eq!(claimed[0].status, TaskStatus::Running);
+    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Collecting);
 
     // A direct JOIN entry starts its own run with the supplied input.
     let entry = repo
         .enqueue(&new_task("deps", "missing_dependency"))
         .await
         .unwrap();
+    assert_eq!(entry.status, TaskStatus::Pending);
     let claimed = repo.claim_many("deps", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, entry.task_id);
-    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Pending);
+    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Collecting);
 }
 
 #[tokio::test]
@@ -787,7 +789,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     assert_eq!(unchanged.lease_until, root.lease_until);
     assert!(unchanged.error.is_none());
     assert_eq!(get(&repo, &child).await.status, TaskStatus::Pending);
-    assert_eq!(get(&repo, &join).await.status, TaskStatus::Pending);
+    assert_eq!(get(&repo, &join).await.status, TaskStatus::Collecting);
     sqlx::query("DROP TRIGGER reject_cascade")
         .execute(&pool)
         .await
@@ -799,7 +801,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     assert_eq!(get(&repo, &join).await.status, TaskStatus::Failed);
     assert_eq!(
         get(&repo, &other_run).await.status,
-        TaskStatus::Pending,
+        TaskStatus::Collecting,
         "name-based cascading stays in its run"
     );
     assert_eq!(get(&repo, &unrelated).await.status, TaskStatus::Pending);
@@ -889,7 +891,7 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
             } else if target.run_id == source_run {
                 TaskStatus::Failed
             } else {
-                TaskStatus::Pending
+                TaskStatus::Collecting
             };
             assert_eq!(
                 get(&repo, &target).await.status,
@@ -1252,6 +1254,6 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
         .enqueue(&new_task("concurrent", "after_reopen"))
         .await
         .unwrap();
-    assert_eq!(next.task_id, 41, "the workflow counter survives reopen");
+    assert!(next.task_id > merged[0].task_id);
     reopened.close().await;
 }

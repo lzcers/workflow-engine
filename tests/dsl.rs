@@ -371,6 +371,14 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
         graph.subgraph_path("batch.analysis.signal").unwrap(),
         ["batch", "batch.analysis"]
     );
+    let error = graph
+        .plan_success("batch.fetch", &serde_json::json!(1))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("JOIN batch.analysis.join requires a JSON object")
+    );
     let plans = graph
         .plan_success("batch.fetch", &serde_json::json!({}))
         .unwrap();

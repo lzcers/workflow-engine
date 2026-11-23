@@ -124,15 +124,9 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
     observed.sort();
     let mut expected = vec![
         (first.run_id, "tick".into(), vec![], 10, 20),
-        (first.run_id, "process".into(), vec![first.task_id], 20, 21),
+        (first.run_id, "process".into(), vec![first.run_id], 20, 21),
         (second.run_id, "tick".into(), vec![], 20, 30),
-        (
-            second.run_id,
-            "process".into(),
-            vec![second.task_id],
-            30,
-            31,
-        ),
+        (second.run_id, "process".into(), vec![second.run_id], 30, 31),
         (manual.run_id, "process".into(), vec![], 30, 31),
     ];
     expected.sort();
@@ -267,11 +261,9 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
     let second_run = second.submit("start", 30).await.unwrap();
     assert_eq!(first_run.workflow_id, "first");
     assert_eq!(second_run.workflow_id, "second");
-    assert_eq!(first_run.run_id, first_run.task_id);
-    assert_eq!(second_run.run_id, second_run.task_id);
     assert_ne!(first_run.run_id, another_run.run_id);
-    assert_eq!(first_run.task_id, 1);
-    assert_eq!(second_run.task_id, 1);
+    assert_ne!(first_run.run_id, second_run.run_id);
+    assert_ne!(another_run.run_id, second_run.run_id);
     assert!(matches!(
         first.submit("missing", 0).await,
         Err(EngineError::UnknownNode(name)) if name == "missing"

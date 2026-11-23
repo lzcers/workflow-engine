@@ -7,7 +7,10 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    /// 输入已确定，等待认领。
     Pending,
+    /// JOIN 正在收集输入，等待前驱就绪后认领。
+    Collecting,
     Running,
     Succeeded,
     Failed,
@@ -20,6 +23,7 @@ impl TaskStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Collecting => "collecting",
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -60,7 +64,7 @@ pub struct TaskRecord {
     pub run_id: Option<i64>,
     /// 当前子图执行实例；父子关系保存在 scopes 表，None 为运行根作用域。
     pub scope_id: Option<i64>,
-    /// 来源任务按贡献顺序去重，首项标识创建 JOIN 的来源。独立入口为空。
+    /// 来源任务按贡献顺序去重。独立入口为空。
     /// 失败后继同样记录来源；此字段不要求来源任务成功。
     pub parent_task_ids: Vec<i64>,
     pub name: String,

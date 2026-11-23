@@ -8,17 +8,18 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{Task, TaskRecord};
-use crate::graph::Successor;
+use crate::{error::StorageError, graph::Successor};
 
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
 
 /// 将前驱贡献合并到 JOIN 的累积对象；同名 key 合为数组，已有数组及新贡献数组按元素追加。
-/// 任一输入不是对象时不合并。后端须在持锁事务内读取累积值、调用此函数并写回。
-pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) {
-    let Value::Object(acc_map) = acc else { return };
-    let Some(obj) = contribution.as_object() else {
-        return;
+/// 后端在结算事务内更新尚未认领的 JOIN。
+pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<(), StorageError> {
+    let (Value::Object(acc_map), Value::Object(obj)) = (acc, contribution) else {
+        return Err(StorageError::InvalidFanout {
+            detail: "JOIN contributions must be JSON objects".into(),
+        });
     };
     for (key, value) in obj {
         match acc_map.get_mut(key) {
@@ -38,6 +39,7 @@ pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) {
             }
         }
     }
+    Ok(())
 }
 
 /// 引擎与调度器共用的任务持久化抽象：提交、认领、续租、原子结算和释放认领。
@@ -62,11 +64,11 @@ pub trait TaskStore: Sync {
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
     /// 时返回少于 `limit` 甚至空列表，按任务 ID 排序。`limit` 为 0 时直接返回空列表。
     ///
-    /// 待处理任务必须同时满足：
-    /// - 状态为 pending / running，未持有租约或租约已过期。
-    /// - JOIN 在图和当前作用域中匹配的前驱必须全部成功；当前图中仍可能生产来源的任务
-    ///   全部结束后才可认领。祖先或兄弟入口绑定精确触发任务，子图输出按父实例收集。
-    /// 独立运行入口和失败路由创建的 JOIN 可直接认领。
+    /// 认领仅处理无有效租约的任务：
+    /// - pending 输入已确定，可直接执行，包括独立运行入口和失败路由创建的 JOIN。
+    /// - collecting 等待当前作用域的有效前驱成功，并等待可能继续产生输入的上游结束。
+    ///   祖先或兄弟入口绑定精确触发任务，子图输出按父实例收集。
+    /// - running 沿用首次认领时冻结的输入恢复执行。
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
     /// 每次认领递增 attempt 并写入 300 秒租约。
@@ -107,9 +109,9 @@ pub trait TaskStore: Sync {
     /// 在同一事务内结算失败，并入队失败后继或级联已有依赖任务。
     ///
     /// `successors` 非空时标记 `superseded`；为空时标记 `failed`，并将同一工作流、
-    /// 同一 run 中按前驱名称和作用域关系依赖该实例来源的 pending JOIN 标记失败。
+    /// 同一 run 中按前驱名称和作用域关系依赖该实例来源的 collecting JOIN 标记失败。
     /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
-    /// 失败后继同样将源任务 ID 写入 parent_task_ids，使用与成功后继相同的创建和 JOIN 汇合规则。
+    /// 失败后继同样将源任务 ID 写入 parent_task_ids，每条失败路由输入创建一条直接执行的后继。
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn settle_failure<'a>(
         &'a self,

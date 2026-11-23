@@ -1,6 +1,5 @@
 //! scope 实例创建与父级恢复，随任务结算事务提交。
 
-use super::repo::allocate_task_id;
 use crate::{
     error::StorageError,
     task::scope::{ScopeEntries, ScopeRecord},
@@ -36,38 +35,29 @@ pub(super) async fn route(
     entries: &mut ScopeEntries,
 ) -> Result<Option<i64>, StorageError> {
     let chain = chain(tx, workflow_id, source_scope_id).await?;
-    if chain.iter().any(|scope| scope.run_id != run_id) {
-        return Err(StorageError::InvalidFanout {
-            detail: "source scope does not match run".into(),
-        });
+    let (mut parent, entered) =
+        crate::task::scope::route_path(&chain, run_id, destination_path, foreach)?;
+    for subgraph_id in entered {
+        let key = (parent, subgraph_id.clone());
+        if !foreach && let Some(&id) = entries.get(&key) {
+            parent = Some(id);
+            continue;
+        }
+        let id = sqlx::query_scalar(
+            "INSERT INTO scopes (workflow_id, run_id, subgraph_id, parent_scope_id, trigger_task_id)
+             VALUES ($1, $2, $3, $4, $5) RETURNING scope_id",
+        )
+        .bind(workflow_id)
+        .bind(run_id)
+        .bind(subgraph_id)
+        .bind(parent)
+        .bind(trigger_task_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !foreach {
+            entries.insert(key, id);
+        }
+        parent = Some(id);
     }
-    let common = chain
-        .iter()
-        .map(|scope| &scope.subgraph_id)
-        .zip(destination_path)
-        .take_while(|(a, b)| a == b)
-        .count();
-    if foreach && common == destination_path.len() {
-        return Err(StorageError::InvalidFanout {
-            detail: "foreach must enter a subgraph".into(),
-        });
-    }
-    let mut scope_id = common.checked_sub(1).map(|index| chain[index].scope_id);
-    for subgraph_id in &destination_path[common..] {
-        let key = (scope_id, subgraph_id.clone());
-        let existing = if foreach { None } else { entries.get(&key) };
-        scope_id = Some(if let Some(id) = existing {
-            *id
-        } else {
-            let id = allocate_task_id(tx, workflow_id).await?;
-            sqlx::query("INSERT INTO scopes (workflow_id, scope_id, run_id, subgraph_id, parent_scope_id, trigger_task_id) VALUES ($1,$2,$3,$4,$5,$6)")
-                .bind(workflow_id).bind(id).bind(run_id).bind(subgraph_id).bind(scope_id).bind(trigger_task_id)
-                .execute(&mut **tx).await?;
-            if !foreach {
-                entries.insert(key, id);
-            }
-            id
-        });
-    }
-    Ok(scope_id)
+    Ok(parent)
 }

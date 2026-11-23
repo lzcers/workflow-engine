@@ -27,7 +27,7 @@
 
 PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下文实现
 `NodeContext`，`fork` 接收 `&TaskRecord`，不依赖数据库任务类型。`TaskStatus` 使用枚举，序列化为
-`pending`、`running`、`succeeded`、`failed`、`skipped`、`superseded`；数据库中的未知状态
+`pending`、`collecting`、`running`、`succeeded`、`failed`、`skipped`、`superseded`；数据库中的未知状态
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
 `Task::new(workflow_id, name, input)` 默认创建独立运行入口，每条任务最多执行业务 3 次。
@@ -36,16 +36,15 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
 业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
 
-`parent_task_ids` 记录来源任务 ID 集合，独立入口为空数组。成功和失败后继均由
-引擎按贡献顺序填写。首个来源为 `superseded` 时，JOIN 走失败恢复路径，可直接执行。
-普通节点每条输入创建独立任务，以 `task_id` 标识；同一父任务的多个子任务共享
-`parent_task_ids = [源任务 ID]`，不同父任务的同名后继也独立存在。父任务结算与后继创建原子提交，
-并通过认领校验阻止重复结算，因此不需要额外的实例编号去重。
-只有 JOIN 按 `workflow_id + run_id + scope_id + name` 汇入已有 pending / running JOIN，跨父任务
-累积输入，并将所有贡献者 ID 去重合并到 `parent_task_ids`。JOIN 是否就绪由
-图中的前驱、`scopes` 的入口和任务状态共同判断。无父任务且 `task_id = run_id` 的运行入口直接执行。可能继续产生输入的上游范围
-在图构建时计算并保存在图中，不写入任务表。仓储直接查询共享图，后继规划只包含
-目标节点、输入和是否为每条输入创建作用域，不复制节点类型、路径或前驱集合。
+`parent_task_ids` 按贡献顺序记录实际来源，入口为空。普通后继每条输入对应一个新任务。
+任务终态与后继创建在同一事务提交，认领代次阻止重复结算。
+
+成功边向 JOIN 提交 JSON 对象，按对象键合并，同名键的多次贡献累积为数组。
+引擎按 `workflow_id + run_id + scope_id + name` 查找状态为 `collecting` 的 JOIN，合并输入并去重记录来源 ID。
+前驱就绪后，首次认领将状态直接改为 `running` 并固定输入。租约过期时使用同一输入重试，晚到的成功贡献开启下一次汇合。
+直接提交到 JOIN 的独立运行入口，以及失败边指向 JOIN 时产生的每条后继，均以 `pending` 入队，使用各自的输入执行。
+前驱和上游范围在构图时计算，认领时结合作用域入口和任务状态判断就绪。
+
 同一 Engine 的不同工作流共享数据库连接池，各自绑定自己的图。
 
 ## 子图与执行作用域
@@ -87,7 +86,9 @@ JOIN 在同一实例内聚合来源，认领时按作用域入口筛选本次调
 查询所属作用域及其后代中的同名任务，并等待仍可能创建这些任务的上游结束；跨子图进入时，
 通过作用域的 `trigger_task_id` 识别本次调用的外部来源，避免混入其他调用。
 
-组内 JOIN 按当前实例等待；外部入口贡献绑定创建该实例的具体任务，不自动关联不同入口事件。
+组内 JOIN 等待每个必需的前驱名至少有一次成功，忽略已由失败后继接管的历史任务。
+条件分支如果使必需前驱从未创建，JOIN 会持续等待。
+外部入口贡献绑定创建该实例的具体任务，不自动关联不同入口事件。
 多个外部入口是不同子图调用的备选来源，当前实例只等待真实入口对应的贡献；组内必需前驱仍须全部完成。
 父层 JOIN 可收集其子图实例的输出，并等待相关上游生产结束；普通跨出边仍立即继续。
 
@@ -124,8 +125,7 @@ where
     let context: &Ctx = workflow.graph_as::<Ctx>().expect("original context type").context();
     // 创建 run_id 并唤醒调度器，返回时不等待运行结束。
     let run = workflow.submit("entry", input).await?;
-    // 当前为空方法，不返回实际运行状态。
-    run.status().await;
+    println!("submitted run {}", run.run_id);
 
     // 执行期间保持 workflow 存活。
     tokio::signal::ctrl_c().await?;
@@ -133,12 +133,11 @@ where
 }
 ```
 
-`submit(entry, input)` 检查节点名并序列化输入，在同一事务内分配 `run_id` 和保存入口任务，
-任务的 `task_type` 使用入口节点声明的类型。
+`submit(entry, input)` 检查节点名并序列化输入，在同一事务内分配 `run_id` 并保存入口任务。
 入口由每次提交指定，输入需要符合该节点的 `In` 类型。每次提交都是独立运行：
 `workflow_id + run_id` 确定运行身份，后继继承 `run_id`，不同运行的 JOIN 汇合相互隔离。
 选定入口需要能触达后续 JOIN 所需的前驱；多次 submit 不能补齐同一次运行的多个入口。
-RunHandle 保存 `workflow_id`、`run_id` 和入口任务的 `task_id`，`status()` 暂为空实现。
+`RunHandle` 保存 `workflow_id` 和 `run_id`。入口任务的 ID 即 `run_id`。
 提交成功后立即唤醒认领，返回时不等待运行结束。调度器执行当前图下所有已提交及后续
 提交的运行，空闲时持续等待。每个 Workflow 的所有运行共享一个调度器、8 个执行槽和
 1 秒轮询周期，提交不会再创建调度器。
@@ -207,7 +206,7 @@ SQLite 可写文件连接默认启用 WAL 和 5 秒锁等待，未指定 `mode` 
 `mode` 和 `immutable` 参数保持原意。内存及临时数据库使用单连接且不按空闲时间或存活时间回收。
 PostgreSQL 使用最多 10 个连接和 5 秒连接池获取超时。
 
-两个后端均使用引擎自有的 `tasks` / `task_counters` / `scopes` 表，建表 SQL 分别位于
+引擎使用 `tasks` 和 `scopes` 两张表，各自使用数据库生成的整数主键。编号在各自表内唯一，允许跳号。建表 SQL 分别位于
 [`migrations/pgsql/0001_workflow_tasks.sql`](migrations/pgsql/0001_workflow_tasks.sql) 和
 [`migrations/sqlite/0001_workflow_tasks.sql`](migrations/sqlite/0001_workflow_tasks.sql)，由 Engine 幂等执行。
 任务认领、续租、失效认领恢复、后继入队及 JOIN 汇合由内部调度和存储实现负责。
@@ -323,7 +322,7 @@ impl<Ctx: Send> Node<Ctx> for CronEntry {
 `workflow.triggers()` 返回按节点名排序的 `Vec<(&str, Trigger)>`，构图后也可通过
 `graph.triggers()` 读取相同声明。宿主遍历 `(node_id, trigger)` 并完成注册；事件到达后
 调用 `workflow.submit(node_id, payload).await?`，输入需要符合该节点的 `In`。
-每次提交创建独立运行，入口任务保存 `task_type = "event"`，沿现有调度与结算路径执行后继。
+每次提交创建独立运行，入口节点类型取自绑定图，后继沿正常调度与结算路径执行。
 普通节点仍可通过 `submit` 手动启动。
 
 `trigger()` 只读取固定配置，必须无副作用；构图、描述和查询都不会建立监听。
@@ -331,8 +330,6 @@ Event 节点必须返回声明，其他节点必须返回 `None`，成功边和�
 这些规则在 `build()` 时校验；具体触发配置的有效性由宿主注册器校验。
 触发器注册、注销、消息确认和事件去重由宿主管理，`submit` 不提供外部事件去重。
 多个入口的事件各自启动运行，不能用多次提交补齐同一次运行的 JOIN。
-
-SQLite 的 `event` 类型约束适用于新建表；已有数据库中的旧类型约束不会自动升级。
 
 ## 开发
 

@@ -92,8 +92,7 @@ impl Workflow {
         self.wake.notify_one();
         Ok(RunHandle {
             workflow_id: record.workflow_id,
-            run_id: record.run_id.expect("enqueue must assign a run ID"),
-            task_id: record.task_id,
+            run_id: record.task_id,
         })
     }
 }
@@ -103,10 +102,4 @@ impl Workflow {
 pub struct RunHandle {
     pub workflow_id: String,
     pub run_id: i64,
-    pub task_id: i64,
-}
-
-impl RunHandle {
-    /// 查询本次图运行的状态。当前为空实现，不读取存储或返回实际状态。
-    pub async fn status(&self) {}
 }
