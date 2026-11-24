@@ -6,10 +6,11 @@ use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 use super::{SqliteTaskRepo, migrate};
 #[path = "graph_fixture.rs"]
 mod graph_fixture;
+use crate::TaskStore;
 use crate::error::StorageError;
 use crate::graph::{Successor, TaskType};
+use crate::task::ExecutionStore;
 use crate::task::MAX_ATTEMPTS;
-use crate::task::TaskStore;
 use crate::{Task, TaskRecord, TaskStatus};
 use TaskType::{Join, Normal};
 use graph_fixture::graph;
@@ -1022,6 +1023,83 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
         repo.release_claim(&second).await,
         Err(StorageError::ClaimLost { .. })
     ));
+}
+
+#[tokio::test]
+async fn transactional_enqueue_and_claims_follow_the_published_revision() {
+    let id = "published";
+    let nodes = [
+        ("analysis.entry", Normal, Some("analysis")),
+        ("finish", Normal, None),
+    ];
+    let edges = [("analysis.entry", "finish")];
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    migrate(&pool).await.unwrap();
+    let graph = graph(id, &nodes, &edges);
+    let definition = graph.describe();
+    let first = SqliteTaskRepo::for_worker(pool.clone(), graph.clone(), "1", "worker-a");
+    let replacement = SqliteTaskRepo::for_worker(pool.clone(), graph.clone(), "1", "worker-b");
+    let other = SqliteTaskRepo::for_worker(pool.clone(), graph, "2", "worker-a");
+
+    let mut tx = pool.begin().await.unwrap();
+    let run = tx
+        .enqueue(&definition, Some("1"), "analysis.entry", json!(42))
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(first.get(id, run.run_id).await.unwrap().is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM scopes")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let mut tx = pool.begin().await.unwrap();
+    let run = tx
+        .enqueue(&definition, Some("1"), "analysis.entry", json!(42))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(other.executable_workflow_ids(id).await.unwrap().is_empty());
+    assert!(other.claim_many(id, 1).await.unwrap().is_empty());
+    let root = first.claim_many(id, 1).await.unwrap().pop().unwrap();
+    assert_eq!(root.task_id, run.run_id);
+    assert!(root.scope_id.is_some());
+    assert_eq!(root.input, json!(42));
+    for foreign in [&replacement, &other] {
+        assert!(foreign.renew_claim(&root).await.unwrap().is_none());
+        assert!(foreign.release_claim(&root).await.is_err());
+        assert!(foreign.succeed(&root, &json!(1)).await.is_err());
+        assert!(foreign.fail(&root, "foreign claim").await.is_err());
+    }
+
+    first.release_claim(&root).await.unwrap();
+    let recovered = replacement.claim_many(id, 1).await.unwrap().pop().unwrap();
+    assert_eq!(recovered.attempt, root.attempt + 1);
+    assert!(first.fail(&root, "stale claim").await.is_err());
+    replacement
+        .settle_success(&recovered, &json!(42), &[plan("finish", vec![json!(42)])])
+        .await
+        .unwrap();
+    assert!(other.claim_many(id, 1).await.unwrap().is_empty());
+    let child = first.claim_many(id, 1).await.unwrap().pop().unwrap();
+    assert_eq!(child.parent_task_ids, [root.task_id]);
+    assert_eq!(child.run_id, Some(run.run_id));
+    assert_eq!(child.scope_id, None);
+    let owners: Vec<String> = sqlx::query_scalar(
+        "SELECT worker_id FROM tasks WHERE run_id = ? AND revision = '1' ORDER BY task_id",
+    )
+    .bind(run.run_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, ["worker-b", "worker-a"]);
 }
 
 #[tokio::test]

@@ -26,7 +26,7 @@ use crate::{
     backend::sqlite::{SqliteTaskRepo, migrate},
     edge::on_error,
     graph::Successor,
-    task::{TaskStore, store::LEASE_DURATION},
+    task::{ExecutionStore, store::LEASE_DURATION},
 };
 
 struct Context {
@@ -301,12 +301,8 @@ impl Store {
     }
 }
 
-impl TaskStore for Store {
+impl ExecutionStore for Store {
     type Error = io::Error;
-
-    fn enqueue<'a>(&'a self, _: &'a Task) -> BoxFuture<'a, Result<TaskRecord, Self::Error>> {
-        Box::pin(async { unreachable!("run_task does not enqueue directly") })
-    }
 
     fn claim_many<'a>(
         &'a self,

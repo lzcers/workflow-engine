@@ -5,6 +5,9 @@
 CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流标识，用于隔离调度与查询。
     workflow_id TEXT NOT NULL,
+    -- 运行绑定的图版本和最近一次认领的执行实例。
+    revision TEXT,
+    worker_id TEXT,
     -- 工作流运行身份；后继继承源任务的值。
     -- enqueue 未指定时以新任务 ID 创建运行，指定时保留；直接写入的 NULL 在同一工作流内按同组处理。
     run_id INTEGER,
@@ -42,7 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(workflow_id, status, lease_until);
+CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(workflow_id, revision, status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_tasks_recovery ON tasks(status, workflow_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_predecessors ON tasks(workflow_id, run_id, scope_id, name, status);
 

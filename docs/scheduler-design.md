@@ -4,11 +4,11 @@
 `Workflow::submit` 创建独立运行并唤醒认领。`Scheduler::run()` 持续执行，生命周期由所属实例管理。
 
 核心代码：[Scheduler](../src/scheduler.rs)、[Workflow](../src/workflow.rs)、
-[TaskStore](../src/task/store.rs)、[Graph](../src/graph/mod.rs)。
+[TaskStore](../src/task/enqueue.rs)、[ExecutionStore](../src/task/store.rs)、[Graph](../src/graph/mod.rs)。
 
 ## 职责与运行范围
 
-一个 Scheduler 绑定一张固定的 Graph，按 `workflow_id` 认领该图所有运行的任务。
+一个 Scheduler 绑定一张固定的 Graph，按 `workflow_id` 和绑定的 revision 认领任务。
 数据库保存任务和实际来源；调度器只在有空槽时认领，不在内存中维护另一份待执行队列。
 
 | 组件 | 职责 |
@@ -16,7 +16,8 @@
 | `Workflow` | 构造时启动后台调度器、提交入口任务、唤醒认领、随实例释放取消后台任务 |
 | `Scheduler` | 计算空闲槽、批量认领、执行期间续租、调用存储结算及异常释放 |
 | `Graph` | 提供节点与上下文，执行节点钩子和业务逻辑，规划成功或失败后继 |
-| `TaskStore` | 原子创建运行，筛选可认领任务，续租并校验认领归属，原子提交状态与后继 |
+| `TaskStore` | 在事务内创建运行及入口任务 |
+| `ExecutionStore` | 筛选可认领任务，续租并校验认领归属，原子提交状态与后继 |
 | 数据库后端 | 实现依赖与 JOIN 闸门、租约、尝试预算和并发事务控制 |
 
 `run_id` 标识一次提交产生的运行。一次调度循环可以处理同一工作流的多个运行。
@@ -35,8 +36,8 @@
 因此 `make` 必须在 Tokio runtime 内调用。调度器开始认领该图已有的可执行任务，无需先提交新运行。
 每次 `Workflow::submit(entry, input)` 按以下顺序执行：
 
-1. 检查入口节点存在，将输入序列化为 JSON。节点 `In` 类型的反序列化检查留到实际执行阶段。
-2. 根据节点名和输入构造未指定 `run_id` 的 Task，调用 `TaskStore::enqueue`，在同一事务内分配运行身份并保存入口任务。
+1. 将输入序列化为 JSON，传给存储层的 `enqueue`。节点 `In` 类型的反序列化检查留到实际执行阶段。
+2. 存储层依据图描述校验入口节点，在同一事务内分配 run ID、创建子图实例并保存入口任务。
 3. 调用共享 `Notify::notify_one()` 唤醒认领，返回包含 `workflow_id` 和 `run_id` 的 `RunHandle`。
 
 成功返回表示入口任务已持久化并安排执行，不等待节点完成。提交不会创建调度器，
@@ -46,9 +47,7 @@
 宿主从 `Workflow::triggers()` 获取节点名及声明，自行注册触发器并在事件到达时调用 `submit`。
 Scheduler 不注册或监听触发源；已入队的 Event 任务按普通任务认领、执行与结算。
 
-存储统一使用 `enqueue(Task)` 入队：`run_id = None` 时以新任务的 `task_id` 创建独立运行，
-`Some(id)` 时加入指定运行，父任务沿用 Task 的字段，JOIN 的等待条件由图与当前作用域确定。
-任务、运行身份和作用域在同一事务提交。
+控制面可直接在 SQLx 事务上调用 `TaskStore::enqueue` 并自行决定提交时机。入口任务的 `task_id` 同时标识新 run。后继在执行端结算时继承该 run ID 与 revision。
 
 Workflow 持有图与存储的共享句柄，Engine 释放不影响它。执行期间需要保留 Workflow；
 实例释放会通过 `Workflow::drop` 中止后台任务，继而取消调度器的在途任务。
@@ -100,7 +99,7 @@ Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配�
 
 ## 认领与依赖就绪
 
-调度器把 `workflow_id` 和数量上限交给 `TaskStore::claim_many`。
+调度器把 `workflow_id` 和数量上限交给 `ExecutionStore::claim_many`。
 当前 PostgreSQL / SQLite 后端负责筛选待执行或租约已过期的任务、检查依赖和 JOIN
 是否就绪，再原子写入 `running`、初始 300 秒租约及递增后的 `attempt`。
 

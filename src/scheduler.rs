@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::{
     graph::{Graph, Successor},
     node::{NodeContext, NodeError},
-    task::{MAX_ATTEMPTS, TaskRecord, TaskStore, store::LEASE_DURATION},
+    task::{ExecutionStore, MAX_ATTEMPTS, TaskRecord, store::LEASE_DURATION},
 };
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -29,7 +29,7 @@ const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 pub struct Scheduler<Ctx, Store>
 where
     Ctx: NodeContext + Sync + 'static,
-    Store: TaskStore + ?Sized,
+    Store: ExecutionStore + ?Sized,
 {
     store: Arc<Store>,
     graph: Arc<Graph<Ctx>>,
@@ -41,7 +41,7 @@ where
 impl<Ctx, Store> Scheduler<Ctx, Store>
 where
     Ctx: NodeContext + Sync + 'static,
-    Store: TaskStore + Send + ?Sized + 'static,
+    Store: ExecutionStore + Send + ?Sized + 'static,
 {
     /// 由固定的图与共享任务存储构造调度器，按 workflow_id 认领所有运行的任务。
     pub fn new(graph: Arc<Graph<Ctx>>, store: Arc<Store>, poll: Duration) -> Self {
@@ -170,7 +170,7 @@ async fn run_task<Ctx, S>(
     lease_deadline: Instant,
 ) where
     Ctx: NodeContext + Sync + 'static,
-    S: TaskStore + Send + ?Sized + 'static,
+    S: ExecutionStore + Send + ?Sized + 'static,
 {
     if lease_deadline <= Instant::now() {
         warn!("claim lease elapsed before execution");
@@ -224,7 +224,7 @@ fn panic_detail(panic: &Box<dyn std::any::Any + Send>) -> &str {
 }
 
 /// 失权或最后确认的租约到期时返回，使调用方丢弃未结算的业务 future。
-async fn maintain_claim<S: TaskStore + ?Sized>(
+async fn maintain_claim<S: ExecutionStore + ?Sized>(
     store: &S,
     task: &TaskRecord,
     mut deadline: Instant,
@@ -329,7 +329,7 @@ async fn settle<Ctx, S>(
 ) -> Result<(), S::Error>
 where
     Ctx: NodeContext + Sync,
-    S: TaskStore + ?Sized,
+    S: ExecutionStore + ?Sized,
 {
     match outcome {
         ExecutionOutcome::Success {

@@ -153,19 +153,30 @@ where
 
 上述示例使用默认 SQLite 后端，PostgreSQL 使用 `pg` feature 和对应连接 URL。
 
-### PostgreSQL 跨进程执行
+### 从控制面入队，在独立进程执行
 
-控制面和 worker 可分别连接同一个 PostgreSQL 数据库。每个进程启动时调用
-`postgres::initialize(&pool).await`；并发初始化通过数据库事务锁串行执行。
+多机部署使用共享 PostgreSQL，单机进程也可连接同一个 SQLite 文件。进程可以通过 `Database::connect(url)` 建立连接，或用已有 SQLx 连接池构造 `Database::Postgres(pool)`、`Database::Sqlite(pool)`，然后调用 `database.initialize().await` 建表。
 
-- worker 发布 `graph.describe()` 和不可变的 revision，再调用
-  `postgres::worker(pool, graph, revision, worker_id)` 启动同版本任务的认领。
-  宿主持有返回的 `Workflow`，可通过 `is_finished()` 检查后台调度器是否退出。
-- 控制面反序列化已发布的 `GraphDescription`，在自己的 PostgreSQL 事务内
-  调用 `postgres::submit(&mut tx, &description, revision, entry, &input).await`。
-  提交该事务后，其他进程即可认领。调度去重、图版本选择和运行入队可在同一事务完成。
-- 每次运行的入口与后继使用同一 revision；每次认领写入最新的 worker_id。
-  新版本与旧版本可以并行消费各自的任务。旧版本运行尚未完成时需保持对应的 worker 可用。
+控制面读取已发布的图描述，在调用方事务中选择版本并入队。cron 可以在同一事务中推进自己的触发游标。
+
+```rust,ignore
+use workflow_engine::TaskStore;
+
+let mut tx = pool.begin().await?;
+let run = tx.enqueue(&description, Some(revision), entry, input).await?;
+tx.commit().await?;
+```
+
+单独提交时可以直接使用 `database.enqueue(&description, Some(revision), entry, input).await`。两种方式均在存储层分配 run ID 并建立入口节点的子图作用域。
+
+执行进程加载实际的图，登记后用获得的实例 ID 启动执行。
+
+```rust,ignore
+let engine = Engine::from_database(database).with_worker(revision, worker_id);
+let workflow = engine.make(graph);
+```
+
+宿主持有 `Workflow` 以维持调度器生命周期。它只认领匹配工作流和版本的任务，每次认领记录当前实例 ID。运行中的后继继承原版本，旧版本尚有待执行任务时应保留对应的 worker。进程内调用 `Workflow::submit` 也通过同一存储接口入队，并在提交后唤醒本地调度器。
 
 ## 关键机制
 

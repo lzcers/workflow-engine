@@ -7,17 +7,13 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::repo::PgTaskRepo;
+use crate::TaskRecord;
 use crate::error::StorageError;
 use crate::graph::Successor;
-use crate::task::TaskStore;
-use crate::{Task, TaskRecord};
+use crate::task::ExecutionStore;
 
-impl TaskStore for PgTaskRepo {
+impl ExecutionStore for PgTaskRepo {
     type Error = StorageError;
-
-    fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
-        Box::pin(PgTaskRepo::enqueue(self, task))
-    }
 
     fn claim_many<'a>(
         &'a self,

@@ -201,7 +201,7 @@ pub struct PgTaskRepo {
     worker_id: Option<String>,
 }
 
-/// 实现 [`crate::task::TaskStore::claim_many`] 的可执行契约，`wt` 为 `tasks` 别名。
+/// 实现 [`crate::task::ExecutionStore::claim_many`] 的可执行契约，`wt` 为 `tasks` 别名。
 ///
 /// 由认领（[`PgTaskRepo::claim_many`]）与恢复扫描（[`PgTaskRepo::executable_workflow_ids`]）
 /// 认领和恢复共用同一谓词；仅 collecting 需要检查前驱与上游。
@@ -215,7 +215,7 @@ fn executable_where(rules_parameter: &str) -> String {
 }
 
 /// 入口入队与工作流句柄共享同一事务语义，包括深层子图入口的 scope 链。
-pub(super) async fn insert_task_at_path(
+pub(crate) async fn insert_task_at_path(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     task: &Task,
     revision: Option<&str>,

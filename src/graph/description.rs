@@ -119,6 +119,21 @@ impl<Ctx> Graph<Ctx> {
 }
 
 impl GraphDescription {
+    /// 从持久化的图描述解析独立运行入口及其子图路径。
+    pub(crate) fn entry_path(&self, entry: &str) -> Result<Vec<String>, crate::EngineError> {
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.id == entry)
+            .ok_or_else(|| crate::EngineError::UnknownNode(entry.to_owned()))?;
+        self.validate_subgraphs()
+            .map_err(|detail| crate::error::StorageError::InvalidFanout { detail })?;
+        Ok(super::subgraph_path(
+            &self.subgraphs,
+            node.subgraph_id.as_deref(),
+        ))
+    }
+
     /// 校验静态归属以及 foreach 的边界。允许普通边直接连接子图内部节点。
     pub fn validate_subgraphs(&self) -> Result<(), String> {
         let mut groups = HashMap::new();

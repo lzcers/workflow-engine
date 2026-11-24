@@ -155,15 +155,11 @@ async fn published_revision_routes_scoped_runs_and_recovered_claims() {
         &[("analysis.entry", "finish")],
     );
     let mut tx = pool.begin().await.unwrap();
-    let submitted = crate::postgres::submit(
-        &mut tx,
-        &graph.describe(),
-        "v1",
-        "analysis.entry",
-        &json!(1),
-    )
-    .await
-    .unwrap();
+    use crate::TaskStore;
+    let submitted = tx
+        .enqueue(&graph.describe(), Some("v1"), "analysis.entry", json!(1))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let other_version = PgTaskRepo::for_worker(pool.clone(), graph.clone(), "v2", "other");

@@ -1,4 +1,4 @@
-//! [`SqliteTaskRepo`] 直接实现通用引擎 [`crate::task::TaskStore`]。
+//! [`SqliteTaskRepo`] 直接实现通用引擎 [`crate::task::ExecutionStore`]。
 //!
 //! 通过 [`SqliteTaskRepo`] 持久化当前图规划的后继输入，
 //! 不感知任何业务字段。
@@ -7,17 +7,13 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::repo::SqliteTaskRepo;
+use crate::TaskRecord;
 use crate::error::StorageError;
 use crate::graph::Successor;
-use crate::task::TaskStore;
-use crate::{Task, TaskRecord};
+use crate::task::ExecutionStore;
 
-impl TaskStore for SqliteTaskRepo {
+impl ExecutionStore for SqliteTaskRepo {
     type Error = StorageError;
-
-    fn enqueue<'a>(&'a self, task: &'a Task) -> BoxFuture<'a, Result<TaskRecord, StorageError>> {
-        Box::pin(SqliteTaskRepo::enqueue(self, task))
-    }
 
     fn claim_many<'a>(
         &'a self,

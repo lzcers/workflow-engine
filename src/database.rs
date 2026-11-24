@@ -8,7 +8,7 @@ use crate::backend::pgsql::PgTaskRepo;
 use crate::backend::sqlite::SqliteTaskRepo;
 use crate::error::StorageError;
 use crate::graph::ErasedGraph;
-use crate::task::TaskStore;
+use crate::task::ExecutionStore;
 
 /// 工作流存储的共享连接句柄。
 ///
@@ -116,15 +116,27 @@ impl Database {
 
     /// 为一张图创建仓储并共享原始图；不同图的仓储共享当前数据库连接池。
     /// 由 Engine 内部调用，不重新连接或初始化表。
-    pub(crate) fn task_store(
+    pub(crate) fn execution_store(
         &self,
         graph: Arc<dyn ErasedGraph>,
-    ) -> Arc<dyn TaskStore<Error = StorageError> + Send> {
-        match self {
+        worker: Option<&(String, String)>,
+    ) -> Arc<dyn ExecutionStore<Error = StorageError> + Send> {
+        match (self, worker) {
             #[cfg(feature = "pg")]
-            Self::Postgres(pool) => Arc::new(PgTaskRepo::new(pool.clone(), graph)),
+            (Self::Postgres(pool), Some((revision, id))) => {
+                Arc::new(PgTaskRepo::for_worker(pool.clone(), graph, revision, id))
+            }
+            #[cfg(feature = "pg")]
+            (Self::Postgres(pool), None) => Arc::new(PgTaskRepo::new(pool.clone(), graph)),
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => Arc::new(SqliteTaskRepo::new(pool.clone(), graph)),
+            (Self::Sqlite(pool), Some((revision, id))) => Arc::new(SqliteTaskRepo::for_worker(
+                pool.clone(),
+                graph,
+                revision,
+                id,
+            )),
+            #[cfg(feature = "sqlite")]
+            (Self::Sqlite(pool), None) => Arc::new(SqliteTaskRepo::new(pool.clone(), graph)),
         }
     }
 
