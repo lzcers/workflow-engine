@@ -27,8 +27,8 @@ pub mod graph;
 pub mod task;
 pub mod workflow;
 
-pub use database::Database;
+pub use database::{Database, SubmitTask};
 pub use engine::{Engine, EngineError};
 pub use graph::{Graph, JoinNode, Node, NodeContext, NodeError, Trigger};
-pub use task::{Task, TaskRecord, TaskStatus, TaskStore};
+pub use task::{Task, TaskRecord, TaskStatus};
 pub use workflow::{RunHandle, Workflow};

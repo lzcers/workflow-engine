@@ -25,5 +25,4 @@ mod tests;
 mod scheduler_tests;
 
 pub use repo::SqliteTaskRepo;
-pub(crate) use repo::insert_task_at_path;
 pub use schema::migrate;

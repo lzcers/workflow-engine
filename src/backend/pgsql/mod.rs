@@ -31,5 +31,4 @@ mod store;
 mod test_support;
 
 pub use repo::PgTaskRepo;
-pub(crate) use repo::{insert_task_at_path, notify_tasks_ready};
 pub use schema::migrate;

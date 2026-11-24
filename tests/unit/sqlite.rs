@@ -6,12 +6,13 @@ use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 use super::{SqliteTaskRepo, migrate};
 #[path = "graph_fixture.rs"]
 mod graph_fixture;
-use crate::TaskStore;
+use crate::SubmitTask;
+use crate::backend::task_fixture::TaskSeed;
 use crate::error::StorageError;
 use crate::graph::{Successor, TaskType};
 use crate::task::ExecutionStore;
 use crate::task::MAX_ATTEMPTS;
-use crate::{Task, TaskRecord, TaskStatus};
+use crate::{TaskRecord, TaskStatus};
 use TaskType::{Join, Normal};
 use graph_fixture::graph;
 
@@ -30,8 +31,8 @@ async fn memory_repo(
     (pool, repo)
 }
 
-fn new_task(workflow_id: &str, name: &str) -> Task {
-    Task::new(workflow_id, name, json!({}))
+fn new_task(workflow_id: &str, name: &str) -> TaskSeed {
+    TaskSeed::new(workflow_id, name, json!({}))
 }
 
 async fn get(repo: &SqliteTaskRepo, task: &TaskRecord) -> TaskRecord {
@@ -81,7 +82,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     let store = repo.clone();
     let mut input = new_task("workflow", "root");
     input.run_id = Some(42);
-    input.input = json!({"text": "工作流 'quoted'", "nested": [null, true, {"n": 3}]});
+    input.task.input = json!({"text": "工作流 'quoted'", "nested": [null, true, {"n": 3}]});
     let first = store.enqueue(&input).await.unwrap();
 
     migrate(&pool).await.unwrap();
@@ -110,7 +111,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     assert_eq!(other.run_id, Some(other.task_id));
     assert_eq!(first.name, "root");
     assert!(first.parent_task_ids.is_empty());
-    assert_eq!(first.input, input.input);
+    assert_eq!(first.input, input.task.input);
     assert_eq!(first.status, TaskStatus::Pending);
     assert_eq!(first.attempt, 0);
     assert!(first.lease_until.is_none());
@@ -121,7 +122,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         rows.iter().map(|t| t.task_id).collect::<Vec<_>>(),
         [first.task_id, second.task_id]
     );
-    assert_eq!(rows[0].input, input.input);
+    assert_eq!(rows[0].input, input.task.input);
     assert_eq!(rows[0].run_id, Some(42));
     assert_eq!(rows[1].run_id, second.run_id);
     assert!(repo.get("missing", 1).await.unwrap().is_none());
@@ -157,7 +158,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
     }
 
     let scoped = repo
-        .enqueue(&Task {
+        .enqueue(&TaskSeed {
             run_id: first.run_id,
 
             ..new_task("workflow", "analysis.entry")
@@ -165,7 +166,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         .await
         .unwrap();
     for (run_id, scope_id) in [(first.run_id, Some(i64::MAX)), (Some(43), scoped.scope_id)] {
-        let invalid = Task {
+        let invalid = TaskSeed {
             run_id,
             scope_id,
             ..new_task("workflow", "invalid_scope")
@@ -362,7 +363,7 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
     for input in [json!("a"), json!("b")] {
         let mut image = new_task("join", "image");
         image.run_id = Some(1);
-        image.input = input;
+        image.task.input = input;
         images.push(repo.enqueue(&image).await.unwrap());
     }
     let store = repo.clone();
@@ -474,7 +475,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
         ] {
             let mut source = new_task("fanin", "image");
             source.run_id = run_id;
-            source.input = input;
+            source.task.input = input;
             repo.enqueue(&source).await.unwrap();
         }
     }
@@ -746,7 +747,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     child.parent_task_ids = vec![root.task_id];
     let child = repo.enqueue(&child).await.unwrap();
     let join = repo
-        .enqueue(&Task {
+        .enqueue(&TaskSeed {
             run_id: root.run_id,
 
             ..new_task("cascade", "join")
@@ -754,7 +755,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .await
         .unwrap();
     let other_run = repo
-        .enqueue(&Task {
+        .enqueue(&TaskSeed {
             run_id: Some(0),
 
             ..new_task("cascade", "join")
@@ -808,7 +809,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     assert_eq!(get(&repo, &unrelated).await.status, TaskStatus::Pending);
 
     let late = repo
-        .enqueue(&Task {
+        .enqueue(&TaskSeed {
             run_id: root.run_id,
 
             ..new_task("cascade", "late_join")
@@ -847,7 +848,7 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
             child.parent_task_ids = vec![root.task_id];
             targets.push(repo.enqueue(&child).await.unwrap());
             targets.push(
-                repo.enqueue(&Task {
+                repo.enqueue(&TaskSeed {
                     run_id: run_id,
 
                     ..new_task("cascade_runs", "join")
@@ -1026,7 +1027,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
 }
 
 #[tokio::test]
-async fn transactional_enqueue_and_claims_follow_the_published_revision() {
+async fn transactional_submit_and_claims_follow_workflow_and_worker_ownership() {
     let id = "published";
     let nodes = [
         ("analysis.entry", Normal, Some("analysis")),
@@ -1039,17 +1040,16 @@ async fn transactional_enqueue_and_claims_follow_the_published_revision() {
         .await
         .unwrap();
     migrate(&pool).await.unwrap();
+    let other_id = "published-other";
+    let other =
+        SqliteTaskRepo::for_worker(pool.clone(), graph(other_id, &nodes, &edges), "worker-a");
     let graph = graph(id, &nodes, &edges);
-    let definition = graph.describe();
-    let first = SqliteTaskRepo::for_worker(pool.clone(), graph.clone(), "1", "worker-a");
-    let replacement = SqliteTaskRepo::for_worker(pool.clone(), graph.clone(), "1", "worker-b");
-    let other = SqliteTaskRepo::for_worker(pool.clone(), graph, "2", "worker-a");
+    let task = graph.describe().task("analysis.entry", json!(42)).unwrap();
+    let first = SqliteTaskRepo::for_worker(pool.clone(), graph.clone(), "worker-a");
+    let replacement = SqliteTaskRepo::for_worker(pool.clone(), graph, "worker-b");
 
     let mut tx = pool.begin().await.unwrap();
-    let run = tx
-        .enqueue(&definition, Some("1"), "analysis.entry", json!(42))
-        .await
-        .unwrap();
+    let run = tx.submit(task.clone()).await.unwrap();
     tx.rollback().await.unwrap();
     assert!(first.get(id, run.run_id).await.unwrap().is_none());
     assert_eq!(
@@ -1061,13 +1061,16 @@ async fn transactional_enqueue_and_claims_follow_the_published_revision() {
     );
 
     let mut tx = pool.begin().await.unwrap();
-    let run = tx
-        .enqueue(&definition, Some("1"), "analysis.entry", json!(42))
-        .await
-        .unwrap();
+    let run = tx.submit(task).await.unwrap();
     tx.commit().await.unwrap();
-    assert!(other.executable_workflow_ids(id).await.unwrap().is_empty());
-    assert!(other.claim_many(id, 1).await.unwrap().is_empty());
+    assert!(
+        other
+            .executable_workflow_ids(other_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(other.claim_many(other_id, 1).await.unwrap().is_empty());
     let root = first.claim_many(id, 1).await.unwrap().pop().unwrap();
     assert_eq!(root.task_id, run.run_id);
     assert!(root.scope_id.is_some());
@@ -1087,18 +1090,17 @@ async fn transactional_enqueue_and_claims_follow_the_published_revision() {
         .settle_success(&recovered, &json!(42), &[plan("finish", vec![json!(42)])])
         .await
         .unwrap();
-    assert!(other.claim_many(id, 1).await.unwrap().is_empty());
+    assert!(other.claim_many(other_id, 1).await.unwrap().is_empty());
     let child = first.claim_many(id, 1).await.unwrap().pop().unwrap();
     assert_eq!(child.parent_task_ids, [root.task_id]);
     assert_eq!(child.run_id, Some(run.run_id));
     assert_eq!(child.scope_id, None);
-    let owners: Vec<String> = sqlx::query_scalar(
-        "SELECT worker_id FROM tasks WHERE run_id = ? AND revision = '1' ORDER BY task_id",
-    )
-    .bind(run.run_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let owners: Vec<String> =
+        sqlx::query_scalar("SELECT worker_id FROM tasks WHERE run_id = ? ORDER BY task_id")
+            .bind(run.run_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(owners, ["worker-b", "worker-a"]);
 }
 
@@ -1257,7 +1259,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     for n in 1..=4 {
         let mut source = new_task("concurrent_fanin", "worker");
         source.run_id = Some(1);
-        source.input = json!(n);
+        source.task.input = json!(n);
         repo_a.enqueue(&source).await.unwrap();
     }
     let sources = repo_a.claim_many("concurrent_fanin", 4).await.unwrap();

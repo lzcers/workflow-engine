@@ -4,3 +4,7 @@
 pub mod pgsql;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+#[cfg(test)]
+#[path = "../../tests/unit/task_fixture.rs"]
+pub(crate) mod task_fixture;

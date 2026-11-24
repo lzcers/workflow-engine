@@ -29,12 +29,9 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 `NodeContext`，`fork` 接收 `&TaskRecord`，不依赖数据库任务类型。`TaskStatus` 使用枚举，序列化为
 `pending`、`collecting`、`running`、`succeeded`、`failed`、`skipped`、`superseded`；数据库中的未知状态
 会返回解码错误。任务模型由两个后端共享。
-`Task` 表示待入队内容，`TaskRecord` 表示带身份、状态和结果的任务快照。
-`Task::new(workflow_id, name, input)` 默认创建独立运行入口，每条任务最多执行业务 3 次。
-入队前可设置 `run_id`、`scope_id` 和 `parent_task_ids`。
-节点类型、静态子图路径与前驱定义统一从绑定图查询；任务输入不重复携带这些静态定义。
-存储统一通过 `enqueue` 入队：未指定 `run_id` 时使用新任务 ID，指定时保留该运行身份。
-业务侧通过 `Workflow::submit` 提交运行，在节点上下文和生命周期回调中读取当前任务。
+`Task` 表示独立运行的入口，包含 `workflow_id`、节点名、输入和子图路径。根节点用 `Task::new(workflow_id, name, input)`，图描述的 `task(entry, input)` 可为任意已注册节点解析路径。
+`Database::submit(task)` 将入口持久化，以新任务 ID 作为 `run_id`。执行端结算时，后继继承该运行 ID。
+`TaskRecord` 是带身份、状态和结果的任务快照。业务侧可以在节点上下文和生命周期回调中读取当前任务。每条任务最多执行业务 3 次。
 
 `parent_task_ids` 按贡献顺序记录实际来源，入口为空。普通后继每条输入对应一个新任务。
 任务终态与后继创建在同一事务提交，认领代次阻止重复结算。
@@ -157,26 +154,35 @@ where
 
 多机部署使用共享 PostgreSQL，单机进程也可连接同一个 SQLite 文件。进程可以通过 `Database::connect(url)` 建立连接，或用已有 SQLx 连接池构造 `Database::Postgres(pool)`、`Database::Sqlite(pool)`，然后调用 `database.initialize().await` 建表。
 
-控制面读取已发布的图描述，在调用方事务中选择版本并入队。cron 可以在同一事务中推进自己的触发游标。
+每个 `workflow_id` 对应一个不可变定义。向根节点提交独立运行时，只需构造一个任务。
 
 ```rust,ignore
-use workflow_engine::TaskStore;
+use workflow_engine::Task;
+
+let run = database.submit(Task::new(workflow_id, "start", input)).await?;
+```
+
+控制面接受用户选择的节点时，可用 `description.task(entry, input)?` 校验节点并填好子图路径，再将这个任务交给存储。存储分配 run ID，并为子图入口创建运行时的作用域。
+
+cron 需要同时记录本次触发已处理。通过 `SubmitTask` 可以在已有 SQLx 事务中提交同一个任务，随后推进游标并一起提交。
+
+```rust,ignore
+use workflow_engine::SubmitTask;
 
 let mut tx = pool.begin().await?;
-let run = tx.enqueue(&description, Some(revision), entry, input).await?;
+let run = tx.submit(task).await?;
+advance_schedule(&mut tx, next_at).await?;
 tx.commit().await?;
 ```
 
-单独提交时可以直接使用 `database.enqueue(&description, Some(revision), entry, input).await`。两种方式均在存储层分配 run ID 并建立入口节点的子图作用域。
-
-执行进程加载实际的图，登记后用获得的实例 ID 启动执行。
+执行进程加载实际的图，使用登记时取得的实例 ID 启动调度器。
 
 ```rust,ignore
-let engine = Engine::from_database(database).with_worker(revision, worker_id);
+let engine = Engine::from_database(database).with_worker(worker_id);
 let workflow = engine.make(graph);
 ```
 
-宿主持有 `Workflow` 以维持调度器生命周期。它只认领匹配工作流和版本的任务，每次认领记录当前实例 ID。运行中的后继继承原版本，旧版本尚有待执行任务时应保留对应的 worker。进程内调用 `Workflow::submit` 也通过同一存储接口入队，并在提交后唤醒本地调度器。
+宿主持有 `Workflow` 以维持调度器生命周期。每个调度器认领本图 `workflow_id` 下的任务，并在每次认领时记录实例 ID。工作流变化时使用新的 ID，旧 ID 的运行由旧 worker 完成。进程内的 `Workflow::submit` 使用同一存储入口，并在提交后唤醒本地调度器。
 
 ## 关键机制
 

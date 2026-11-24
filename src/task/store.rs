@@ -10,6 +10,14 @@ use serde_json::Value;
 use super::TaskRecord;
 use crate::{error::StorageError, graph::Successor};
 
+/// 在当前事务中持久化输入已确定的独立入口任务。
+pub(crate) trait TaskStore {
+    fn enqueue(
+        &mut self,
+        task: super::Task,
+    ) -> impl std::future::Future<Output = Result<TaskRecord, StorageError>> + Send;
+}
+
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
 

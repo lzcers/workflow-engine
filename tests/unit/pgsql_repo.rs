@@ -6,13 +6,14 @@ use sqlx::postgres::PgListener;
 use super::super::test_support::connect_test;
 use super::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR};
 use super::{PgTaskRepo, TASK_READY_CHANNEL};
+use crate::backend::task_fixture::TaskSeed;
 use crate::error::StorageError;
 use crate::graph::{
     Successor,
     TaskType::{Event, Join, Normal},
 };
 use crate::task::MAX_ATTEMPTS;
-use crate::{Task, TaskRecord, TaskStatus};
+use crate::{TaskRecord, TaskStatus};
 
 #[path = "graph_fixture.rs"]
 mod graph_fixture;
@@ -78,18 +79,18 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
             &[("root", "child"), ("root", "analysis.entry")],
         ),
     );
-    let task = Task::new(workflow_id, "root", json!({"input": 1}));
+    let task = TaskSeed::new(workflow_id, "root", json!({"input": 1}));
     let first = repo.enqueue(&task).await.unwrap();
     let second = repo.enqueue(&task).await.unwrap();
     assert_eq!(first.run_id, Some(first.task_id));
     assert_eq!(second.run_id, Some(second.task_id));
     assert_ne!(first.run_id, second.run_id);
 
-    let child = Task {
+    let child = TaskSeed {
         run_id: first.run_id,
         scope_id: None,
         parent_task_ids: vec![first.task_id],
-        ..Task::new(workflow_id, "child", json!({"input": 2}))
+        ..TaskSeed::new(workflow_id, "child", json!({"input": 2}))
     };
     let inserted = repo.enqueue(&child).await.unwrap();
     let stored = repo
@@ -99,16 +100,16 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
         .unwrap();
     assert_eq!(stored.run_id, first.run_id);
     assert_eq!(stored.scope_id, child.scope_id);
-    assert_eq!(stored.name, child.name);
+    assert_eq!(stored.name, child.task.name);
     assert_eq!(stored.parent_task_ids, child.parent_task_ids);
-    assert_eq!(stored.input, child.input);
+    assert_eq!(stored.input, child.task.input);
     assert_eq!(stored.status, TaskStatus::Pending);
     assert_eq!(stored.attempt, 0);
 
     let scoped = repo
-        .enqueue(&Task {
+        .enqueue(&TaskSeed {
             run_id: first.run_id,
-            ..Task::new(workflow_id, "analysis.entry", json!("item"))
+            ..TaskSeed::new(workflow_id, "analysis.entry", json!("item"))
         })
         .await
         .unwrap();
@@ -127,10 +128,10 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
         (first.run_id, Some(i64::MAX)),
         (second.run_id, scoped.scope_id),
     ] {
-        let invalid = Task {
+        let invalid = TaskSeed {
             run_id,
             scope_id,
-            ..Task::new(workflow_id, "invalid_scope", json!({}))
+            ..TaskSeed::new(workflow_id, "invalid_scope", json!({}))
         };
         assert!(matches!(
             repo.enqueue(&invalid).await,
@@ -140,7 +141,7 @@ async fn enqueue_creates_independent_runs_or_preserves_explicit_task_fields() {
 }
 
 #[tokio::test]
-async fn published_revision_routes_scoped_runs_and_recovered_claims() {
+async fn submitted_tasks_follow_workflow_and_worker_ownership() {
     let Some(database) = connect_test().await else {
         return;
     };
@@ -155,23 +156,20 @@ async fn published_revision_routes_scoped_runs_and_recovered_claims() {
         &[("analysis.entry", "finish")],
     );
     let mut tx = pool.begin().await.unwrap();
-    use crate::TaskStore;
-    let submitted = tx
-        .enqueue(&graph.describe(), Some("v1"), "analysis.entry", json!(1))
-        .await
-        .unwrap();
+    use crate::SubmitTask;
+    let task = graph.describe().task("analysis.entry", json!(1)).unwrap();
+    let submitted = tx.submit(task).await.unwrap();
     tx.commit().await.unwrap();
 
-    let other_version = PgTaskRepo::for_worker(pool.clone(), graph.clone(), "v2", "other");
-    let first = PgTaskRepo::for_worker(pool.clone(), graph.clone(), "v1", "first");
-    let replacement = PgTaskRepo::for_worker(pool.clone(), graph, "v1", "replacement");
-    assert!(
-        other_version
-            .claim_many(workflow_id, 1)
-            .await
-            .unwrap()
-            .is_empty()
+    let other_id = "distributed-other";
+    let other = PgTaskRepo::for_worker(
+        pool.clone(),
+        graph_fixture::graph(other_id, &[("analysis.entry", Normal, None)], &[]),
+        "first",
     );
+    let first = PgTaskRepo::for_worker(pool.clone(), graph.clone(), "first");
+    let replacement = PgTaskRepo::for_worker(pool.clone(), graph, "replacement");
+    assert!(other.claim_many(other_id, 1).await.unwrap().is_empty());
     let root = first
         .claim_many(workflow_id, 1)
         .await
@@ -180,8 +178,8 @@ async fn published_revision_routes_scoped_runs_and_recovered_claims() {
         .unwrap();
     assert_eq!(root.run_id, Some(submitted.run_id));
     assert!(root.scope_id.is_some());
-    // Even a copy of the current claim cannot be used by a different worker or revision.
-    for foreign in [&replacement, &other_version] {
+    // Even a copy of the current claim cannot be used by a different worker or workflow.
+    for foreign in [&replacement, &other] {
         assert!(foreign.renew_claim(&root).await.unwrap().is_none());
         assert!(foreign.release_claim(&root).await.is_err());
         assert!(foreign.succeed(&root, &json!(1)).await.is_err());
@@ -199,13 +197,7 @@ async fn published_revision_routes_scoped_runs_and_recovered_claims() {
         .succeed_and_enqueue(&recovered, &json!(1), &[plan("finish", vec![json!(1)])])
         .await
         .unwrap();
-    assert!(
-        other_version
-            .claim_many(workflow_id, 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(other.claim_many(other_id, 1).await.unwrap().is_empty());
     let child = first
         .claim_many(workflow_id, 1)
         .await
@@ -214,13 +206,12 @@ async fn published_revision_routes_scoped_runs_and_recovered_claims() {
         .unwrap();
     assert_eq!(child.run_id, root.run_id);
     assert_eq!(child.scope_id, None);
-    let workers: Vec<String> = sqlx::query_scalar(
-        "SELECT worker_id FROM tasks WHERE run_id=$1 AND revision='v1' ORDER BY task_id",
-    )
-    .bind(submitted.run_id)
-    .fetch_all(pool)
-    .await
-    .unwrap();
+    let workers: Vec<String> =
+        sqlx::query_scalar("SELECT worker_id FROM tasks WHERE run_id=$1 ORDER BY task_id")
+            .bind(submitted.run_id)
+            .fetch_all(pool)
+            .await
+            .unwrap();
     assert_eq!(workers, ["replacement", "first"]);
 }
 
@@ -247,14 +238,11 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
             ],
         ),
     );
-    repo.enqueue(&Task {
-        workflow_id: workflow_id.to_string(),
-        run_id: None,
-        scope_id: None,
-        name: "image_prompt".to_string(),
-        parent_task_ids: vec![],
-        input: json!({"prompts": ["a", "b"]}),
-    })
+    repo.enqueue(&TaskSeed::new(
+        workflow_id,
+        "image_prompt",
+        json!({"prompts": ["a", "b"]}),
+    ))
     .await
     .unwrap();
     let source = repo.claim_many(workflow_id, 5).await.unwrap().remove(0);
@@ -337,7 +325,7 @@ async fn normal_fanout_creates_each_input_independently() {
         let mut previous = vec![];
         for _ in 0..2 {
             let root = repo
-                .enqueue(&Task::new(&workflow_id, "root", json!({})))
+                .enqueue(&TaskSeed::new(&workflow_id, "root", json!({})))
                 .await
                 .unwrap();
             let claims = repo.claim_many(&workflow_id, 20).await.unwrap();
@@ -464,14 +452,11 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         ),
     );
     // 有后继：superseded + 后继入队，并保留源任务。
-    repo.enqueue(&Task {
-        workflow_id: workflow_id.to_string(),
-        run_id: None,
-        scope_id: None,
-        name: "commit_scene".to_string(),
-        parent_task_ids: vec![],
-        input: json!({"proposal": {}}),
-    })
+    repo.enqueue(&TaskSeed::new(
+        workflow_id,
+        "commit_scene",
+        json!({"proposal": {}}),
+    ))
     .await
     .unwrap();
     let retried = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
@@ -500,14 +485,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
 
     // 无后继：failed。
     let failed = repo
-        .enqueue(&Task {
-            workflow_id: workflow_id.to_string(),
-            run_id: None,
-            scope_id: None,
-            name: "audio_generate".to_string(),
-            parent_task_ids: vec![],
-            input: json!({}),
-        })
+        .enqueue(&TaskSeed::new(workflow_id, "audio_generate", json!({})))
         .await
         .unwrap();
     let failed = repo
@@ -524,17 +502,14 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         ("other_run", retried.run_id, true),
     ] {
         let dependent = repo
-            .enqueue(&Task {
-                workflow_id: workflow_id.to_string(),
+            .enqueue(&TaskSeed {
                 run_id,
-                scope_id: None,
-                name: name.to_string(),
                 parent_task_ids: if is_join {
                     vec![]
                 } else {
                     vec![failed.task_id]
                 },
-                input: json!({}),
+                ..TaskSeed::new(workflow_id, name, json!({}))
             })
             .await
             .unwrap();
@@ -602,16 +577,9 @@ async fn releasing_a_claim_stays_in_its_workflow() {
         graph("release_other", &[("narration", Normal, None)], &[]),
     );
     async fn enqueue(repo: &PgTaskRepo, workflow_id: &str) -> TaskRecord {
-        repo.enqueue(&Task {
-            workflow_id: workflow_id.to_string(),
-            run_id: None,
-            scope_id: None,
-            name: "narration".to_string(),
-            parent_task_ids: vec![],
-            input: json!({}),
-        })
-        .await
-        .unwrap()
+        repo.enqueue(&TaskSeed::new(workflow_id, "narration", json!({})))
+            .await
+            .unwrap()
     }
     let ours = enqueue(&repo, "release_ours").await;
     let other = enqueue(&other_repo, "release_other").await;
@@ -679,7 +647,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
         )
     };
     async fn insert_task(repo: &PgTaskRepo, workflow_id: &str, name: &str) -> TaskRecord {
-        repo.enqueue(&Task::new(workflow_id, name, json!({})))
+        repo.enqueue(&TaskSeed::new(workflow_id, name, json!({})))
             .await
             .unwrap()
     }
@@ -695,7 +663,7 @@ async fn executable_workflow_ids_only_returns_claimable_sessions() {
     let blocked = "exec_sess_blocked";
     let blocked_repo = repository(blocked);
     let dep = insert_task(&blocked_repo, blocked, "commit_scene").await;
-    let mut join = Task::new(blocked, "collect", json!({}));
+    let mut join = TaskSeed::new(blocked, "collect", json!({}));
     join.run_id = dep.run_id;
     blocked_repo.enqueue(&join).await.unwrap();
     assert_eq!(blocked_repo.claim_many(blocked, 5).await.unwrap().len(), 1);
@@ -756,7 +724,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
             &[],
         ),
     );
-    let input = Task::new(workflow_id, "source", json!({}));
+    let input = TaskSeed::new(workflow_id, "source", json!({}));
     let root = repo.enqueue(&input).await.unwrap();
     for _ in 1..MAX_ATTEMPTS {
         let previous = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
@@ -833,9 +801,9 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
             &[("source", "dependent")],
         ),
     );
-    let input = Task::new("zero-budget", "source", json!({}));
+    let input = TaskSeed::new("zero-budget", "source", json!({}));
     let zero = zero_repo.enqueue(&input).await.unwrap();
-    let mut child = Task::new("zero-budget", "dependent", json!({}));
+    let mut child = TaskSeed::new("zero-budget", "dependent", json!({}));
     child.run_id = zero.run_id;
     let child = zero_repo.enqueue(&child).await.unwrap();
     for _ in 0..MAX_ATTEMPTS {
@@ -890,14 +858,7 @@ async fn task_ready_notifications_carry_workflow_id() {
 
     // 1) 入队（HTTP 推进根任务）。
     let root = repo
-        .enqueue(&Task {
-            workflow_id: workflow_id.to_string(),
-            run_id: None,
-            scope_id: None,
-            name: "scene_proposal".to_string(),
-            parent_task_ids: vec![],
-            input: json!({}),
-        })
+        .enqueue(&TaskSeed::new(workflow_id, "scene_proposal", json!({})))
         .await
         .unwrap();
     recv_ready(&mut listener, workflow_id).await;
@@ -921,13 +882,9 @@ async fn task_ready_notifications_carry_workflow_id() {
 }
 
 async fn seed(repo: &PgTaskRepo, workflow_id: &str, name: &str, run_id: Option<i64>) -> TaskRecord {
-    repo.enqueue(&Task {
-        workflow_id: workflow_id.into(),
+    repo.enqueue(&TaskSeed {
         run_id,
-        scope_id: None,
-        name: name.into(),
-        parent_task_ids: vec![],
-        input: json!({}),
+        ..TaskSeed::new(workflow_id, name, json!({}))
     })
     .await
     .unwrap()
@@ -982,7 +939,7 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
             database.pool().clone(),
             graph(&workflow_id, &[("root", Normal, None)], &[]),
         );
-        let task = Task::new(&workflow_id, "root", json!({}));
+        let task = TaskSeed::new(&workflow_id, "root", json!({}));
 
         let pending = repo.enqueue(&task).await.unwrap();
         for _ in 0..previous_attempts {
@@ -1042,13 +999,9 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     );
     seed(&repo, workflow_id, "root", Some(7)).await;
     let old = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
-    let mut dependent = Task {
-        workflow_id: workflow_id.into(),
+    let mut dependent = TaskSeed {
         run_id: Some(7),
-        scope_id: None,
-        name: "dependent".into(),
-        parent_task_ids: vec![],
-        input: json!({}),
+        ..TaskSeed::new(workflow_id, "dependent", json!({}))
     };
     repo.enqueue(&dependent).await.unwrap();
     sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1 AND task_id = $2")
@@ -1080,7 +1033,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
         .unwrap();
     assert_eq!(settled.output, Some(json!("current")));
     // Releasing one task leaves the other claim valid.
-    dependent.name = "another".into();
+    dependent.task.name = "another".into();
     repo.enqueue(&dependent).await.unwrap();
     let a = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     let b = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);

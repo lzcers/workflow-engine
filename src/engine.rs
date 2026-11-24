@@ -21,7 +21,7 @@ pub enum EngineError {
 /// 默认使用 SQLite，也可通过 `pg` feature 启用 PostgreSQL。
 pub struct Engine {
     database: Database,
-    worker: Option<(String, String)>,
+    worker_id: Option<String>,
 }
 
 impl Engine {
@@ -36,13 +36,13 @@ impl Engine {
     pub fn from_database(database: Database) -> Self {
         Self {
             database,
-            worker: None,
+            worker_id: None,
         }
     }
 
-    /// 为此引擎创建的调度器指定可执行版本和认领任务的实例 ID。
-    pub fn with_worker(mut self, revision: &str, worker_id: &str) -> Self {
-        self.worker = Some((revision.to_owned(), worker_id.to_owned()));
+    /// 指定认领任务时记录的执行实例 ID。
+    pub fn with_worker(mut self, worker_id: &str) -> Self {
+        self.worker_id = Some(worker_id.to_owned());
         self
     }
 
@@ -50,7 +50,7 @@ impl Engine {
     ///
     /// 返回非泛型的 Workflow 句柄，与后台调度器共享原始图对象，保留图访问能力。
     /// 每个调度器按 workflow_id 认领任务。通过 `with_worker` 绑定身份后，
-    /// 它只认领指定版本的任务，并在存储中记录本次认领的实例 ID。
+    /// 存储会记录本次认领的实例 ID。
     /// 创建后即处理存量任务，无需先提交新运行；执行期间需保持返回的 Workflow 存活。
     ///
     /// # Panics
@@ -60,6 +60,6 @@ impl Engine {
     where
         Ctx: NodeContext + Sync + 'static,
     {
-        Workflow::new(graph, self.database.clone(), self.worker.as_ref())
+        Workflow::new(graph, self.database.clone(), self.worker_id.as_deref())
     }
 }

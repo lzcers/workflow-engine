@@ -8,7 +8,8 @@ use crate::backend::pgsql::PgTaskRepo;
 use crate::backend::sqlite::SqliteTaskRepo;
 use crate::error::StorageError;
 use crate::graph::ErasedGraph;
-use crate::task::ExecutionStore;
+use crate::task::{ExecutionStore, store::TaskStore};
+use crate::{RunHandle, Task};
 
 /// 工作流存储的共享连接句柄。
 ///
@@ -20,6 +21,24 @@ pub enum Database {
     Postgres(sqlx::PgPool),
     #[cfg(feature = "sqlite")]
     Sqlite(sqlx::SqlitePool),
+}
+
+/// 在宿主已有的 PostgreSQL 或 SQLite 事务内提交入口任务，由宿主统一提交或回滚。
+pub trait SubmitTask {
+    fn submit(
+        &mut self,
+        task: Task,
+    ) -> impl std::future::Future<Output = Result<RunHandle, StorageError>> + Send;
+}
+
+impl<T: TaskStore + Send> SubmitTask for T {
+    async fn submit(&mut self, task: Task) -> Result<RunHandle, StorageError> {
+        let record = self.enqueue(task).await?;
+        Ok(RunHandle {
+            workflow_id: record.workflow_id,
+            run_id: record.task_id,
+        })
+    }
 }
 
 impl Database {
@@ -114,27 +133,44 @@ impl Database {
         }
     }
 
+    /// 持久化一个独立运行的入口任务，返回已提交的运行身份。
+    pub async fn submit(&self, task: Task) -> Result<RunHandle, StorageError> {
+        match self {
+            #[cfg(feature = "pg")]
+            Self::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                let run = tx.submit(task).await?;
+                tx.commit().await?;
+                Ok(run)
+            }
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(pool) => {
+                let mut tx = pool.begin().await?;
+                let run = tx.submit(task).await?;
+                tx.commit().await?;
+                Ok(run)
+            }
+        }
+    }
+
     /// 为一张图创建仓储并共享原始图；不同图的仓储共享当前数据库连接池。
     /// 由 Engine 内部调用，不重新连接或初始化表。
     pub(crate) fn execution_store(
         &self,
         graph: Arc<dyn ErasedGraph>,
-        worker: Option<&(String, String)>,
+        worker_id: Option<&str>,
     ) -> Arc<dyn ExecutionStore<Error = StorageError> + Send> {
-        match (self, worker) {
+        match (self, worker_id) {
             #[cfg(feature = "pg")]
-            (Self::Postgres(pool), Some((revision, id))) => {
-                Arc::new(PgTaskRepo::for_worker(pool.clone(), graph, revision, id))
+            (Self::Postgres(pool), Some(id)) => {
+                Arc::new(PgTaskRepo::for_worker(pool.clone(), graph, id))
             }
             #[cfg(feature = "pg")]
             (Self::Postgres(pool), None) => Arc::new(PgTaskRepo::new(pool.clone(), graph)),
             #[cfg(feature = "sqlite")]
-            (Self::Sqlite(pool), Some((revision, id))) => Arc::new(SqliteTaskRepo::for_worker(
-                pool.clone(),
-                graph,
-                revision,
-                id,
-            )),
+            (Self::Sqlite(pool), Some(id)) => {
+                Arc::new(SqliteTaskRepo::for_worker(pool.clone(), graph, id))
+            }
             #[cfg(feature = "sqlite")]
             (Self::Sqlite(pool), None) => Arc::new(SqliteTaskRepo::new(pool.clone(), graph)),
         }

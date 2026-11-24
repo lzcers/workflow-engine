@@ -84,26 +84,22 @@ pub struct TaskRecord {
 
 /// 待入队的任务内容；身份、执行状态和结果由引擎写入 [`TaskRecord`]。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     pub workflow_id: String,
-    /// Some(id) 加入指定运行；None 在入队时以新任务的 task_id 创建独立运行。
-    pub run_id: Option<i64>,
-    /// 直接入队的父实例，None 为根作用域。
-    pub scope_id: Option<i64>,
-    /// 来源任务按贡献顺序排列。无父任务且 task_id 等于 run_id 时是独立运行入口。
-    pub parent_task_ids: Vec<i64>,
+    /// 从根到入口所属子图的完整子图 ID，根节点为空。
+    #[serde(default)]
+    pub subgraph_path: Vec<String>,
     pub name: String,
     pub input: Value,
 }
 
 impl Task {
-    /// 创建独立运行入口；节点类型和静态归属由存储从图定义读取。
+    /// 创建根作用域的独立运行入口。子图入口可通过 GraphDescription::task 构造。
     pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             workflow_id: workflow_id.into(),
-            run_id: None,
-            scope_id: None,
-            parent_task_ids: Vec::new(),
+            subgraph_path: Vec::new(),
             name: name.into(),
             input,
         }

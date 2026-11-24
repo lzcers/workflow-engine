@@ -26,14 +26,7 @@ fn repository(database: &Database) -> SqliteTaskRepo {
 }
 
 fn task() -> Task {
-    Task {
-        workflow_id: "connection-check".into(),
-        run_id: Some(1),
-        scope_id: None,
-        parent_task_ids: vec![],
-        name: "start".into(),
-        input: json!({"persisted": true}),
-    }
+    Task::new("connection-check", "start", json!({"persisted": true}))
 }
 
 #[tokio::test]
@@ -49,14 +42,14 @@ async fn memory_and_temporary_urls_keep_tasks_until_shared_close() {
         let database = Database::connect(url).await.unwrap();
         database.initialize().await.unwrap();
         let shared = database.clone();
-        let inserted = repository(&database).enqueue(&task()).await.unwrap();
+        let inserted = database.submit(task()).await.unwrap();
         shared.check().await.unwrap();
         let loaded = repository(&shared)
-            .get(&inserted.workflow_id, inserted.task_id)
+            .get(&inserted.workflow_id, inserted.run_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.input, inserted.input, "{url}");
+        assert_eq!(loaded.input, task().input, "{url}");
         assert_eq!(loaded.status, TaskStatus::Pending);
         database.close().await;
         assert!(shared.check().await.is_err(), "{url}");
@@ -78,18 +71,18 @@ async fn file_urls_persist_tasks_and_respect_explicit_access_modes() {
 
     let database = Database::connect(&url).await.unwrap();
     database.initialize().await.unwrap();
-    let inserted = repository(&database).enqueue(&task()).await.unwrap();
+    let inserted = database.submit(task()).await.unwrap();
     database.close().await;
 
     let database = Database::connect(&format!("{url}?mode=ro")).await.unwrap();
     database.check().await.unwrap();
     let loaded = repository(&database)
-        .get(&inserted.workflow_id, inserted.task_id)
+        .get(&inserted.workflow_id, inserted.run_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(loaded.input, inserted.input);
-    assert!(repository(&database).enqueue(&task()).await.is_err());
+    assert_eq!(loaded.input, task().input);
+    assert!(database.submit(task()).await.is_err());
     database.close().await;
     std::fs::remove_file(path).unwrap();
 }

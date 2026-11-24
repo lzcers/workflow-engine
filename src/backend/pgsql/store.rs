@@ -7,10 +7,65 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::repo::PgTaskRepo;
-use crate::TaskRecord;
+use super::{repo::ROW_COLS, rows::TaskRow, scope};
 use crate::error::StorageError;
 use crate::graph::Successor;
 use crate::task::ExecutionStore;
+use crate::task::scope::ScopeEntries;
+use crate::{Task, TaskRecord, TaskStatus};
+
+/// 入口入队与工作流句柄共享同一事务语义，包括深层子图入口的 scope 链。
+pub(super) async fn insert_task(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: &Task,
+    status: TaskStatus,
+    run_id: Option<i64>,
+    source_scope_id: Option<i64>,
+    parent_task_ids: &[i64],
+) -> Result<TaskRecord, StorageError> {
+    // 子图入口需要在写入作用域时引用即将创建的任务。
+    let task_id: i64 =
+        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('tasks', 'task_id'))")
+            .fetch_one(&mut **tx)
+            .await?;
+    let run_id = Some(run_id.unwrap_or(task_id));
+    let scope_id = scope::route(
+        tx,
+        &task.workflow_id,
+        run_id,
+        source_scope_id,
+        &task.subgraph_path,
+        task_id,
+        false,
+        &mut ScopeEntries::new(),
+    )
+    .await?;
+    let sql = format!(
+        "INSERT INTO tasks
+         (workflow_id, task_id, run_id, name, status, parent_task_ids, input_json, scope_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {ROW_COLS}"
+    );
+    let row = sqlx::query_as::<_, TaskRow>(&sql)
+        .bind(&task.workflow_id)
+        .bind(task_id)
+        .bind(run_id)
+        .bind(&task.name)
+        .bind(status.as_str())
+        .bind(parent_task_ids)
+        .bind(&task.input)
+        .bind(scope_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(row.into())
+}
+
+impl crate::task::store::TaskStore for sqlx::Transaction<'_, sqlx::Postgres> {
+    async fn enqueue(&mut self, task: Task) -> Result<TaskRecord, StorageError> {
+        let record = insert_task(self, &task, TaskStatus::Pending, None, None, &[]).await?;
+        super::repo::notify_tasks_ready(self, &task.workflow_id).await?;
+        Ok(record)
+    }
+}
 
 impl ExecutionStore for PgTaskRepo {
     type Error = StorageError;

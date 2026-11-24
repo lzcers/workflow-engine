@@ -5,12 +5,64 @@
 
 use futures::future::BoxFuture;
 use serde_json::Value;
+use sqlx::types::Json;
 
 use super::repo::SqliteTaskRepo;
-use crate::TaskRecord;
+use super::{repo::ROW_COLS, rows::TaskRow, scope};
 use crate::error::StorageError;
 use crate::graph::Successor;
 use crate::task::ExecutionStore;
+use crate::task::scope::ScopeEntries;
+use crate::{Task, TaskRecord, TaskStatus};
+
+/// Insert the task and allocate its run and scope in the caller's transaction.
+pub(super) async fn insert_task(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task: &Task,
+    status: TaskStatus,
+    run_id: Option<i64>,
+    source_scope_id: Option<i64>,
+    parent_task_ids: &[i64],
+) -> Result<TaskRecord, StorageError> {
+    let task_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tasks (workflow_id,name,status,parent_task_ids,input_json)
+         VALUES (?1,?2,?3,?4,?5) RETURNING task_id",
+    )
+    .bind(&task.workflow_id)
+    .bind(&task.name)
+    .bind(status.as_str())
+    .bind(Json(parent_task_ids))
+    .bind(&task.input)
+    .fetch_one(&mut **tx)
+    .await?;
+    let run_id = Some(run_id.unwrap_or(task_id));
+    let scope_id = scope::route(
+        tx,
+        &task.workflow_id,
+        run_id,
+        source_scope_id,
+        &task.subgraph_path,
+        task_id,
+        false,
+        &mut ScopeEntries::new(),
+    )
+    .await?;
+    let row = sqlx::query_as::<_, TaskRow>(&format!(
+        "UPDATE tasks SET run_id=?1, scope_id=?2 WHERE task_id=?3 RETURNING {ROW_COLS}"
+    ))
+    .bind(run_id)
+    .bind(scope_id)
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(row.into())
+}
+
+impl crate::task::store::TaskStore for sqlx::Transaction<'_, sqlx::Sqlite> {
+    async fn enqueue(&mut self, task: Task) -> Result<TaskRecord, StorageError> {
+        insert_task(self, &task, TaskStatus::Pending, None, None, &[]).await
+    }
+}
 
 impl ExecutionStore for SqliteTaskRepo {
     type Error = StorageError;

@@ -21,8 +21,9 @@ use tokio::{
 };
 
 use super::{Scheduler, run_task};
+use crate::backend::task_fixture::TaskSeed;
 use crate::{
-    Graph, Node, NodeContext, NodeError, Task, TaskRecord, TaskStatus,
+    Graph, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, migrate},
     edge::on_error,
     graph::Successor,
@@ -152,7 +153,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         .unwrap(),
     );
     let repo = SqliteTaskRepo::new(pool.clone(), graph.clone());
-    let input = Task::new("timeout", "pending", json!(41));
+    let input = TaskSeed::new("timeout", "pending", json!(41));
     repo.enqueue(&input).await.unwrap();
     for _ in 1..crate::task::MAX_ATTEMPTS {
         let previous = repo.claim_many("timeout", 1).await.unwrap().remove(0);
@@ -241,7 +242,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
         .unwrap(),
     );
     let repo = SqliteTaskRepo::new(pool.clone(), graph.clone());
-    repo.enqueue(&Task::new("expired", "pending", json!(0)))
+    repo.enqueue(&TaskSeed::new("expired", "pending", json!(0)))
         .await
         .unwrap();
     let claim = repo.claim_many("expired", 1).await.unwrap().remove(0);

@@ -20,7 +20,6 @@ pub struct Workflow {
     graph: Arc<dyn ErasedGraph>,
     description: GraphDescription,
     database: Database,
-    revision: Option<String>,
     worker: JoinHandle<()>,
     wake: Arc<Notify>,
 }
@@ -32,17 +31,13 @@ impl Drop for Workflow {
 }
 
 impl Workflow {
-    pub(crate) fn new<Ctx>(
-        graph: Graph<Ctx>,
-        database: Database,
-        identity: Option<&(String, String)>,
-    ) -> Self
+    pub(crate) fn new<Ctx>(graph: Graph<Ctx>, database: Database, worker_id: Option<&str>) -> Self
     where
         Ctx: NodeContext + Sync + 'static,
     {
         let graph = Arc::new(graph);
         let description = graph.describe();
-        let store = database.execution_store(graph.clone(), identity);
+        let store = database.execution_store(graph.clone(), worker_id);
         let wake = Arc::new(Notify::new());
         let scheduler =
             Scheduler::new(graph.clone(), store, Duration::from_secs(1)).with_wake(wake.clone());
@@ -53,7 +48,6 @@ impl Workflow {
             graph,
             description,
             database,
-            revision: identity.map(|(revision, _)| revision.clone()),
             worker,
             wake,
         }
@@ -92,15 +86,8 @@ impl Workflow {
         entry: &str,
         input: impl Serialize,
     ) -> Result<RunHandle, EngineError> {
-        let run = self
-            .database
-            .enqueue(
-                &self.description,
-                self.revision.as_deref(),
-                entry,
-                serde_json::to_value(input)?,
-            )
-            .await?;
+        let task = self.description.task(entry, serde_json::to_value(input)?)?;
+        let run = self.database.submit(task).await?;
         self.wake.notify_one();
         Ok(run)
     }
