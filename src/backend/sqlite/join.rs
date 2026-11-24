@@ -37,12 +37,12 @@ fn matches_rule(rules: &str, condition: &str) -> String {
                     WHERE p.depth IS NULL OR p.name = t.name
                 ),
                 sources AS (
-                    SELECT r.name, st.status FROM required r JOIN tasks st
+                    SELECT st.status FROM required r LEFT JOIN tasks st
                       ON st.workflow_id = wt.workflow_id AND st.run_id IS wt.run_id
                         AND st.name = r.name AND st.status <> 'superseded'
-                    WHERE st.task_id = r.trigger_task_id OR (
-                        r.trigger_task_id IS NULL AND EXISTS (SELECT 1 FROM local_scopes WHERE scope_id IS st.scope_id)
-                    )
+                        AND (st.task_id = r.trigger_task_id OR (r.trigger_task_id IS NULL AND EXISTS (
+                            SELECT 1 FROM local_scopes WHERE scope_id IS st.scope_id
+                        )))
                 ),
                 upstreams AS (
                     SELECT st.status FROM json_each(rule.value, '$.upstreams') upstream JOIN tasks st
@@ -60,10 +60,7 @@ pub(super) fn ready(rules: &str) -> String {
     let blocked = matches_rule(
         rules,
         r#"EXISTS (SELECT 1 FROM upstreams WHERE status IN ('pending','collecting','running'))
-           OR EXISTS (SELECT 1 FROM required r WHERE NOT EXISTS (
-               SELECT 1 FROM sources s WHERE s.name = r.name AND s.status = 'succeeded'
-           ))
-           OR EXISTS (SELECT 1 FROM sources WHERE status <> 'succeeded')"#,
+           OR EXISTS (SELECT 1 FROM sources WHERE status IS NOT 'succeeded')"#,
     );
     format!("NOT {blocked}")
 }
