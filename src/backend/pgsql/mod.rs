@@ -1,4 +1,4 @@
-//! PostgreSQL 通用工作流实现：把 [`crate::task::ExecutionStore`] 落到 `tasks` 表。
+//! PostgreSQL 通用工作流实现：把 [`crate::task::TaskStore`] 落到 `tasks` 表。
 //!
 //! 本模块由 `pg` feature 启用。模块只依赖通用引擎
 //! （[`crate::task`] / [`crate::graph`]）与**引擎自有 schema**（[`migrate`] 幂等执行）：
@@ -15,7 +15,7 @@
 //!
 //! 子模块划分：
 //! - [`repo`]：[`PgTaskRepo`]，通用 SQL 持久化操作（与业务查询解耦）；
-//! - [`store`]：为 [`PgTaskRepo`] 实现 [`crate::task::ExecutionStore`]；
+//! - [`store`]：为 [`PgTaskRepo`] 实现 [`crate::task::TaskStore`]；
 //! - [`crate::task::record`] / [`rows`]：数据库任务行与公共 [`crate::TaskRecord`]；
 //! - [`schema`]：引擎自有 DDL 与迁移入口。
 

@@ -37,7 +37,7 @@ impl Workflow {
     {
         let graph = Arc::new(graph);
         let description = graph.describe();
-        let store = database.execution_store(graph.clone(), worker_id);
+        let store = database.task_store(graph.clone(), worker_id);
         let wake = Arc::new(Notify::new());
         let scheduler =
             Scheduler::new(graph.clone(), store, Duration::from_secs(1)).with_wake(wake.clone());

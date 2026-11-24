@@ -9,4 +9,4 @@ pub const MAX_ATTEMPTS: i32 = 3;
 
 pub use record::{Task, TaskRecord, TaskStatus};
 pub use scope::ScopeRecord;
-pub(crate) use store::ExecutionStore;
+pub(crate) use store::TaskStore;

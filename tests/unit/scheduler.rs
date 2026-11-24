@@ -27,7 +27,7 @@ use crate::{
     backend::sqlite::{SqliteTaskRepo, migrate},
     edge::on_error,
     graph::Successor,
-    task::{ExecutionStore, store::LEASE_DURATION},
+    task::{TaskStore, store::LEASE_DURATION},
 };
 
 struct Context {
@@ -302,8 +302,16 @@ impl Store {
     }
 }
 
-impl ExecutionStore for Store {
+impl TaskStore for Store {
+    type Database = sqlx::Sqlite;
     type Error = io::Error;
+
+    async fn enqueue(
+        _: &mut sqlx::Transaction<'_, Self::Database>,
+        _: crate::Task,
+    ) -> Result<crate::RunHandle, Self::Error> {
+        unreachable!("run_task receives an existing claim")
+    }
 
     fn claim_many<'a>(
         &'a self,

@@ -1,4 +1,4 @@
-//! [`SqliteTaskRepo`] 直接实现通用引擎 [`crate::task::ExecutionStore`]。
+//! [`SqliteTaskRepo`] 直接实现通用引擎 [`crate::task::TaskStore`]。
 //!
 //! 通过 [`SqliteTaskRepo`] 持久化当前图规划的后继输入，
 //! 不感知任何业务字段。
@@ -11,9 +11,9 @@ use super::repo::SqliteTaskRepo;
 use super::{repo::ROW_COLS, rows::TaskRow, scope};
 use crate::error::StorageError;
 use crate::graph::Successor;
-use crate::task::ExecutionStore;
+use crate::task::TaskStore;
 use crate::task::scope::ScopeEntries;
-use crate::{Task, TaskRecord, TaskStatus};
+use crate::{RunHandle, Task, TaskRecord, TaskStatus};
 
 /// Insert the task and allocate its run and scope in the caller's transaction.
 pub(super) async fn insert_task(
@@ -58,14 +58,20 @@ pub(super) async fn insert_task(
     Ok(row.into())
 }
 
-impl crate::task::store::TaskStore for sqlx::Transaction<'_, sqlx::Sqlite> {
-    async fn enqueue(&mut self, task: Task) -> Result<TaskRecord, StorageError> {
-        insert_task(self, &task, TaskStatus::Pending, None, None, &[]).await
-    }
-}
-
-impl ExecutionStore for SqliteTaskRepo {
+impl TaskStore for SqliteTaskRepo {
+    type Database = sqlx::Sqlite;
     type Error = StorageError;
+
+    async fn enqueue(
+        tx: &mut sqlx::Transaction<'_, Self::Database>,
+        task: Task,
+    ) -> Result<RunHandle, StorageError> {
+        let root = insert_task(tx, &task, TaskStatus::Pending, None, None, &[]).await?;
+        Ok(RunHandle {
+            workflow_id: root.workflow_id,
+            run_id: root.task_id,
+        })
+    }
 
     fn claim_many<'a>(
         &'a self,

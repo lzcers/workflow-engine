@@ -8,7 +8,7 @@ use crate::backend::pgsql::PgTaskRepo;
 use crate::backend::sqlite::SqliteTaskRepo;
 use crate::error::StorageError;
 use crate::graph::ErasedGraph;
-use crate::task::{ExecutionStore, store::TaskStore};
+use crate::task::TaskStore;
 use crate::{RunHandle, Task};
 
 /// 工作流存储的共享连接句柄。
@@ -31,13 +31,17 @@ pub trait SubmitTask {
     ) -> impl std::future::Future<Output = Result<RunHandle, StorageError>> + Send;
 }
 
-impl<T: TaskStore + Send> SubmitTask for T {
+#[cfg(feature = "pg")]
+impl SubmitTask for sqlx::Transaction<'_, sqlx::Postgres> {
     async fn submit(&mut self, task: Task) -> Result<RunHandle, StorageError> {
-        let record = self.enqueue(task).await?;
-        Ok(RunHandle {
-            workflow_id: record.workflow_id,
-            run_id: record.task_id,
-        })
+        <PgTaskRepo as TaskStore>::enqueue(self, task).await
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl SubmitTask for sqlx::Transaction<'_, sqlx::Sqlite> {
+    async fn submit(&mut self, task: Task) -> Result<RunHandle, StorageError> {
+        <SqliteTaskRepo as TaskStore>::enqueue(self, task).await
     }
 }
 
@@ -155,11 +159,11 @@ impl Database {
 
     /// 为一张图创建仓储并共享原始图；不同图的仓储共享当前数据库连接池。
     /// 由 Engine 内部调用，不重新连接或初始化表。
-    pub(crate) fn execution_store(
+    pub(crate) fn task_store(
         &self,
         graph: Arc<dyn ErasedGraph>,
         worker_id: Option<&str>,
-    ) -> Arc<dyn ExecutionStore<Error = StorageError> + Send> {
+    ) -> Arc<dyn TaskStore<Error = StorageError> + Send> {
         match (self, worker_id) {
             #[cfg(feature = "pg")]
             (Self::Postgres(pool), Some(id)) => {

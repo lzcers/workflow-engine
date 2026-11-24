@@ -40,7 +40,7 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
     }
 }
 
-/// Implements the JOIN predecessor/lease gate in [`crate::task::ExecutionStore::claim_many`]
+/// Implements the JOIN predecessor/lease gate in [`crate::task::TaskStore::claim_many`]
 /// for both claim and recovery. Parent IDs record provenance, not execution dependencies.
 fn executable_where(rules_parameter: &str) -> String {
     format!(

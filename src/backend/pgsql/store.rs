@@ -10,9 +10,9 @@ use super::repo::PgTaskRepo;
 use super::{repo::ROW_COLS, rows::TaskRow, scope};
 use crate::error::StorageError;
 use crate::graph::Successor;
-use crate::task::ExecutionStore;
+use crate::task::TaskStore;
 use crate::task::scope::ScopeEntries;
-use crate::{Task, TaskRecord, TaskStatus};
+use crate::{RunHandle, Task, TaskRecord, TaskStatus};
 
 /// 入口入队与工作流句柄共享同一事务语义，包括深层子图入口的 scope 链。
 pub(super) async fn insert_task(
@@ -59,16 +59,21 @@ pub(super) async fn insert_task(
     Ok(row.into())
 }
 
-impl crate::task::store::TaskStore for sqlx::Transaction<'_, sqlx::Postgres> {
-    async fn enqueue(&mut self, task: Task) -> Result<TaskRecord, StorageError> {
-        let record = insert_task(self, &task, TaskStatus::Pending, None, None, &[]).await?;
-        super::repo::notify_tasks_ready(self, &task.workflow_id).await?;
-        Ok(record)
-    }
-}
-
-impl ExecutionStore for PgTaskRepo {
+impl TaskStore for PgTaskRepo {
+    type Database = sqlx::Postgres;
     type Error = StorageError;
+
+    async fn enqueue(
+        tx: &mut sqlx::Transaction<'_, Self::Database>,
+        task: Task,
+    ) -> Result<RunHandle, StorageError> {
+        let root = insert_task(tx, &task, TaskStatus::Pending, None, None, &[]).await?;
+        super::repo::notify_tasks_ready(tx, &task.workflow_id).await?;
+        Ok(RunHandle {
+            workflow_id: root.workflow_id,
+            run_id: root.task_id,
+        })
+    }
 
     fn claim_many<'a>(
         &'a self,

@@ -1,22 +1,15 @@
 //! 引擎统一定义的任务存储契约与后继输入规则。
 //!
-//! 各数据库后端复用本模块的纯数据转换，并通过各自的 SQL、锁与事务落实 [`ExecutionStore`] 契约。
+//! 各数据库后端复用本模块的纯数据转换，并通过各自的 SQL、锁与事务落实 [`TaskStore`] 契约。
 
 use futures::future::BoxFuture;
 use std::time::Duration;
 
 use serde_json::Value;
 
-use super::TaskRecord;
+use super::{Task, TaskRecord};
+use crate::RunHandle;
 use crate::{error::StorageError, graph::Successor};
-
-/// 在当前事务中持久化输入已确定的独立入口任务。
-pub(crate) trait TaskStore {
-    fn enqueue(
-        &mut self,
-        task: super::Task,
-    ) -> impl std::future::Future<Output = Result<TaskRecord, StorageError>> + Send;
-}
 
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
@@ -50,7 +43,7 @@ pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<
     Ok(())
 }
 
-/// 引擎与调度器共用的任务持久化抽象：认领、续租、原子结算和释放认领。
+/// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。
 ///
 /// 每张图绑定独立仓储并共享数据库连接池；仓储共享图的只读查询，负责 JOIN 判断。
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
@@ -58,10 +51,23 @@ pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<
 ///
 /// 认领资格与结算语义由本契约统一规定，后端负责事务实现；结算必须原子提交任务状态
 /// 与全部后继，失败则整体回滚。认领与恢复扫描必须使用一致的可执行性规则。
-pub trait ExecutionStore: Sync {
+pub(crate) trait TaskStore: Sync {
+    /// 入口入队使用调用方的数据库事务；调度器通过仓储实例执行其余操作。
+    type Database: sqlx::Database
+    where
+        Self: Sized;
+
     /// 存储层错误类型：允许不同存储实现定义各自的错误，同时保证引擎层可统一传播
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// 在已有事务中写入独立运行的入口及子图作用域。
+    fn enqueue(
+        tx: &mut sqlx::Transaction<'_, Self::Database>,
+        task: Task,
+    ) -> impl std::future::Future<Output = Result<RunHandle, Self::Error>> + Send
+    where
+        Self: Sized;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
     /// 时返回少于 `limit` 甚至空列表，按任务 ID 排序。`limit` 为 0 时直接返回空列表。
