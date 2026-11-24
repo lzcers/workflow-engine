@@ -27,7 +27,7 @@ mod success;
 pub use builder::{
     EdgeImpl, ErrorWhenBuilder, FailureEdgeImpl, WhenBuilder, foreach, foreach_checked, map,
     map_checked, on_error, on_error_checked, passthrough_checked, when, when_checked, when_error,
-    when_error_checked,
+    when_error_checked, when_error_map_checked, when_map_checked,
 };
 pub use failure::{AnyFailureEdge, FailureEdge};
 pub use success::{AnySuccessEdge, SuccessEdge};

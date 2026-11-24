@@ -24,7 +24,7 @@ pub(crate) fn check_workflow(
     if workflow_id != graph.workflow_id() {
         return Err(StorageError::InvalidFanout {
             detail: format!(
-                "workflow {workflow_id} does not match bound graph {}",
+                "workflow {workflow_id} does not match settlement graph {}",
                 graph.workflow_id()
             ),
         });
@@ -32,9 +32,20 @@ pub(crate) fn check_workflow(
     Ok(())
 }
 
-/// 将前驱贡献合并到 JOIN 的累积对象；同名 key 合为数组，已有数组及新贡献数组按元素追加。
-/// 后端在结算事务内更新尚未认领的 JOIN。
-pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<(), StorageError> {
+/// 在已有 JOIN 输入上按边的输出顺序合并整批贡献。
+pub(crate) fn merge_join_inputs(
+    existing: Option<Value>,
+    inputs: &[Value],
+) -> Result<Value, StorageError> {
+    let mut acc = existing.unwrap_or_else(|| Value::Object(Default::default()));
+    for input in inputs {
+        merge_join_input(&mut acc, input)?;
+    }
+    Ok(acc)
+}
+
+/// 同名 key 合为数组，已有数组及新贡献数组按元素追加。
+fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<(), StorageError> {
     let (Value::Object(acc_map), Value::Object(obj)) = (acc, contribution) else {
         return Err(StorageError::InvalidFanout {
             detail: "JOIN contributions must be JSON objects".into(),
@@ -63,7 +74,7 @@ pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<
 
 /// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。
 ///
-/// 仓储绑定工作流图和可选的 worker 身份，从图中读取 JOIN 规则。
+/// 同一引擎的工作流共用仓储和 worker 身份，认领和结算从调用方的图读取规则。
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
 /// 具体存储实现使用统一的 [`TaskRecord`] 快照，并将操作限制在任务所属的工作流内。
 ///
@@ -74,7 +85,7 @@ pub(crate) trait TaskStore: Sync {
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// 提交当前图的独立入口任务，事务提交成功后返回运行身份。
+    /// 提交已准备好入口路径的独立任务，事务提交成功后返回运行身份。
     fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
@@ -93,7 +104,7 @@ pub(crate) trait TaskStore: Sync {
     /// 后续认领保留该原因，使最终失败处理在崩溃或结算失败后仍可恢复。
     fn claim_many<'a>(
         &'a self,
-        workflow_id: &'a str,
+        graph: &'a dyn ErasedGraph,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>>;
 
@@ -117,6 +128,7 @@ pub(crate) trait TaskStore: Sync {
     /// 依赖永久失败会令已有及晚创建的 JOIN 失败，不影响其他实例。
     fn settle_success<'a>(
         &'a self,
+        graph: &'a dyn ErasedGraph,
         task: &'a TaskRecord,
         output: &'a Value,
         successors: &'a [Successor],
@@ -131,6 +143,7 @@ pub(crate) trait TaskStore: Sync {
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn settle_failure<'a>(
         &'a self,
+        graph: &'a dyn ErasedGraph,
         task: &'a TaskRecord,
         message: &'a str,
         successors: &'a [Successor],

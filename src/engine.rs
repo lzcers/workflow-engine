@@ -1,4 +1,4 @@
-//! 可复用的引擎入口：连接数据库，并为工作流装配存储和调度器。
+//! 可复用的引擎入口：连接数据库，多个工作流共享任务仓储。
 
 use std::sync::Arc;
 
@@ -18,13 +18,13 @@ pub enum EngineError {
     Storage(#[from] StorageError),
 }
 
-/// 可复用的引擎，持有由数据库 URL 选择的共享连接池。
+/// 可复用的引擎，为其创建的所有工作流共享同一个任务仓储。
 ///
 /// 每次 [`Self::make`] 根据图创建独立的 Workflow 和 Scheduler，并立即启动后台调度。
 /// 默认使用 SQLite，也可通过 `pg` feature 启用 PostgreSQL。
 pub struct Engine {
     database: Database,
-    worker_id: Option<Arc<str>>,
+    store: Arc<dyn TaskStore<Error = StorageError> + Send>,
 }
 
 impl Engine {
@@ -37,16 +37,28 @@ impl Engine {
 
     /// 复用宿主已经初始化的存储连接。
     pub fn from_database(database: Database) -> Self {
-        Self {
-            database,
-            worker_id: None,
-        }
+        Self::with_database_worker(database, None)
     }
 
-    /// 指定认领任务时记录的执行实例 ID。
-    pub fn with_worker(mut self, worker_id: &str) -> Self {
-        self.worker_id = Some(Arc::from(worker_id));
-        self
+    fn with_database_worker(database: Database, worker_id: Option<Arc<str>>) -> Self {
+        let store: Arc<dyn TaskStore<Error = StorageError> + Send> = match database.pool() {
+            #[cfg(feature = "pg")]
+            DatabasePool::Postgres(pool) => Arc::new(crate::backend::pgsql::PgTaskRepo::new(
+                pool.clone(),
+                worker_id,
+            )),
+            #[cfg(feature = "sqlite")]
+            DatabasePool::Sqlite(pool) => Arc::new(crate::backend::sqlite::SqliteTaskRepo::new(
+                pool.clone(),
+                worker_id,
+            )),
+        };
+        Self { database, store }
+    }
+
+    /// 指定后续工作流认领任务时记录的执行实例 ID。
+    pub fn with_worker(self, worker_id: &str) -> Self {
+        Self::with_database_worker(self.database, Some(Arc::from(worker_id)))
     }
 
     /// 根据图定义创建工作流实例并启动后台调度器，支持不同上下文类型的图。
@@ -63,21 +75,6 @@ impl Engine {
     where
         Ctx: NodeContext + Sync + 'static,
     {
-        let graph = Arc::new(graph);
-        let store: Arc<dyn TaskStore<Error = StorageError> + Send> = match self.database.pool() {
-            #[cfg(feature = "pg")]
-            DatabasePool::Postgres(pool) => Arc::new(crate::backend::pgsql::PgTaskRepo::new(
-                pool.clone(),
-                graph.clone(),
-                self.worker_id.clone(),
-            )),
-            #[cfg(feature = "sqlite")]
-            DatabasePool::Sqlite(pool) => Arc::new(crate::backend::sqlite::SqliteTaskRepo::new(
-                pool.clone(),
-                graph.clone(),
-                self.worker_id.clone(),
-            )),
-        };
-        Workflow::new(graph, store)
+        Workflow::new(Arc::new(graph), self.store.clone())
     }
 }

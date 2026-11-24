@@ -16,7 +16,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    graph::{Graph, Successor},
+    graph::{ErasedGraph, Graph, Successor},
     node::{NodeContext, NodeError},
     task::{MAX_ATTEMPTS, TaskRecord, TaskStore, store::LEASE_DURATION},
 };
@@ -114,7 +114,7 @@ where
     async fn claim_and_spawn(&self, in_flight: &mut JoinSet<()>, limit: usize) -> usize {
         // 从请求发出时计时，比数据库真正写入租约更早，不受应用与数据库时钟偏差影响。
         let lease_deadline = Instant::now() + LEASE_DURATION;
-        match self.store.claim_many(self.graph.workflow_id(), limit).await {
+        match self.store.claim_many(self.graph.as_ref(), limit).await {
             Ok(tasks) => {
                 let count = tasks.len();
                 if count > 0 {
@@ -178,7 +178,7 @@ async fn run_task<Ctx, S>(
     }
     let work = async {
         let outcome = execute_and_plan(graph.as_ref(), &task).await;
-        settle(store.as_ref(), &task, &outcome).await?;
+        settle(store.as_ref(), graph.as_ref(), &task, &outcome).await?;
         Ok::<_, S::Error>(outcome)
     };
     let lifecycle = async {
@@ -324,6 +324,7 @@ where
 /// 原子提交任务状态与后继；存储再次校验 owner、attempt 和当前有效租约。
 async fn settle<Ctx, S>(
     store: &S,
+    graph: &dyn ErasedGraph,
     task: &TaskRecord,
     outcome: &ExecutionOutcome<Ctx>,
 ) -> Result<(), S::Error>
@@ -334,12 +335,12 @@ where
     match outcome {
         ExecutionOutcome::Success {
             output, successors, ..
-        } => store.settle_success(task, output, successors).await,
+        } => store.settle_success(graph, task, output, successors).await,
         ExecutionOutcome::Failure {
             error, successors, ..
         } => {
             store
-                .settle_failure(task, &error.to_string(), successors)
+                .settle_failure(graph, task, &error.to_string(), successors)
                 .await
         }
     }

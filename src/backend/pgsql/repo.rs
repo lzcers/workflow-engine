@@ -16,7 +16,7 @@ use sqlx::{PgPool, types::Json};
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
-use crate::task::store::{LEASE_DURATION, check_workflow, merge_join_input};
+use crate::task::store::{LEASE_DURATION, check_workflow, merge_join_inputs};
 use crate::{TaskRecord, TaskStatus};
 
 /// 最终失败恢复认领保存的原因，重复恢复时保留第一次记录。
@@ -101,6 +101,9 @@ async fn enqueue_fanouts_in_tx(
         let chain = scope::chain(tx, &source.workflow_id, source.scope_id).await?;
         let mut entries = ScopeEntries::new();
         for plan in fanouts {
+            if plan.inputs.is_empty() {
+                continue;
+            }
             let destination =
                 graph
                     .subgraph_path(plan.dst)
@@ -113,56 +116,104 @@ async fn enqueue_fanouts_in_tx(
                 &destination,
                 plan.new_scope_per_input,
             )?;
-            for input in &plan.inputs {
-                let scope_id = scope::enter(
-                    tx,
-                    &source.workflow_id,
-                    source.run_id,
-                    source.task_id,
-                    parent,
-                    entered,
-                    (!plan.new_scope_per_input).then_some(&mut entries),
-                )
-                .await?;
-                enqueue_input(tx, source, plan, scope_id, input).await?;
+            if plan.new_scope_per_input {
+                for input in &plan.inputs {
+                    let scope_id = scope::enter(
+                        tx,
+                        &source.workflow_id,
+                        source.run_id,
+                        source.task_id,
+                        parent,
+                        entered,
+                        None,
+                    )
+                    .await?;
+                    insert_task(tx, source, plan, scope_id, input).await?;
+                }
+                continue;
+            }
+            let scope_id = scope::enter(
+                tx,
+                &source.workflow_id,
+                source.run_id,
+                source.task_id,
+                parent,
+                entered,
+                Some(&mut entries),
+            )
+            .await?;
+            if plan.initial_status == TaskStatus::Collecting {
+                collect_join(tx, source, plan, scope_id).await?;
+            } else {
+                for input in &plan.inputs {
+                    insert_task(tx, source, plan, scope_id, input).await?;
+                }
             }
         }
     }
     fail_blocked_joins(tx, &source.workflow_id, source.run_id, graph.join_rules()).await
 }
 
-async fn enqueue_input(
+async fn collect_join(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source: &TaskRecord,
+    plan: &Successor,
+    scope_id: Option<i64>,
+) -> Result<(), StorageError> {
+    let existing = sqlx::query_as::<_, (i64, Vec<i64>, Value)>(
+        "SELECT task_id, parent_task_ids, input_json FROM tasks
+         WHERE workflow_id=$1 AND name=$2 AND run_id IS NOT DISTINCT FROM $3
+           AND scope_id IS NOT DISTINCT FROM $4 AND status='collecting'
+         ORDER BY task_id LIMIT 1 FOR UPDATE",
+    )
+    .bind(&source.workflow_id)
+    .bind(plan.dst)
+    .bind(source.run_id)
+    .bind(scope_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((id, mut parents, input)) = existing {
+        if !parents.contains(&source.task_id) {
+            parents.push(source.task_id);
+        }
+        let merged = merge_join_inputs(Some(input), &plan.inputs)?;
+        sqlx::query(
+            "UPDATE tasks SET parent_task_ids=$3, input_json=$4, updated_at=clock_timestamp()
+             WHERE workflow_id=$1 AND task_id=$2",
+        )
+        .bind(&source.workflow_id)
+        .bind(id)
+        .bind(parents)
+        .bind(merged)
+        .execute(&mut **tx)
+        .await?;
+    } else {
+        let merged = merge_join_inputs(None, &plan.inputs)?;
+        insert_task(tx, source, plan, scope_id, &merged).await?;
+    }
+    Ok(())
+}
+
+async fn insert_task(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     source: &TaskRecord,
     plan: &Successor,
     scope_id: Option<i64>,
     input: &Value,
 ) -> Result<(), StorageError> {
-    let existing = if plan.initial_status == TaskStatus::Collecting {
-        sqlx::query_as::<_, TaskRow>(&format!(
-            "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=$1 AND name=$2 AND run_id IS NOT DISTINCT FROM $3 AND scope_id IS NOT DISTINCT FROM $4 AND status = 'collecting' ORDER BY task_id LIMIT 1 FOR UPDATE"
-        )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
-          .fetch_optional(&mut **tx).await?
-    } else {
-        None
-    };
-    if let Some(existing) = existing {
-        let mut parents = existing.parent_task_ids;
-        if !parents.contains(&source.task_id) {
-            parents.push(source.task_id);
-        }
-        let mut input_json = existing.input_json;
-        merge_join_input(&mut input_json, input)?;
-        sqlx::query("UPDATE tasks SET parent_task_ids=$3, input_json=$4, updated_at=clock_timestamp() WHERE workflow_id=$1 AND task_id=$2")
-            .bind(&source.workflow_id).bind(existing.task_id).bind(parents).bind(input_json)
-            .execute(&mut **tx).await?;
-    } else {
-        sqlx::query("INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES ($1,$2,$3,$4,$5,$6,$7)")
-            .bind(&source.workflow_id).bind(source.run_id).bind(plan.dst).bind(plan.initial_status.as_str())
-            .bind(vec![source.task_id]).bind(input).bind(scope_id)
-            .execute(&mut **tx).await?;
-    }
-
+    sqlx::query(
+        "INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(&source.workflow_id)
+    .bind(source.run_id)
+    .bind(plan.dst)
+    .bind(plan.initial_status.as_str())
+    .bind([source.task_id].as_slice())
+    .bind(input)
+    .bind(scope_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -173,6 +224,9 @@ async fn fail_blocked_joins(
     run_id: Option<i64>,
     rules: &HashMap<String, JoinRule>,
 ) -> Result<(), StorageError> {
+    if rules.is_empty() {
+        return Ok(());
+    }
     loop {
         let changed = sqlx::query(&format!(
             "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=clock_timestamp() WHERE wt.workflow_id=$1 AND wt.run_id IS NOT DISTINCT FROM $2 AND wt.status='collecting' AND ({})", join::failed("$3")
@@ -184,21 +238,16 @@ async fn fail_blocked_joins(
     Ok(())
 }
 
-/// 当前工作流的任务仓储，克隆共享连接池和图。
+/// 共享连接池上的任务仓储，可绑定认领任务的 worker 身份。
 #[derive(Clone)]
 pub struct PgTaskRepo {
     pub(super) pool: PgPool,
-    pub(super) graph: Arc<dyn ErasedGraph>,
     worker_id: Option<Arc<str>>,
 }
 
 impl PgTaskRepo {
-    pub fn new(pool: PgPool, graph: Arc<dyn ErasedGraph>, worker_id: Option<Arc<str>>) -> Self {
-        Self {
-            pool,
-            graph,
-            worker_id,
-        }
+    pub fn new(pool: PgPool, worker_id: Option<Arc<str>>) -> Self {
+        Self { pool, worker_id }
     }
 
     /// 先等行锁，再在后续写语句中检查数据库当前时间，避免等锁期间租约已过期。
@@ -206,16 +255,13 @@ impl PgTaskRepo {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         task: &TaskRecord,
-    ) -> Result<TaskRow, StorageError> {
-        if task.workflow_id != self.graph.workflow_id() {
-            return Err(claim_lost(task));
-        }
-        sqlx::query_as::<_, TaskRow>(&format!(
-            "SELECT {ROW_COLS} FROM tasks
+    ) -> Result<Option<i64>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT run_id FROM tasks
          WHERE workflow_id = $1 AND task_id = $2
            AND worker_id IS NOT DISTINCT FROM $3
-         FOR UPDATE"
-        ))
+         FOR UPDATE",
+        )
         .bind(&task.workflow_id)
         .bind(task.task_id)
         .bind(self.worker_id.as_deref())
@@ -239,8 +285,8 @@ impl PgTaskRepo {
         .await?
         .ok_or_else(|| claim_lost(task))?;
         lock_run(tx, &task.workflow_id, run_id).await?;
-        let current = self.lock_task(tx, task).await?;
-        if current.run_id != run_id {
+        let current_run = self.lock_task(tx, task).await?;
+        if current_run != run_id {
             return Err(claim_lost(task));
         }
         Ok(())
@@ -249,11 +295,12 @@ impl PgTaskRepo {
     /// 当前认领成功结算与边界路由、后继入队在同一事务提交。
     pub async fn succeed_and_enqueue(
         &self,
+        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         output: &Value,
         fanouts: &[Successor],
     ) -> Result<TaskRecord, StorageError> {
-        check_workflow(self.graph.as_ref(), &task.workflow_id)?;
+        check_workflow(graph, &task.workflow_id)?;
         // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
         let mut tx = self
             .pool
@@ -262,7 +309,7 @@ impl PgTaskRepo {
         self.lock_settlement(&mut tx, task).await?;
         let settled =
             settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
-        enqueue_fanouts_in_tx(&mut tx, self.graph.as_ref(), &settled, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, graph, &settled, fanouts).await?;
         tx.commit().await?;
         Ok(settled)
     }
@@ -270,11 +317,12 @@ impl PgTaskRepo {
     /// 当前认领先结算，再原子生成失败后继或级联失败；过期执行者没有写权限。
     pub async fn fail_and_enqueue(
         &self,
+        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         error: &str,
         fanouts: &[Successor],
     ) -> Result<(), StorageError> {
-        check_workflow(self.graph.as_ref(), &task.workflow_id)?;
+        check_workflow(graph, &task.workflow_id)?;
         // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
         let mut tx = self
             .pool
@@ -287,7 +335,7 @@ impl PgTaskRepo {
             TaskStatus::Superseded
         };
         let settled = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
-        enqueue_fanouts_in_tx(&mut tx, self.graph.as_ref(), &settled, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, graph, &settled, fanouts).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -356,10 +404,9 @@ impl PgTaskRepo {
     /// 恢复认领保存首次失败原因，允许恢复结算本身在崩溃或事务失败后重试。
     pub async fn claim_many(
         &self,
-        workflow_id: &str,
+        graph: &dyn ErasedGraph,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
-        check_workflow(self.graph.as_ref(), workflow_id)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -392,12 +439,12 @@ impl PgTaskRepo {
             join_ready = join::ready("$6"),
         );
         let mut rows = sqlx::query_as::<_, TaskRow>(&sql)
-            .bind(workflow_id)
+            .bind(graph.workflow_id())
             .bind(LEASE_DURATION.as_secs() as f64)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(LEASE_EXPIRED_ERR)
             .bind(BUDGET_EXHAUSTED_ERR)
-            .bind(Json(self.graph.join_rules()))
+            .bind(Json(graph.join_rules()))
             .bind(self.worker_id.as_deref())
             .fetch_all(&mut *tx)
             .await?;

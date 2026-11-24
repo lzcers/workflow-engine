@@ -402,6 +402,59 @@ async fn waits_for_later_upstream_tasks(url: &str) {
     other_release.add_permits(1);
 }
 
+// Both graphs use the same JOIN name but wait for different predecessors.
+async fn shared_store_uses_each_graphs_join_rules(url: &str) {
+    let engine = Engine::new(url).await.unwrap();
+    let (results, mut receiver) = mpsc::unbounded_channel();
+    let make = |id: &str, entry: &'static str| {
+        let context = Context {
+            task: None,
+            results: results.clone(),
+        };
+        let graph = Graph::builder(id, id, context)
+            .node(entry, pass::<Vec<i32>>())
+            .node("joined", JoinNode)
+            .node("finish", pass::<Value>())
+            .edge(workflow_engine::graph::map(
+                entry,
+                "joined",
+                |values: &Vec<i32>| values.iter().map(|v| json!({"value": v})).collect(),
+            ))
+            .edge(workflow_engine::graph::map(
+                "joined",
+                "finish",
+                |value: &Value| vec![value.clone()],
+            ))
+            .build()
+            .unwrap();
+        engine.make(graph)
+    };
+    let orders = make("shared-orders", "charge");
+    let billing = make("shared-billing", "invoice");
+    orders.submit("charge", [1, 2]).await.unwrap();
+    billing.submit("invoice", [3, 4]).await.unwrap();
+    let mut outputs = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut outputs = Vec::new();
+        while outputs.len() < 2 {
+            let (task, output) = receiver.recv().await.unwrap();
+            if task.name == "finish" {
+                outputs.push((task.workflow_id, output));
+            }
+        }
+        outputs
+    })
+    .await
+    .expect("both graphs must claim their own JOIN");
+    outputs.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        outputs,
+        [
+            ("shared-billing".into(), json!({"value": [3, 4]})),
+            ("shared-orders".into(), json!({"value": [1, 2]})),
+        ]
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_nested_scopes_and_entry_correlation() {
@@ -412,6 +465,7 @@ async fn sqlite_nested_scopes_and_entry_correlation() {
     recover_nested(&url).await;
     waits_for_later_upstream_tasks(&url).await;
     retry_and_recovery_join(&url).await;
+    shared_store_uses_each_graphs_join_rules(&url).await;
     let _ = std::fs::remove_file(path);
 }
 #[cfg(feature = "pg")]
@@ -425,6 +479,7 @@ async fn postgres_nested_scopes_and_entry_correlation() {
     recover_nested(&url).await;
     waits_for_later_upstream_tasks(&url).await;
     retry_and_recovery_join(&url).await;
+    shared_store_uses_each_graphs_join_rules(&url).await;
 }
 
 struct RetryWork(Arc<Semaphore>);

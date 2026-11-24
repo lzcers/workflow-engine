@@ -39,7 +39,7 @@
 #[doc(hidden)]
 pub use crate::edge::{
     foreach_checked, map_checked, on_error_checked, passthrough_checked, when_checked,
-    when_error_checked,
+    when_error_checked, when_error_map_checked, when_map_checked,
 };
 
 /// 声明类型检查的工作流。子图内包含节点、嵌套子图和边；跨边界使用完整点路径。

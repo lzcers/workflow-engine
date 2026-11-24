@@ -26,7 +26,7 @@ use crate::{
     Graph, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, migrate},
     edge::on_error,
-    graph::Successor,
+    graph::{ErasedGraph, Successor},
     task::{TaskStore, store::LEASE_DURATION},
 };
 
@@ -152,14 +152,14 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         .build()
         .unwrap(),
     );
-    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone(), None);
+    let repo = SqliteTaskRepo::new(pool.clone(), None);
     let input = TaskSeed::new("timeout", "pending", json!(41));
-    repo.seed_task(&input).await.unwrap();
+    repo.seed_task(graph.as_ref(), &input).await.unwrap();
     for _ in 1..crate::task::MAX_ATTEMPTS {
-        let previous = repo.claim_many("timeout", 1).await.unwrap().remove(0);
+        let previous = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
         repo.release_claim(&previous).await.unwrap();
     }
-    let claim = repo.claim_many("timeout", 1).await.unwrap().remove(0);
+    let claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
     let claim = set_deadline(
         &pool,
         &repo,
@@ -241,11 +241,14 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
         .build()
         .unwrap(),
     );
-    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone(), None);
-    repo.seed_task(&TaskSeed::new("expired", "pending", json!(0)))
-        .await
-        .unwrap();
-    let claim = repo.claim_many("expired", 1).await.unwrap().remove(0);
+    let repo = SqliteTaskRepo::new(pool.clone(), None);
+    repo.seed_task(
+        graph.as_ref(),
+        &TaskSeed::new("expired", "pending", json!(0)),
+    )
+    .await
+    .unwrap();
+    let claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
     let claim = set_deadline(
         &pool,
         &repo,
@@ -311,7 +314,7 @@ impl TaskStore for Store {
 
     fn claim_many<'a>(
         &'a self,
-        _: &'a str,
+        _: &'a dyn ErasedGraph,
         _: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>> {
         Box::pin(async { unreachable!("run_task receives an existing claim") })
@@ -344,6 +347,7 @@ impl TaskStore for Store {
 
     fn settle_success<'a>(
         &'a self,
+        _: &'a dyn ErasedGraph,
         _: &'a TaskRecord,
         _: &'a Value,
         _: &'a [Successor],
@@ -360,6 +364,7 @@ impl TaskStore for Store {
 
     fn settle_failure<'a>(
         &'a self,
+        _: &'a dyn ErasedGraph,
         _: &'a TaskRecord,
         _: &'a str,
         _: &'a [Successor],

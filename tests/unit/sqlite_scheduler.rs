@@ -111,13 +111,19 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
     .unwrap();
 
     let graph = Arc::new(graph);
-    let repo = SqliteTaskRepo::new(pool, graph.clone(), None);
+    let repo = SqliteTaskRepo::new(pool, None);
     let root = repo
-        .seed_task(&TaskSeed::new("dsl-workflow", "start", json!(0)))
+        .seed_task(
+            graph.as_ref(),
+            &TaskSeed::new("dsl-workflow", "start", json!(0)),
+        )
         .await
         .unwrap();
     let other_root = repo
-        .seed_task(&TaskSeed::new("dsl-workflow", "start", json!(100)))
+        .seed_task(
+            graph.as_ref(),
+            &TaskSeed::new("dsl-workflow", "start", json!(100)),
+        )
         .await
         .unwrap();
     assert_eq!(root.run_id, Some(root.task_id));
@@ -221,12 +227,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .find(|task| task.name == "total")
         .unwrap();
     assert_eq!(other_total.output, Some(json!(316)));
-    assert!(
-        repo.claim_many(graph.workflow_id(), 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(repo.claim_many(graph.as_ref(), 1).await.unwrap().is_empty());
     database.close().await;
 }
 
@@ -258,9 +259,12 @@ async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
     }
     .unwrap();
     let graph = Arc::new(graph);
-    let repo = SqliteTaskRepo::new(pool, graph.clone(), None);
+    let repo = SqliteTaskRepo::new(pool, None);
     let root = repo
-        .seed_task(&TaskSeed::new("nested-fanout", "start", json!(0)))
+        .seed_task(
+            graph.as_ref(),
+            &TaskSeed::new("nested-fanout", "start", json!(0)),
+        )
         .await
         .unwrap();
     let scheduler = Scheduler::new(
@@ -409,9 +413,12 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
         }
         .unwrap();
         let graph = Arc::new(graph);
-        let repo = SqliteTaskRepo::new(pool, graph.clone(), None);
+        let repo = SqliteTaskRepo::new(pool, None);
         let root = repo
-            .seed_task(&TaskSeed::new("scoped-reports", "start", json!(0)))
+            .seed_task(
+                graph.as_ref(),
+                &TaskSeed::new("scoped-reports", "start", json!(0)),
+            )
             .await
             .unwrap();
         let scheduler = Scheduler::new(
@@ -556,9 +563,12 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
         }
         .unwrap();
         let graph = Arc::new(graph);
-        let repo = SqliteTaskRepo::new(pool, graph.clone(), None);
+        let repo = SqliteTaskRepo::new(pool, None);
         let root = repo
-            .seed_task(&TaskSeed::new("external-entry-join", "start", json!(0)))
+            .seed_task(
+                graph.as_ref(),
+                &TaskSeed::new("external-entry-join", "start", json!(0)),
+            )
             .await
             .unwrap();
         let scheduler = Scheduler::new(
@@ -674,8 +684,8 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     }
     .unwrap();
     let graph = Arc::new(graph);
-    let repo = SqliteTaskRepo::new(db.clone(), graph.clone(), None);
-    repo.seed_task(&task).await.unwrap();
+    let repo = SqliteTaskRepo::new(db.clone(), None);
+    repo.seed_task(graph.as_ref(), &task).await.unwrap();
     let wake = Arc::new(Notify::new());
     let scheduler = Scheduler::new(
         graph.clone(),
@@ -704,7 +714,7 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     .expect("scheduler starts the slow node and finishes its next claim");
 
     task.task.name = "fast".into();
-    repo.seed_task(&task).await.unwrap();
+    repo.seed_task(graph.as_ref(), &task).await.unwrap();
     wake.notify_one();
     let started = tokio::time::timeout(Duration::from_secs(5), fast_started.notified()).await;
 

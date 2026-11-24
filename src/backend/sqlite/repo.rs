@@ -18,18 +18,17 @@ use crate::error::StorageError;
 use crate::graph::{ErasedGraph, JoinRule, Successor};
 use crate::{TaskRecord, TaskStatus};
 
-use crate::task::store::{LEASE_DURATION, check_workflow, merge_join_input};
+use crate::task::store::{LEASE_DURATION, check_workflow, merge_join_inputs};
 
 /// Columns suitable for application queries against the same task table.
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
     lease_until, attempt, \
     input_json, output_json, error, created_at, updated_at";
 
-/// SQLite task repository bound to a workflow graph and its worker identity.
+/// SQLite task repository shared across workflow graphs for one worker identity.
 #[derive(Clone)]
 pub struct SqliteTaskRepo {
     pub(super) pool: SqlitePool,
-    pub(super) graph: Arc<dyn ErasedGraph>,
     worker_id: Option<Arc<str>>,
 }
 
@@ -51,6 +50,9 @@ async fn enqueue_fanouts_in_tx(
         let chain = scope::chain(tx, &source.workflow_id, source.scope_id).await?;
         let mut entries = ScopeEntries::new();
         for plan in fanouts {
+            if plan.inputs.is_empty() {
+                continue;
+            }
             let destination =
                 graph
                     .subgraph_path(plan.dst)
@@ -63,56 +65,104 @@ async fn enqueue_fanouts_in_tx(
                 &destination,
                 plan.new_scope_per_input,
             )?;
-            for input in &plan.inputs {
-                let scope_id = scope::enter(
-                    tx,
-                    &source.workflow_id,
-                    source.run_id,
-                    source.task_id,
-                    parent,
-                    entered,
-                    (!plan.new_scope_per_input).then_some(&mut entries),
-                )
-                .await?;
-                enqueue_input(tx, source, plan, scope_id, input).await?;
+            if plan.new_scope_per_input {
+                for input in &plan.inputs {
+                    let scope_id = scope::enter(
+                        tx,
+                        &source.workflow_id,
+                        source.run_id,
+                        source.task_id,
+                        parent,
+                        entered,
+                        None,
+                    )
+                    .await?;
+                    insert_task(tx, source, plan, scope_id, input).await?;
+                }
+                continue;
+            }
+            let scope_id = scope::enter(
+                tx,
+                &source.workflow_id,
+                source.run_id,
+                source.task_id,
+                parent,
+                entered,
+                Some(&mut entries),
+            )
+            .await?;
+            if plan.initial_status == TaskStatus::Collecting {
+                collect_join(tx, source, plan, scope_id).await?;
+            } else {
+                for input in &plan.inputs {
+                    insert_task(tx, source, plan, scope_id, input).await?;
+                }
             }
         }
     }
     fail_blocked_joins(tx, &source.workflow_id, source.run_id, graph.join_rules()).await
 }
 
-async fn enqueue_input(
+async fn collect_join(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source: &TaskRecord,
+    plan: &Successor,
+    scope_id: Option<i64>,
+) -> Result<(), StorageError> {
+    let existing = sqlx::query_as::<_, (i64, Json<Vec<i64>>, Value)>(
+        "SELECT task_id, parent_task_ids, input_json FROM tasks
+         WHERE workflow_id = ?1 AND name = ?2 AND run_id IS ?3 AND scope_id IS ?4
+           AND status = 'collecting' ORDER BY task_id LIMIT 1",
+    )
+    .bind(&source.workflow_id)
+    .bind(plan.dst)
+    .bind(source.run_id)
+    .bind(scope_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((task_id, Json(mut parents), existing_input)) = existing {
+        if !parents.contains(&source.task_id) {
+            parents.push(source.task_id);
+        }
+        let input = merge_join_inputs(Some(existing_input), &plan.inputs)?;
+        sqlx::query(
+            "UPDATE tasks SET parent_task_ids = ?3, input_json = ?4,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE workflow_id = ?1 AND task_id = ?2",
+        )
+        .bind(&source.workflow_id)
+        .bind(task_id)
+        .bind(Json(parents))
+        .bind(input)
+        .execute(&mut **tx)
+        .await?;
+    } else {
+        let input = merge_join_inputs(None, &plan.inputs)?;
+        insert_task(tx, source, plan, scope_id, &input).await?;
+    }
+    Ok(())
+}
+
+async fn insert_task(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     source: &TaskRecord,
     plan: &Successor,
     scope_id: Option<i64>,
     input: &Value,
 ) -> Result<(), StorageError> {
-    let existing = if plan.initial_status == TaskStatus::Collecting {
-        sqlx::query_as::<_, TaskRow>(&format!(
-            "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND name=?2 AND run_id IS ?3 AND scope_id IS ?4 AND status='collecting' ORDER BY task_id LIMIT 1"
-        )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
-          .fetch_optional(&mut **tx).await?
-    } else {
-        None
-    };
-    if let Some(existing) = existing {
-        let mut parents = existing.parent_task_ids;
-        if !parents.contains(&source.task_id) {
-            parents.push(source.task_id);
-        }
-        let mut input_json = existing.input_json;
-        merge_join_input(&mut input_json, input)?;
-        sqlx::query("UPDATE tasks SET parent_task_ids=?3, input_json=?4, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE workflow_id=?1 AND task_id=?2")
-            .bind(&source.workflow_id).bind(existing.task_id).bind(Json(parents)).bind(input_json)
-            .execute(&mut **tx).await?;
-    } else {
-        sqlx::query("INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES (?1,?2,?3,?4,?5,?6,?7)")
-            .bind(&source.workflow_id).bind(source.run_id).bind(plan.dst).bind(plan.initial_status.as_str())
-            .bind(Json([source.task_id])).bind(input).bind(scope_id)
-            .execute(&mut **tx).await?;
-    }
-
+    sqlx::query(
+        "INSERT INTO tasks (workflow_id, run_id, name, status, parent_task_ids, input_json, scope_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(&source.workflow_id)
+    .bind(source.run_id)
+    .bind(plan.dst)
+    .bind(plan.initial_status.as_str())
+    .bind(Json([source.task_id]))
+    .bind(input)
+    .bind(scope_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -123,6 +173,9 @@ async fn fail_blocked_joins(
     run_id: Option<i64>,
     rules: &HashMap<String, JoinRule>,
 ) -> Result<(), StorageError> {
+    if rules.is_empty() {
+        return Ok(());
+    }
     loop {
         let changed = sqlx::query(&format!(
             "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='collecting' AND ({})", join::failed("?3")
@@ -135,23 +188,20 @@ async fn fail_blocked_joins(
 }
 
 impl SqliteTaskRepo {
-    pub fn new(pool: SqlitePool, graph: Arc<dyn ErasedGraph>, worker_id: Option<Arc<str>>) -> Self {
-        Self {
-            pool,
-            graph,
-            worker_id,
-        }
+    pub fn new(pool: SqlitePool, worker_id: Option<Arc<str>>) -> Self {
+        Self { pool, worker_id }
     }
 
     /// Settle only the current, unexpired claim and enqueue successors in the same commit.
     /// Successors inherit the current database run_id and scope_id, including business updates.
     pub async fn succeed_and_enqueue(
         &self,
+        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         output: &Value,
         fanouts: &[Successor],
     ) -> Result<TaskRecord, StorageError> {
-        check_workflow(self.graph.as_ref(), &task.workflow_id)?;
+        check_workflow(graph, &task.workflow_id)?;
         let mut tx = self.pool.begin().await?;
         let settled = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
@@ -175,7 +225,7 @@ impl SqliteTaskRepo {
         .await?
         .ok_or_else(|| claim_lost(task))?;
         let settled = TaskRecord::from(settled);
-        enqueue_fanouts_in_tx(&mut tx, self.graph.as_ref(), &settled, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, graph, &settled, fanouts).await?;
         tx.commit().await?;
         Ok(settled)
     }
@@ -183,11 +233,12 @@ impl SqliteTaskRepo {
     /// Fence the source claim before generating failure successors or cascading failures.
     pub async fn fail_and_enqueue(
         &self,
+        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         error: &str,
         fanouts: &[Successor],
     ) -> Result<(), StorageError> {
-        check_workflow(self.graph.as_ref(), &task.workflow_id)?;
+        check_workflow(graph, &task.workflow_id)?;
         let mut tx = self.pool.begin().await?;
         // Settle first so a failure self-edge creates a fresh pending task instead
         // of merging its retry input into the still-running source task.
@@ -217,7 +268,7 @@ impl SqliteTaskRepo {
         .await?
         .ok_or_else(|| claim_lost(task))?;
         let settled = TaskRecord::from(settled);
-        enqueue_fanouts_in_tx(&mut tx, self.graph.as_ref(), &settled, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, graph, &settled, fanouts).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -228,9 +279,6 @@ impl SqliteTaskRepo {
         &self,
         task: &TaskRecord,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
-        if self.graph.workflow_id() != task.workflow_id {
-            return Ok(None);
-        }
         let mut tx = self.pool.begin().await?;
         let lease_until = sqlx::query_scalar(
             r#"
@@ -257,7 +305,6 @@ impl SqliteTaskRepo {
 
     /// Release only this still-valid claim so another worker may reclaim the task.
     pub async fn release_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
-        check_workflow(self.graph.as_ref(), &task.workflow_id)?;
         let result = sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL,
@@ -285,10 +332,9 @@ impl SqliteTaskRepo {
     /// they never execute the node again. The write transaction serializes competing workers.
     pub async fn claim_many(
         &self,
-        workflow_id: &str,
+        graph: &dyn ErasedGraph,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
-        check_workflow(self.graph.as_ref(), workflow_id)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -317,10 +363,10 @@ impl SqliteTaskRepo {
             RETURNING {ROW_COLS}
             "#
         ))
-        .bind(workflow_id)
+        .bind(graph.workflow_id())
         .bind(LEASE_DURATION.as_secs() as i64)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .bind(Json(self.graph.join_rules()))
+        .bind(Json(graph.join_rules()))
         .bind(self.worker_id.as_deref())
         .fetch_all(&mut *tx)
         .await?;

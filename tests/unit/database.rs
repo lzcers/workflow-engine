@@ -7,20 +7,10 @@ use crate::{
     task::{Task, TaskStatus},
 };
 use serde_json::json;
-#[path = "graph_fixture.rs"]
-mod graph_fixture;
 
 fn repository(database: &Database) -> SqliteTaskRepo {
     match database.pool() {
-        DatabasePool::Sqlite(pool) => SqliteTaskRepo::new(
-            pool.clone(),
-            graph_fixture::graph(
-                "connection-check",
-                &[("start", crate::graph::TaskType::Normal, None)],
-                &[],
-            ),
-            None,
-        ),
+        DatabasePool::Sqlite(pool) => SqliteTaskRepo::new(pool.clone(), None),
         #[cfg(feature = "pg")]
         DatabasePool::Postgres(_) => panic!("SQLite URL must select SQLite"),
     }

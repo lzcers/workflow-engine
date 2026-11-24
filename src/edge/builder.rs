@@ -5,12 +5,8 @@
 //! - 命令式：成功边 [`when`]（返回 [`WhenBuilder`]）/ [`map`] / [`foreach`]，失败边 [`on_error`]（无条件）/
 //!   [`when_error`]（返回 [`ErrorWhenBuilder`]）。类型参数直接来自转换/条件闭包的签名；
 //!   与注册节点的接线一致性由 build 期的类型指纹校验兜底（无编译期检查）。
-//! - 类型检查版（DSL 专用）：[`map_checked`]/[`foreach_checked`]/[`when_checked`]/[`on_error_checked`]/
-//!   [`when_error_checked`]，接收由节点实例推导的 [`NodeKey`]，编译期强制转换函数入参 ==
-//!   上游节点 `Out`（失败边为 `In`）、出参 == 下游节点 `In`；`when`/`when_error` 不接转换时
-//!   用 `.passthrough_checked()` 透传并强制上游输出类型 == 下游输入类型；无条件的成功透传
-//!   用 [`passthrough_checked`]（DSL 裸边语法 `src -> dst`）。
-//! `when(cond)`、`when_error(cond)` 不接转换时用 `.passthrough()` 实现纯透传。成功边与失败边一一对称。
+//! - DSL 的 checked 函数由两端的 [`NodeKey`] 约束条件与转换的签名。透传要求上游载荷
+//!   与目标节点输入同型，转换必须返回目标节点的输入列表。
 
 use std::marker::PhantomData;
 
@@ -118,41 +114,6 @@ impl<SrcOut> WhenBuilder<SrcOut> {
             marker: PhantomData,
         }
     }
-
-    /// 追加成功转换（类型检查版）：条件命中后把输出扇出为 `dst` 输入。
-    ///
-    /// 接收 `dst` 节点的 [`NodeKey`]，编译期强制
-    /// `transform: Fn(&SrcOut) -> Vec<D::In>`——出参必须恰为下游节点输入类型。
-    pub fn map_checked<D, Ctx, F>(
-        self,
-        to: NodeKey<Ctx, D>,
-        transform: F,
-    ) -> EdgeImpl<SrcOut, <D as Node<Ctx>>::In>
-    where
-        D: Node<Ctx>,
-        F: Fn(&SrcOut) -> Vec<<D as Node<Ctx>>::In> + Send + Sync + 'static,
-    {
-        EdgeImpl {
-            src: self.src,
-            dst: to.name(),
-            is_foreach: false,
-            when: Some(self.condition),
-            map: Some(Box::new(transform)),
-            marker: PhantomData,
-        }
-    }
-
-    /// 纯条件边（类型检查版）：条件命中后透传输出作为 `dst` 输入。
-    ///
-    /// 等式约束 `D::In = SrcOut` 编译期强制上游输出类型 == 下游输入类型
-    /// （否则到运行时才以 serde 错误暴露）。
-    pub fn passthrough_checked<D, Ctx>(mut self, to: NodeKey<Ctx, D>) -> EdgeImpl<SrcOut, SrcOut>
-    where
-        D: Node<Ctx, In = SrcOut>,
-    {
-        self.dst = to.name();
-        self.passthrough()
-    }
 }
 
 /// [`when_error`] 的构建器：先声明失败条件，再决定透传或追加转换。对称于 [`WhenBuilder`]。
@@ -189,42 +150,6 @@ impl<SrcIn> ErrorWhenBuilder<SrcIn> {
             marker: PhantomData,
         }
     }
-
-    /// 追加失败转换（类型检查版）：条件命中后把失败输入 + 错误扇出为 `to` 输入。
-    ///
-    /// 接收 `to` 节点的 [`NodeKey`]，编译期强制
-    /// `transform: Fn(&SrcIn, &NodeError) -> Vec<D::In>`——出参必须恰为下游节点输入类型。
-    pub fn map_checked<D, Ctx, F>(
-        self,
-        to: NodeKey<Ctx, D>,
-        transform: F,
-    ) -> FailureEdgeImpl<SrcIn, <D as Node<Ctx>>::In>
-    where
-        D: Node<Ctx>,
-        F: Fn(&SrcIn, &NodeError) -> Vec<<D as Node<Ctx>>::In> + Send + Sync + 'static,
-    {
-        FailureEdgeImpl {
-            src: self.src,
-            dst: to.name(),
-            when: Some(self.condition),
-            map: Some(Box::new(transform)),
-            marker: PhantomData,
-        }
-    }
-
-    /// 纯条件失败边（类型检查版）：条件命中后透传失败输入作为 `to` 输入。
-    ///
-    /// 等式约束 `D::In = SrcIn` 编译期强制上游输入类型 == 下游输入类型。
-    pub fn passthrough_checked<D, Ctx>(
-        mut self,
-        to: NodeKey<Ctx, D>,
-    ) -> FailureEdgeImpl<SrcIn, SrcIn>
-    where
-        D: Node<Ctx, In = SrcIn>,
-    {
-        self.dst = to.name();
-        self.passthrough()
-    }
 }
 
 // ---- 命名建边辅助 ----
@@ -244,26 +169,31 @@ where
     }
 }
 
-/// 成功条件边（类型检查版）：`from` 成功后输出满足 `condition` 才触发 `to`。
-///
-/// 与 [`when`] 的差别：接收 `from` 节点的 [`NodeKey`]，编译期强制
-/// `condition: Fn(&K::Out) -> bool`——条件入参必须恰为上游节点输出类型。
-/// 返回 [`WhenBuilder`]，DSL 再接 `.map_checked()`/`.passthrough_checked()` 完成类型检查。
-pub fn when_checked<K, Ctx, F>(
-    from: NodeKey<Ctx, K>,
-    to: &'static str,
-    condition: F,
-) -> WhenBuilder<<K as Node<Ctx>>::Out>
+/// 成功条件边，透传类型必须与目标输入一致。
+pub fn when_checked<Src, Dst, Ctx>(
+    from: NodeKey<Ctx, Src>,
+    to: NodeKey<Ctx, Dst>,
+    condition: impl Fn(&Src::Out) -> bool + Send + Sync + 'static,
+) -> EdgeImpl<Src::Out, Dst::In>
 where
-    K: Node<Ctx>,
-    F: Fn(&<K as Node<Ctx>>::Out) -> bool + Send + Sync + 'static,
+    Src: Node<Ctx>,
+    Dst: Node<Ctx, In = Src::Out>,
 {
-    WhenBuilder {
-        src: from.name(),
-        dst: to,
-        condition: Box::new(condition),
-        marker: PhantomData,
-    }
+    when(from.name(), to.name(), condition).passthrough()
+}
+
+/// 成功条件边，按两端节点的类型检查转换。
+pub fn when_map_checked<Src, Dst, Ctx>(
+    from: NodeKey<Ctx, Src>,
+    to: NodeKey<Ctx, Dst>,
+    condition: impl Fn(&Src::Out) -> bool + Send + Sync + 'static,
+    transform: impl Fn(&Src::Out) -> Vec<Dst::In> + Send + Sync + 'static,
+) -> EdgeImpl<Src::Out, Dst::In>
+where
+    Src: Node<Ctx>,
+    Dst: Node<Ctx>,
+{
+    when(from.name(), to.name(), condition).map(transform)
 }
 
 /// 成功转换边：`from` 成功后经 `transform` 转换触发 `to`（扇出，空即不继续）。
@@ -302,14 +232,7 @@ where
     K2: Node<Ctx>,
     F: Fn(&<K1 as Node<Ctx>>::Out) -> Vec<<K2 as Node<Ctx>>::In> + Send + Sync + 'static,
 {
-    EdgeImpl {
-        src: from.name(),
-        dst: to.name(),
-        is_foreach: false,
-        when: None,
-        map: Some(Box::new(transform)),
-        marker: PhantomData,
-    }
+    map(from.name(), to.name(), transform)
 }
 
 /// 将数组逐项传给目标子图，每个元素建立独立作用域。
@@ -381,13 +304,7 @@ where
     K2: Node<Ctx>,
     F: Fn(&<K1 as Node<Ctx>>::In, &NodeError) -> Vec<<K2 as Node<Ctx>>::In> + Send + Sync + 'static,
 {
-    FailureEdgeImpl {
-        src: from.name(),
-        dst: to.name(),
-        when: None,
-        map: Some(Box::new(transform)),
-        marker: PhantomData,
-    }
+    on_error(from.name(), to.name(), transform)
 }
 
 /// 失败条件边：`from` 失败且条件命中才触发 `to`。对称于成功边的 [`when`]。
@@ -411,31 +328,35 @@ where
     }
 }
 
-/// 失败条件边（类型检查版）：`from` 失败且条件命中才触发 `to`。对称于 [`when_checked`]。
-///
-/// 与 [`when_error`] 的差别：接收 `from` 节点的 [`NodeKey`]，编译期强制
-/// `condition: Fn(&K::In, &NodeError) -> bool`——条件入参必须恰为失败节点输入类型。
-/// 返回 [`ErrorWhenBuilder`]，DSL 再接 `.map_checked()`/`.passthrough_checked()` 完成类型检查。
-pub fn when_error_checked<K, Ctx, F>(
-    from: NodeKey<Ctx, K>,
-    to: &'static str,
-    condition: F,
-) -> ErrorWhenBuilder<<K as Node<Ctx>>::In>
+/// 失败条件边，透传的失败节点输入必须与目标输入一致。
+pub fn when_error_checked<Src, Dst, Ctx>(
+    from: NodeKey<Ctx, Src>,
+    to: NodeKey<Ctx, Dst>,
+    condition: impl Fn(&Src::In, &NodeError) -> bool + Send + Sync + 'static,
+) -> FailureEdgeImpl<Src::In, Dst::In>
 where
-    K: Node<Ctx>,
-    F: Fn(&<K as Node<Ctx>>::In, &NodeError) -> bool + Send + Sync + 'static,
+    Src: Node<Ctx>,
+    Dst: Node<Ctx, In = Src::In>,
 {
-    ErrorWhenBuilder {
-        src: from.name(),
-        dst: to,
-        condition: Box::new(condition),
-        marker: PhantomData,
-    }
+    when_error(from.name(), to.name(), condition).passthrough()
+}
+
+/// 失败条件边，按两端节点的类型检查错误转换。
+pub fn when_error_map_checked<Src, Dst, Ctx>(
+    from: NodeKey<Ctx, Src>,
+    to: NodeKey<Ctx, Dst>,
+    condition: impl Fn(&Src::In, &NodeError) -> bool + Send + Sync + 'static,
+    transform: impl Fn(&Src::In, &NodeError) -> Vec<Dst::In> + Send + Sync + 'static,
+) -> FailureEdgeImpl<Src::In, Dst::In>
+where
+    Src: Node<Ctx>,
+    Dst: Node<Ctx>,
+{
+    when_error(from.name(), to.name(), condition).map(transform)
 }
 
 /// 成功透传边（类型检查版）：无条件把 `from` 的输出原样喂给 `to`（不剪枝、不转换）。
 ///
-/// 与 [`WhenBuilder::passthrough_checked`] 的差别：无任何条件，`from` 成功即透传。
 /// 等式约束 `K2::In = K1::Out` 编译期强制下游输入类型 == 上游输出类型。
 /// DSL 的裸边语法 `src -> dst,` 展开为本函数。
 pub fn passthrough_checked<K1, K2, Ctx>(

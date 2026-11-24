@@ -185,26 +185,29 @@ fn wire(
             EdgeClause::When {
                 condition,
                 transform,
-            }
-            | EdgeClause::WhenError {
+            } => (
+                false,
+                match transform {
+                    Some(transform) => {
+                        quote! { #engine::dsl::when_map_checked(#source, #target, #condition, #transform) }
+                    }
+                    None => quote! { #engine::dsl::when_checked(#source, #target, #condition) },
+                },
+            ),
+            EdgeClause::WhenError {
                 condition,
                 transform,
-            } => {
-                let failure = matches!(edge.clause, EdgeClause::WhenError { .. });
-                let constructor = if failure {
-                    quote! { #engine::dsl::when_error_checked }
-                } else {
-                    quote! { #engine::dsl::when_checked }
-                };
-                let finish = match transform {
-                    Some(transform) => quote! { map_checked(#target, #transform) },
-                    None => quote! { passthrough_checked(#target) },
-                };
-                (
-                    failure,
-                    quote! { #constructor(#source, #target.name(), #condition).#finish },
-                )
-            }
+            } => (
+                true,
+                match transform {
+                    Some(transform) => {
+                        quote! { #engine::dsl::when_error_map_checked(#source, #target, #condition, #transform) }
+                    }
+                    None => {
+                        quote! { #engine::dsl::when_error_checked(#source, #target, #condition) }
+                    }
+                },
+            ),
         };
         let method = if failure {
             format_ident!("error_edge")

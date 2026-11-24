@@ -31,12 +31,12 @@
 
 ## 实例启动与提交
 
-`Engine::make(graph)` 用当前图及引擎的 worker 身份创建 `TaskStore`，由 Workflow 和 Scheduler 共用，然后启动后台 `scheduler.run()`。
+`Engine::make(graph)` 将当前图和 Engine 共享的任务存储传给 Workflow 与 Scheduler，然后启动后台 `scheduler.run()`。
 因此 `make` 必须在 Tokio runtime 内调用。调度器开始认领该图已有的可执行任务，无需先提交新运行。
 每次 `Workflow::submit(entry, input)` 按以下顺序执行：
 
 1. 将输入序列化为 JSON，从执行图读取入口节点的子图路径并构造 `Task`。节点 `In` 类型的反序列化检查留到实际执行阶段。
-2. 调用当前工作流的 `TaskStore::enqueue(task)`。后端通过 `Database::submit(task)` 在同一事务内分配 run ID、创建子图实例并保存入口任务。
+2. 调用共享任务存储的 `enqueue(task)`。后端通过 `Database::submit(task)` 在同一事务内分配 run ID、创建子图实例并保存入口任务。
 3. 调用共享 `Notify::notify_one()` 唤醒认领，返回包含 `workflow_id` 和 `run_id` 的 `RunHandle`。
 
 成功返回表示入口任务已持久化并安排执行，不等待节点完成。提交不会创建调度器，
@@ -98,7 +98,7 @@ Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配�
 
 ## 认领与依赖就绪
 
-调度器调用 `TaskStore::claim_many(workflow_id, available)`，仓储在指定工作流的全部运行中按空槽数认领。
+调度器向任务存储传入当前图与可用槽数。存储使用图的工作流 ID 限定认领范围，并按图中的 JOIN 规则筛选就绪任务。
 当前 PostgreSQL / SQLite 后端负责筛选待执行或租约已过期的任务、检查依赖和 JOIN
 是否就绪，再原子写入 `running`、初始 300 秒租约及递增后的 `attempt`。
 
@@ -190,7 +190,7 @@ flowchart TD
 
 ### 结算阶段
 
-存储必须在结算事务中再次验证任务状态、`attempt`
+调度器在结算时传入当前图，供存储查询目标子图和 JOIN 规则。存储在结算事务中再次验证任务状态、`attempt`
 以及数据库时间下的租约有效性；旧认领不能提交结果或创建后继。
 仅用于最终失败处理的认领也不能提交成功状态。
 
