@@ -7,7 +7,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::{join, scope};
 use crate::graph::{ErasedGraph, JoinRule, Successor};
-use crate::task::{MAX_ATTEMPTS, scope::ScopeEntries};
+use crate::task::{
+    MAX_ATTEMPTS,
+    scope::{ScopeEntries, route_path},
+};
 use serde_json::Value;
 use sqlx::{PgPool, types::Json};
 
@@ -88,66 +91,76 @@ async fn settle_in_tx(
 
 /// 事务内按子图边界生成后继，JOIN 按运行、实例和节点名累积。
 /// 调用方先获取运行锁，覆盖 JOIN 首次创建的窗口；本方法不自行开事务或提交。
-async fn enqueue_fanout_in_tx(
+async fn enqueue_fanouts_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     graph: &dyn ErasedGraph,
     source: &TaskRecord,
-    plan: &Successor,
-    entries: &mut ScopeEntries,
+    fanouts: &[Successor],
 ) -> Result<(), StorageError> {
-    let is_join = graph.join_rules().contains_key(plan.dst);
-    let destination_path =
-        graph
-            .subgraph_path(plan.dst)
-            .ok_or_else(|| StorageError::InvalidFanout {
-                detail: format!("unknown successor node {}", plan.dst),
-            })?;
-    if plan.new_scope_per_input && is_join {
-        return Err(StorageError::InvalidFanout {
-            detail: "foreach cannot target a JOIN node".into(),
-        });
-    }
-    let status = if is_join && source.status == TaskStatus::Succeeded {
-        TaskStatus::Collecting
-    } else {
-        TaskStatus::Pending
-    };
-    for input in &plan.inputs {
-        let scope_id = scope::route(
-            tx,
-            &source.workflow_id,
-            source.run_id,
-            source.scope_id,
-            &destination_path,
-            source.task_id,
-            plan.new_scope_per_input,
-            entries,
-        )
-        .await?;
-        let existing = if status == TaskStatus::Collecting {
-            sqlx::query_as::<_, TaskRow>(&format!(
-                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=$1 AND name=$2 AND run_id IS NOT DISTINCT FROM $3 AND scope_id IS NOT DISTINCT FROM $4 AND status = 'collecting' ORDER BY task_id LIMIT 1 FOR UPDATE"
-            )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
-              .fetch_optional(&mut **tx).await?
-        } else {
-            None
-        };
-        if let Some(existing) = existing {
-            let mut parents = existing.parent_task_ids;
-            if !parents.contains(&source.task_id) {
-                parents.push(source.task_id);
+    if !fanouts.is_empty() {
+        let chain = scope::chain(tx, &source.workflow_id, source.scope_id).await?;
+        let mut entries = ScopeEntries::new();
+        for plan in fanouts {
+            let destination =
+                graph
+                    .subgraph_path(plan.dst)
+                    .ok_or_else(|| StorageError::InvalidFanout {
+                        detail: format!("unknown successor node {}", plan.dst),
+                    })?;
+            let (parent, entered) = route_path(
+                &chain,
+                source.run_id,
+                &destination,
+                plan.new_scope_per_input,
+            )?;
+            for input in &plan.inputs {
+                let scope_id = scope::enter(
+                    tx,
+                    &source.workflow_id,
+                    source.run_id,
+                    source.task_id,
+                    parent,
+                    entered,
+                    (!plan.new_scope_per_input).then_some(&mut entries),
+                )
+                .await?;
+                enqueue_input(tx, source, plan, scope_id, input).await?;
             }
-            let mut input_json = existing.input_json;
-            merge_join_input(&mut input_json, input)?;
-            sqlx::query("UPDATE tasks SET parent_task_ids=$3, input_json=$4, updated_at=clock_timestamp() WHERE workflow_id=$1 AND task_id=$2")
-                .bind(&source.workflow_id).bind(existing.task_id).bind(parents).bind(input_json)
-                .execute(&mut **tx).await?;
-        } else {
-            sqlx::query("INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES ($1,$2,$3,$4,$5,$6,$7)")
-                .bind(&source.workflow_id).bind(source.run_id).bind(plan.dst).bind(status.as_str())
-                .bind(vec![source.task_id]).bind(input).bind(scope_id)
-                .execute(&mut **tx).await?;
         }
+    }
+    fail_blocked_joins(tx, &source.workflow_id, source.run_id, graph.join_rules()).await
+}
+
+async fn enqueue_input(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source: &TaskRecord,
+    plan: &Successor,
+    scope_id: Option<i64>,
+    input: &Value,
+) -> Result<(), StorageError> {
+    let existing = if plan.initial_status == TaskStatus::Collecting {
+        sqlx::query_as::<_, TaskRow>(&format!(
+            "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=$1 AND name=$2 AND run_id IS NOT DISTINCT FROM $3 AND scope_id IS NOT DISTINCT FROM $4 AND status = 'collecting' ORDER BY task_id LIMIT 1 FOR UPDATE"
+        )).bind(&source.workflow_id).bind(plan.dst).bind(source.run_id).bind(scope_id)
+          .fetch_optional(&mut **tx).await?
+    } else {
+        None
+    };
+    if let Some(existing) = existing {
+        let mut parents = existing.parent_task_ids;
+        if !parents.contains(&source.task_id) {
+            parents.push(source.task_id);
+        }
+        let mut input_json = existing.input_json;
+        merge_join_input(&mut input_json, input)?;
+        sqlx::query("UPDATE tasks SET parent_task_ids=$3, input_json=$4, updated_at=clock_timestamp() WHERE workflow_id=$1 AND task_id=$2")
+            .bind(&source.workflow_id).bind(existing.task_id).bind(parents).bind(input_json)
+            .execute(&mut **tx).await?;
+    } else {
+        sqlx::query("INSERT INTO tasks (workflow_id,run_id,name,status,parent_task_ids,input_json,scope_id) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            .bind(&source.workflow_id).bind(source.run_id).bind(plan.dst).bind(plan.initial_status.as_str())
+            .bind(vec![source.task_id]).bind(input).bind(scope_id)
+            .execute(&mut **tx).await?;
     }
 
     Ok(())
@@ -249,18 +262,7 @@ impl PgTaskRepo {
         self.lock_settlement(&mut tx, task).await?;
         let settled =
             settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
-        let mut entries = ScopeEntries::new();
-        for fanout in fanouts {
-            enqueue_fanout_in_tx(&mut tx, self.graph.as_ref(), &settled, fanout, &mut entries)
-                .await?;
-        }
-        fail_blocked_joins(
-            &mut tx,
-            &task.workflow_id,
-            settled.run_id,
-            self.graph.join_rules(),
-        )
-        .await?;
+        enqueue_fanouts_in_tx(&mut tx, self.graph.as_ref(), &settled, fanouts).await?;
         tx.commit().await?;
         Ok(settled)
     }
@@ -285,18 +287,7 @@ impl PgTaskRepo {
             TaskStatus::Superseded
         };
         let settled = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
-        let mut entries = ScopeEntries::new();
-        for fanout in fanouts {
-            enqueue_fanout_in_tx(&mut tx, self.graph.as_ref(), &settled, fanout, &mut entries)
-                .await?;
-        }
-        fail_blocked_joins(
-            &mut tx,
-            &task.workflow_id,
-            settled.run_id,
-            self.graph.join_rules(),
-        )
-        .await?;
+        enqueue_fanouts_in_tx(&mut tx, self.graph.as_ref(), &settled, fanouts).await?;
         tx.commit().await?;
         Ok(())
     }

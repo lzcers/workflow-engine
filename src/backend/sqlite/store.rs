@@ -11,7 +11,6 @@ use super::scope;
 use crate::error::StorageError;
 use crate::graph::Successor;
 use crate::task::TaskStore;
-use crate::task::scope::ScopeEntries;
 use crate::task::store::check_workflow;
 use crate::{Database, RunHandle, Task, TaskRecord};
 
@@ -29,15 +28,14 @@ impl Database<&mut sqlx::Transaction<'_, sqlx::Sqlite>> {
         .execute(&mut **tx)
         .await?
         .last_insert_rowid();
-        let scope_id = scope::route(
+        let scope_id = scope::enter(
             tx,
             &task.workflow_id,
             Some(run_id),
+            run_id,
             None,
             &task.subgraph_path,
-            run_id,
-            false,
-            &mut ScopeEntries::new(),
+            None,
         )
         .await?;
         sqlx::query("UPDATE tasks SET run_id = task_id, scope_id = ?1 WHERE task_id = ?2")

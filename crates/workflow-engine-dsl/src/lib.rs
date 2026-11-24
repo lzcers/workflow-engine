@@ -30,17 +30,15 @@ pub struct Workflow {
 
 #[derive(Clone, Default)]
 pub struct Region {
-    pub nodes: Vec<Node>,
-    pub subgraphs: Vec<Subgraph>,
+    pub items: Vec<RegionItem>,
     pub edges: Vec<Edge>,
-    pub order: Vec<RegionItem>,
 }
 
-/// Order of node construction and nested declarations in the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A declaration in source order.
+#[derive(Clone)]
 pub enum RegionItem {
-    Node(usize),
-    Subgraph(usize),
+    Node(Node),
+    Subgraph(Subgraph),
 }
 
 #[derive(Clone)]
@@ -131,12 +129,11 @@ impl Parse for Region {
                     let name = body.parse()?;
                     body.parse::<Token![=>]>()?;
                     let instance = body.parse()?;
-                    region.order.push(RegionItem::Node(region.nodes.len()));
-                    region.nodes.push(Node {
+                    region.items.push(RegionItem::Node(Node {
                         name,
                         instance,
                         attributes,
-                    });
+                    }));
                     if !body.is_empty() {
                         body.parse::<Token![,]>()?;
                     }
@@ -147,14 +144,11 @@ impl Parse for Region {
                 let name = input.parse()?;
                 let body;
                 braced!(body in input);
-                region
-                    .order
-                    .push(RegionItem::Subgraph(region.subgraphs.len()));
-                region.subgraphs.push(Subgraph {
+                region.items.push(RegionItem::Subgraph(Subgraph {
                     name,
                     attributes,
                     region: body.parse()?,
-                });
+                }));
             } else if input.peek(keyword::edges) {
                 input.parse::<keyword::edges>()?;
                 let body;
@@ -257,13 +251,10 @@ impl ToTokens for Workflow {
 }
 impl ToTokens for Region {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        for item in &self.order {
+        for item in &self.items {
             match item {
-                RegionItem::Node(index) => {
-                    let node = &self.nodes[*index];
-                    tokens.extend(quote! { nodes { #node, } });
-                }
-                RegionItem::Subgraph(index) => self.subgraphs[*index].to_tokens(tokens),
+                RegionItem::Node(node) => tokens.extend(quote! { nodes { #node, } }),
+                RegionItem::Subgraph(subgraph) => subgraph.to_tokens(tokens),
             }
         }
         let edges = &self.edges;

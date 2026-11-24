@@ -1,16 +1,15 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
 use super::{ROW_COLS, SqliteTaskRepo, TaskRow, fail_blocked_joins, scope};
 use crate::backend::sqlite::migrate;
-use crate::task::scope::ScopeEntries;
 use sqlx::types::Json;
 #[path = "graph_fixture.rs"]
 mod graph_fixture;
 use crate::Database;
-use crate::backend::task_fixture::TaskSeed;
+use crate::backend::task_fixture::{TaskSeed, join_plan, plan};
 use crate::error::StorageError;
 use crate::graph::{Successor, TaskType};
 use crate::task::MAX_ATTEMPTS;
@@ -80,15 +79,16 @@ impl SqliteTaskRepo {
         .await?
         .last_insert_rowid();
         let run_id = seed.run_id.unwrap_or(task_id);
-        let scope_id = scope::route(
+        let chain = scope::chain(&mut tx, &task.workflow_id, seed.scope_id).await?;
+        let (parent, entered) = crate::task::scope::route_path(&chain, Some(run_id), &path, false)?;
+        let scope_id = scope::enter(
             &mut tx,
             &task.workflow_id,
             Some(run_id),
-            seed.scope_id,
-            &path,
             task_id,
-            false,
-            &mut ScopeEntries::new(),
+            parent,
+            entered,
+            None,
         )
         .await?;
         sqlx::query("UPDATE tasks SET run_id = ?1, scope_id = ?2 WHERE task_id = ?3")
@@ -136,15 +136,6 @@ async fn get(repo: &SqliteTaskRepo, task: &TaskRecord) -> TaskRecord {
         .await
         .unwrap()
         .unwrap()
-}
-
-fn plan(dst: &'static str, inputs: Vec<Value>) -> Successor {
-    Successor {
-        new_scope_per_input: false,
-
-        dst,
-        inputs,
-    }
 }
 
 #[tokio::test]
@@ -465,7 +456,7 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         images.iter().map(|task| task.task_id).collect::<Vec<_>>()
     );
 
-    let contribution = |input| plan("collect", vec![input]);
+    let contribution = |input| join_plan("collect", vec![input]);
     repo.settle_success(
         &claimed[0],
         &json!("a"),
@@ -554,7 +545,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
     }
     let sources = repo.claim_many("fanin", 10).await.unwrap();
     for source in &sources {
-        let contribution = plan("collect", vec![source.input.clone()]);
+        let contribution = join_plan("collect", vec![source.input.clone()]);
         repo.succeed_and_enqueue(source, &source.input, &[contribution])
             .await
             .unwrap();
@@ -1345,7 +1336,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
             repo.succeed_and_enqueue(
                 source,
                 &source.input,
-                &[plan("collect", vec![json!({"worker": source.input})])],
+                &[join_plan("collect", vec![json!({"worker": source.input})])],
             )
             .await
             .unwrap();

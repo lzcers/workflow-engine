@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::super::test_support::connect_test;
 use super::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR};
-use super::{PgTaskRepo, ROW_COLS, ScopeEntries, TaskRow, fail_blocked_joins, scope};
-use crate::backend::task_fixture::TaskSeed;
+use super::{PgTaskRepo, ROW_COLS, TaskRow, fail_blocked_joins, scope};
+use crate::backend::task_fixture::{TaskSeed, join_plan, plan};
 use crate::error::StorageError;
 use crate::graph::{
     Successor,
@@ -46,15 +46,16 @@ impl PgTaskRepo {
         .fetch_one(&mut *tx)
         .await?;
         let run_id = Some(seed.run_id.unwrap_or(task_id));
-        let scope_id = scope::route(
+        let chain = scope::chain(&mut tx, &task.workflow_id, seed.scope_id).await?;
+        let (parent, entered) = crate::task::scope::route_path(&chain, run_id, &path, false)?;
+        let scope_id = scope::enter(
             &mut tx,
             &task.workflow_id,
             run_id,
-            seed.scope_id,
-            &path,
             task_id,
-            false,
-            &mut ScopeEntries::new(),
+            parent,
+            entered,
+            None,
         )
         .await?;
         sqlx::query("UPDATE tasks SET run_id=$2, scope_id=$3 WHERE task_id=$1")
@@ -90,14 +91,6 @@ impl PgTaskRepo {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(TaskRow::into))
-    }
-}
-
-fn plan(dst: &'static str, inputs: Vec<Value>) -> Successor {
-    Successor {
-        dst,
-        inputs,
-        new_scope_per_input: false,
     }
 }
 
@@ -386,7 +379,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
         repo.succeed_and_enqueue(
             source,
             &contribution,
-            &[plan(
+            &[join_plan(
                 "collect",
                 vec![contribution.clone(), json!({"extra": source.task_id})],
             )],
@@ -1056,7 +1049,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
         workers.spawn(async move {
             let fanouts: Vec<_> = targets
                 .into_iter()
-                .map(|name| plan(name, vec![json!({ source.name.clone(): source.task_id })]))
+                .map(|name| join_plan(name, vec![json!({ source.name.clone(): source.task_id })]))
                 .collect();
             repo.succeed_and_enqueue(&source, &json!(source.task_id), &fanouts)
                 .await
@@ -1212,7 +1205,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
             .unwrap()
     };
     let contribution = |task: &TaskRecord| {
-        plan(
+        join_plan(
             "analysis.join",
             vec![json!({task.name.rsplit('.').next().unwrap(): task.input})],
         )

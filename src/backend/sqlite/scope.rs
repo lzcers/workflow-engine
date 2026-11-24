@@ -5,7 +5,7 @@ use crate::{
     task::scope::{ScopeEntries, ScopeRecord},
 };
 
-async fn chain(
+pub(super) async fn chain(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     mut scope_id: Option<i64>,
@@ -23,24 +23,20 @@ async fn chain(
     Ok(chain)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn route(
+/// 创建路线中新进入的作用域。普通边共享同一结算内已创建的实例。
+pub(super) async fn enter(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
-    source_scope_id: Option<i64>,
-    destination_path: &[String],
     trigger_task_id: i64,
-    foreach: bool,
-    entries: &mut ScopeEntries,
+    mut parent: Option<i64>,
+    entered: &[String],
+    mut shared: Option<&mut ScopeEntries>,
 ) -> Result<Option<i64>, StorageError> {
-    let chain = chain(tx, workflow_id, source_scope_id).await?;
-    let (mut parent, entered) =
-        crate::task::scope::route_path(&chain, run_id, destination_path, foreach)?;
     for subgraph_id in entered {
         let key = (parent, subgraph_id.clone());
-        if !foreach && let Some(&id) = entries.get(&key) {
-            parent = Some(id);
+        if let Some(id) = shared.as_ref().and_then(|entries| entries.get(&key)) {
+            parent = Some(*id);
             continue;
         }
         let id = sqlx::query_scalar(
@@ -54,7 +50,7 @@ pub(super) async fn route(
         .bind(trigger_task_id)
         .fetch_one(&mut **tx)
         .await?;
-        if !foreach {
+        if let Some(entries) = shared.as_deref_mut() {
             entries.insert(key, id);
         }
         parent = Some(id);

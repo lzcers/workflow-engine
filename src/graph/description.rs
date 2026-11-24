@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use super::{Graph, Trigger, qualified_parent, subgraph_path};
+use super::{Graph, TaskType, Trigger, qualified_parent, subgraph_path};
 
 /// 已构建执行图的可序列化拓扑。节点按 ID 排序，边按成功/失败及各自注册顺序输出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,17 +133,13 @@ impl SubgraphDescription {
     }
 }
 
-impl NodeDescription {
-    fn scope_path(&self) -> Result<impl Iterator<Item = &str>, String> {
-        let subgraph = self.subgraph_id.as_deref();
-        if subgraph.is_some() && qualified_parent(&self.id) != subgraph {
-            return Err(format!(
-                "node {} must use its full subgraph-qualified name",
-                self.id
-            ));
-        }
-        Ok(subgraph_path(subgraph))
+fn validate_node_owner(id: &str, subgraph: Option<&str>) -> Result<(), String> {
+    if subgraph.is_some() && qualified_parent(id) != subgraph {
+        return Err(format!(
+            "node {id} must use its full subgraph-qualified name"
+        ));
     }
+    Ok(())
 }
 
 impl GraphDescription {
@@ -172,7 +168,9 @@ impl GraphDescription {
 
     fn entry_path(&self, node: &NodeDescription) -> Result<Vec<String>, String> {
         let mut path = Vec::new();
-        for id in node.scope_path()? {
+        let owner = node.subgraph_id.as_deref();
+        validate_node_owner(&node.id, owner)?;
+        for id in subgraph_path(owner) {
             let mut groups = self.subgraphs.iter().filter(|group| group.id == id);
             let group = groups
                 .next()
@@ -188,62 +186,106 @@ impl GraphDescription {
 
     /// 校验静态归属以及 foreach 的边界。允许普通边直接连接子图内部节点。
     pub fn validate_subgraphs(&self) -> Result<(), String> {
-        let mut node_paths = HashMap::new();
-        for node in &self.nodes {
-            if node_paths
-                .insert(node.id.as_str(), node.scope_path()?.collect::<Vec<_>>())
-                .is_some()
-            {
-                return Err(format!("duplicate node id: {}", node.id));
-            }
-        }
-        let mut groups = HashSet::new();
-        for group in &self.subgraphs {
-            if !groups.insert(group.id.as_str()) || node_paths.contains_key(group.id.as_str()) {
-                return Err(format!("duplicate subgraph id: {}", group.id));
-            }
-            group.validate()?;
-        }
-        // 已验证每个父 ID 都是严格更短的限定名前缀，逐条确认父级存在即可保证父链完整。
-        for group in &self.subgraphs {
-            if let Some(parent) = &group.parent_id
-                && !groups.contains(parent.as_str())
-            {
-                return Err(format!("subgraph {parent} not registered"));
-            }
-        }
-        for node in &self.nodes {
-            if let Some(id) = &node.subgraph_id
-                && !groups.contains(id.as_str())
-            {
-                return Err(format!("node {}: subgraph {id} not registered", node.id));
-            }
-        }
-        for edge in &self.edges {
-            let source = node_paths
-                .get(edge.source.as_str())
-                .ok_or_else(|| format!("edge src={} not registered", edge.source))?;
-            let destination = node_paths
-                .get(edge.target.as_str())
-                .ok_or_else(|| format!("edge dst={} not registered", edge.target))?;
-            if edge.foreach
-                && self
-                    .nodes
-                    .iter()
-                    .any(|node| node.id == edge.target && node.task_type == "join")
-            {
-                return Err(format!(
-                    "foreach edge must not target join node {}",
-                    edge.target
-                ));
-            }
-            if edge.foreach && source.starts_with(destination) {
-                return Err(format!(
-                    "foreach edge {} -> {} must enter a new subgraph",
-                    edge.source, edge.target
-                ));
-            }
-        }
-        Ok(())
+        let nodes = self.nodes.iter().map(|node| {
+            (
+                node.id.as_str(),
+                node.subgraph_id.as_deref(),
+                node.task_type == TaskType::Join.as_str(),
+            )
+        });
+        let edges = self
+            .edges
+            .iter()
+            .map(|edge| (edge.source.as_str(), edge.target.as_str(), edge.foreach));
+        validate_subgraphs(nodes, self.subgraphs.iter(), edges)
     }
+}
+
+impl<Ctx> Graph<Ctx> {
+    pub(super) fn validate_subgraphs(&self) -> Result<(), String> {
+        // 沿用按 ID 报告首个拓扑错误的顺序。
+        let mut nodes: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|(&id, entry)| {
+                (
+                    id,
+                    entry.subgraph_id.as_deref(),
+                    entry.node.task_type() == TaskType::Join,
+                )
+            })
+            .collect();
+        nodes.sort_unstable_by_key(|&(id, _, _)| id);
+        let mut groups: Vec<_> = self.subgraphs.iter().collect();
+        groups.sort_by_key(|group| &group.id);
+
+        let success = self
+            .success_edges
+            .iter()
+            .map(|e| (e.src(), e.dst(), e.is_foreach()));
+        let failure = self.failure_edges.iter().map(|e| (e.src(), e.dst(), false));
+        validate_subgraphs(
+            nodes.iter().copied(),
+            groups.iter().copied(),
+            success.chain(failure),
+        )
+    }
+}
+
+fn validate_subgraphs<'a>(
+    nodes: impl Iterator<Item = (&'a str, Option<&'a str>, bool)> + Clone,
+    subgraphs: impl Iterator<Item = &'a SubgraphDescription> + Clone,
+    edges: impl Iterator<Item = (&'a str, &'a str, bool)>,
+) -> Result<(), String> {
+    let mut owners = HashMap::new();
+    for (id, owner, is_join) in nodes.clone() {
+        validate_node_owner(id, owner)?;
+        if owners.insert(id, (owner, is_join)).is_some() {
+            return Err(format!("duplicate node id: {id}"));
+        }
+    }
+
+    let mut groups = HashSet::new();
+    for group in subgraphs.clone() {
+        if !groups.insert(group.id.as_str()) || owners.contains_key(group.id.as_str()) {
+            return Err(format!("duplicate subgraph id: {}", group.id));
+        }
+        group.validate()?;
+    }
+    // 父 ID 已验证为严格更短的限定名前缀，确认父级存在即可保证父链完整。
+    for group in subgraphs {
+        if let Some(parent) = &group.parent_id
+            && !groups.contains(parent.as_str())
+        {
+            return Err(format!("subgraph {parent} not registered"));
+        }
+    }
+    for (id, owner, _) in nodes {
+        if let Some(group) = owner
+            && !groups.contains(group)
+        {
+            return Err(format!("node {id}: subgraph {group} not registered"));
+        }
+    }
+    for (src, dst, foreach) in edges {
+        let &(source_group, _) = owners
+            .get(src)
+            .ok_or_else(|| format!("edge src={src} not registered"))?;
+        let &(destination_group, is_join) = owners
+            .get(dst)
+            .ok_or_else(|| format!("edge dst={dst} not registered"))?;
+        if foreach {
+            if is_join {
+                return Err(format!("foreach edge must not target join node {dst}"));
+            }
+            if destination_group
+                .is_none_or(|target| subgraph_path(source_group).any(|id| id == target))
+            {
+                return Err(format!(
+                    "foreach edge {src} -> {dst} must enter a new subgraph"
+                ));
+            }
+        }
+    }
+    Ok(())
 }

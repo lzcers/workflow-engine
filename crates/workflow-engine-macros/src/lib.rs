@@ -81,14 +81,12 @@ fn metadata(
 fn register(
     region: &Region,
     parent: &str,
-    engine: &Path,
     keys: &mut HashMap<String, Ident>,
     statements: &mut Tokens,
 ) -> Result<()> {
-    for item in &region.order {
+    for item in &region.items {
         match item {
-            RegionItem::Node(index) => {
-                let node = &region.nodes[*index];
+            RegionItem::Node(node) => {
                 let name = qualify(parent, &node.name.to_string());
                 let key =
                     format_ident!("__workflow_node_{}", keys.len(), span = Span::mixed_site());
@@ -110,8 +108,7 @@ fn register(
                     );
                 });
             }
-            RegionItem::Subgraph(index) => {
-                let subgraph = &region.subgraphs[*index];
+            RegionItem::Subgraph(subgraph) => {
                 let name = qualify(parent, &subgraph.name.to_string());
                 let (title, _) = metadata(&subgraph.attributes, &subgraph.name.to_string(), false)?;
                 let owner = if parent.is_empty() {
@@ -122,7 +119,7 @@ fn register(
                 statements.extend(quote! {
                     let __workflow_builder = __workflow_builder.subgraph(#name, #title, #owner);
                 });
-                register(&subgraph.region, &name, engine, keys, statements)?;
+                register(&subgraph.region, &name, keys, statements)?;
             }
         }
     }
@@ -154,14 +151,16 @@ fn wire(
     keys: &HashMap<String, Ident>,
     statements: &mut Tokens,
 ) -> Result<()> {
-    for subgraph in &region.subgraphs {
-        wire(
-            &subgraph.region,
-            &qualify(parent, &subgraph.name.to_string()),
-            engine,
-            keys,
-            statements,
-        )?;
+    for item in &region.items {
+        if let RegionItem::Subgraph(subgraph) = item {
+            wire(
+                &subgraph.region,
+                &qualify(parent, &subgraph.name.to_string()),
+                engine,
+                keys,
+                statements,
+            )?;
+        }
     }
     for edge in &region.edges {
         let source = resolve(&edge.source, parent, keys)?;
@@ -231,7 +230,7 @@ fn expand(input: Input) -> Result<Tokens> {
     } = input;
     let mut keys = HashMap::new();
     let mut statements = Tokens::new();
-    register(&region, "", &engine, &mut keys, &mut statements)?;
+    register(&region, "", &mut keys, &mut statements)?;
     wire(&region, "", &engine, &keys, &mut statements)?;
     Ok(quote! {{
         let __workflow_builder = #engine::Graph::builder(#workflow_id, #title, #context);

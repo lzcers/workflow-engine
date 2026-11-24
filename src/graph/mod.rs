@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::edge::{AnyFailureEdge, AnySuccessEdge};
 use super::node::{AnyNode, TypeFingerprint};
+use crate::task::TaskStatus;
 
 mod builder;
 mod description;
@@ -69,6 +70,8 @@ pub struct Graph<Ctx> {
 pub struct Successor {
     pub dst: &'static str,
     pub inputs: Vec<Value>,
+    /// 成功路由到 JOIN 时收集输入，其余后继直接等待认领。
+    pub initial_status: TaskStatus,
     /// 每项输入创建独立的子图调用；为 false 时，同次结算的普通跨入边共享调用。
     pub new_scope_per_input: bool,
 }
@@ -175,23 +178,27 @@ impl<Ctx> Graph<Ctx> {
         let mut plans = Vec::new();
         for edge in self.success_edges.iter().filter(|edge| edge.src() == name) {
             let inputs = edge.plan_success(out)?;
-            if self.join_rules.contains_key(edge.dst())
-                && inputs.iter().any(|input| !input.is_object())
-            {
-                return Err(EdgeError::BadDstIn {
-                    src: edge.src(),
-                    detail: format!(
-                        "JOIN {} requires a JSON object for each contribution",
-                        edge.dst()
-                    ),
-                });
-            }
             if inputs.is_empty() {
                 continue;
             }
+            let initial_status = if self.join_rules.contains_key(edge.dst()) {
+                if inputs.iter().any(|input| !input.is_object()) {
+                    return Err(EdgeError::BadDstIn {
+                        src: edge.src(),
+                        detail: format!(
+                            "JOIN {} requires a JSON object for each contribution",
+                            edge.dst()
+                        ),
+                    });
+                }
+                TaskStatus::Collecting
+            } else {
+                TaskStatus::Pending
+            };
             plans.push(Successor {
                 dst: edge.dst(),
                 inputs,
+                initial_status,
                 new_scope_per_input: edge.is_foreach(),
             });
         }
@@ -214,6 +221,7 @@ impl<Ctx> Graph<Ctx> {
             plans.push(Successor {
                 dst: edge.dst(),
                 inputs,
+                initial_status: TaskStatus::Pending,
                 new_scope_per_input: false,
             });
         }
@@ -305,7 +313,7 @@ impl<Ctx> Graph<Ctx> {
         if self.title.trim().is_empty() {
             return Err("workflow title must not be empty".into());
         }
-        self.describe().validate_subgraphs()?;
+        self.validate_subgraphs()?;
         for (name, entry) in &self.nodes {
             match (entry.node.task_type(), entry.node.trigger()) {
                 (TaskType::Event, None) => {
@@ -317,23 +325,13 @@ impl<Ctx> Graph<Ctx> {
                 _ => {}
             }
         }
-        // 节点名与边引用一致性 + 边类型接线指纹（成功边）
+        // 端点已通过拓扑校验，这里只检查执行语义和类型接线。
         for e in self.success_edges.iter() {
-            let Some(src) = self.nodes.get(e.src()) else {
-                return Err(format!("edge src={} not registered", e.src()));
-            };
-            let Some(dst) = self.nodes.get(e.dst()) else {
-                return Err(format!("edge dst={} not registered", e.dst()));
-            };
+            let src = &self.nodes[e.src()];
+            let dst = &self.nodes[e.dst()];
             if dst.node.task_type() == TaskType::Event {
                 return Err(format!(
                     "success edge must not target event node {}",
-                    e.dst()
-                ));
-            }
-            if e.is_foreach() && dst.node.task_type() == TaskType::Join {
-                return Err(format!(
-                    "foreach edge must not target join node {}",
                     e.dst()
                 ));
             }
@@ -360,14 +358,9 @@ impl<Ctx> Graph<Ctx> {
                 ));
             }
         }
-        // 节点名与边引用一致性 + 边类型接线指纹（失败边）
         for e in self.failure_edges.iter() {
-            let Some(src) = self.nodes.get(e.src()) else {
-                return Err(format!("edge src={} not registered", e.src()));
-            };
-            let Some(dst) = self.nodes.get(e.dst()) else {
-                return Err(format!("edge dst={} not registered", e.dst()));
-            };
+            let src = &self.nodes[e.src()];
+            let dst = &self.nodes[e.dst()];
             if dst.node.task_type() == TaskType::Event {
                 return Err(format!(
                     "failure edge must not target event node {}",
