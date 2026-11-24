@@ -45,7 +45,6 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks(workflow_id, status, lease_until);
-CREATE INDEX IF NOT EXISTS idx_tasks_recovery ON tasks(status, workflow_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_predecessors ON tasks(workflow_id, run_id, scope_id, name, status);
 
 -- 子图的执行实例，仅保存身份和父子关系，无独立任务状态或调度生命周期。

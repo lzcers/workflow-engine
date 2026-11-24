@@ -31,12 +31,12 @@
 
 ## 实例启动与提交
 
-`Engine::make(graph)` 为图和 worker 绑定一个 `TaskStore`，将同一实例交给 Workflow 和 Scheduler，并启动后台 `scheduler.run()`。
+`Engine::make(graph)` 用当前图及引擎的 worker 身份创建 `TaskStore`，由 Workflow 和 Scheduler 共用，然后启动后台 `scheduler.run()`。
 因此 `make` 必须在 Tokio runtime 内调用。调度器开始认领该图已有的可执行任务，无需先提交新运行。
 每次 `Workflow::submit(entry, input)` 按以下顺序执行：
 
 1. 将输入序列化为 JSON，从执行图读取入口节点的子图路径并构造 `Task`。节点 `In` 类型的反序列化检查留到实际执行阶段。
-2. 调用该图的 `TaskStore::enqueue(task)`。后端通过 `Database::submit(task)` 在同一事务内分配 run ID、创建子图实例并保存入口任务。
+2. 调用当前工作流的 `TaskStore::enqueue(task)`。后端通过 `Database::submit(task)` 在同一事务内分配 run ID、创建子图实例并保存入口任务。
 3. 调用共享 `Notify::notify_one()` 唤醒认领，返回包含 `workflow_id` 和 `run_id` 的 `RunHandle`。
 
 成功返回表示入口任务已持久化并安排执行，不等待节点完成。提交不会创建调度器，
@@ -87,7 +87,7 @@ flowchart TD
 同时就绪时，选择顺序是任务完成、通知、轮询。满槽时不轮询，也不消耗就绪通知；
 有槽时，即使其他节点很慢，通知仍可唤醒认领。Notify 只是唤醒信号，可以合并多次通知，
 任务是否存在和可执行始终以数据库为准。
-Scheduler 本身不建立 PostgreSQL LISTEN；其他进程提交的任务由轮询发现。
+其他进程提交的任务由调度器轮询发现。
 
 Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配置由库内部管理。
 轮询间隔是进入等待后的休眠时长，
@@ -98,7 +98,7 @@ Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配�
 
 ## 认领与依赖就绪
 
-调度器把 `workflow_id` 和数量上限交给 `TaskStore::claim_many`。
+调度器调用 `TaskStore::claim_many(workflow_id, available)`，仓储在指定工作流的全部运行中按空槽数认领。
 当前 PostgreSQL / SQLite 后端负责筛选待执行或租约已过期的任务、检查依赖和 JOIN
 是否就绪，再原子写入 `running`、初始 300 秒租约及递增后的 `attempt`。
 
@@ -110,7 +110,7 @@ Workflow 使用 1 秒轮询间隔和 8 个执行槽，Scheduler 的构造与配�
 
 认领事务首次发现预算耗尽时记录最终失败原因：旧租约已到期则记录租约失效；
 提前释放的认领记录预算耗尽。后续恢复认领保留该原因。
-预算耗尽的行继续参与认领和恢复查询，由统一失败结算处理，不直接封存为 `failed`。
+预算耗尽的行仍可被认领，由统一失败结算处理，不直接封存为 `failed`。
 
 任务按存储的认领顺序进入执行槽，完成顺序取决于各节点耗时；调度器不提供按 run
 轮转的公平队列。后继通过结算事务入库，满足依赖后由下一次认领取得，不在当前任务里
@@ -258,6 +258,6 @@ Scheduler 只轮询自己绑定的图。应用需要为要恢复的图创建并�
 | [src/scheduler.rs](../src/scheduler.rs) | `run_loop` → `claim_and_spawn` → `run_task`，续租期间执行、规划及结算，提交后调用回调 |
 | [src/task/store.rs](../src/task/store.rs) | 存储契约、`renew_claim`、`FanoutPlan`、租约时长 |
 | [src/graph/mod.rs](../src/graph/mod.rs) | 节点执行、成功与失败后继规划 |
-| [src/backend/pgsql/repo.rs](../src/backend/pgsql/repo.rs) | PostgreSQL 认领、续租、结算与恢复查询 |
-| [src/backend/sqlite/repo.rs](../src/backend/sqlite/repo.rs) | SQLite 认领、续租、结算与恢复查询 |
+| [src/backend/pgsql/repo.rs](../src/backend/pgsql/repo.rs) | PostgreSQL 认领、续租和原子结算 |
+| [src/backend/sqlite/repo.rs](../src/backend/sqlite/repo.rs) | SQLite 认领、续租和原子结算 |
 | [tests/sqlite_backend.rs](../tests/sqlite_backend.rs) | 提交自动执行、共享槽、通知唤醒、扇出与 JOIN 的现有验证 |

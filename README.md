@@ -42,7 +42,7 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 直接提交到 JOIN 的独立运行入口，以及失败边指向 JOIN 时产生的每条后继，均以 `pending` 入队，使用各自的输入执行。
 前驱和上游范围在构图时计算，认领时结合作用域入口和任务状态判断就绪。
 
-同一 Engine 的不同工作流共享数据库连接池，各自绑定自己的图。
+同一 Engine 的不同工作流共享连接池，各自的任务仓储绑定对应的执行图。
 
 ## 子图与执行作用域
 
@@ -96,8 +96,8 @@ DDL 只初始化当前 schema，不迁移旧表；旧 schema 数据库需要另�
 `Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享连接池。
 `engine.make(graph)` 接收 `Graph<Ctx>` 并返回非泛型的 `Workflow`，构造时立即启动一个后台调度器，
 因此必须在 Tokio runtime 内调用。调度器会认领当前图已有的可执行任务，无需先提交新运行。
-同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有绑定图的仓储和独立的调度器。
-`Engine::make` 将同一个 `TaskStore` 交给 `Workflow` 和调度器。两者和仓储共享同一个 `Graph<Ctx>`，
+同一 Engine 可以创建不同上下文类型的工作流。每次 `make` 为当前图创建一个 `TaskStore`，供 `Workflow` 和调度器共用。
+三者共享同一个 `Graph<Ctx>`，
 节点执行仍保留类型约束。宿主可以直接将不同上下文的工作流放入同一集合，
 并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型、子图路径、前驱和触发声明。
 节点查询对未知名称返回 `None`；创建任务及后继时要求目标属于绑定图，且工作流 ID 一致。
@@ -182,7 +182,7 @@ let engine = Engine::from_database(database).with_worker(worker_id);
 let workflow = engine.make(graph);
 ```
 
-宿主持有 `Workflow` 以维持调度器生命周期。每个调度器认领本图 `workflow_id` 下的任务，并在每次认领时记录实例 ID。工作流变化时使用新的 ID，旧 ID 的运行由旧 worker 完成。进程内的 `Workflow::submit` 通过绑定图的 `TaskStore::enqueue` 提交，成功后立即唤醒本地调度器。Server 直接调用 `Database::submit`，两条路径复用相同的数据库写入。
+宿主持有 `Workflow` 以维持调度器生命周期。每个调度器认领本图 `workflow_id` 下的任务，并在每次认领时记录实例 ID。工作流变化时使用新的 ID，旧 ID 的运行由旧 worker 完成。进程内的 `Workflow::submit` 通过本图的 `TaskStore::enqueue` 提交，成功后立即唤醒本地调度器。Server 直接调用 `Database::submit`，两条路径复用相同的数据库写入。
 
 ## 关键机制
 

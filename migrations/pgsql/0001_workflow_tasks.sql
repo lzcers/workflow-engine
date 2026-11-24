@@ -42,7 +42,7 @@ COMMENT ON COLUMN tasks.error IS '失败、跳过或被后继接管的原因文�
 COMMENT ON COLUMN tasks.created_at IS '任务记录创建时间，由数据库时钟写入。';
 COMMENT ON COLUMN tasks.updated_at IS '任务记录最近更新时间；由仓储在认领、结算、来源合并或租约变更时显式更新，无自动更新触发器。';
 
--- 认领与恢复扫描共享工作流、状态和租约条件。
+-- 按绑定工作流、状态和租约查找可认领的任务。
 CREATE INDEX IF NOT EXISTS idx_tasks_claim
 ON tasks(workflow_id, status, lease_until);
 

@@ -11,26 +11,24 @@ use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
-#[cfg(test)]
-use crate::backend::task_fixture::TaskSeed;
 use crate::error::StorageError;
 use crate::graph::{ErasedGraph, JoinRule, Successor};
 use crate::node::TaskType;
 use crate::{TaskRecord, TaskStatus};
 
-use crate::task::store::{LEASE_DURATION, merge_join_input};
+use crate::task::store::{LEASE_DURATION, check_workflow, merge_join_input};
 
 /// Columns suitable for application queries against the same task table.
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
     lease_until, attempt, \
     input_json, output_json, error, created_at, updated_at";
 
-/// One graph's task repository. Clones share its connection pool and graph.
+/// SQLite task repository bound to a workflow graph and its worker identity.
 #[derive(Clone)]
 pub struct SqliteTaskRepo {
     pub(super) pool: SqlitePool,
-    graph: Arc<dyn ErasedGraph>,
-    worker_id: Option<String>,
+    pub(super) graph: Arc<dyn ErasedGraph>,
+    worker_id: Option<Arc<str>>,
 }
 
 fn claim_lost(task: &TaskRecord) -> StorageError {
@@ -38,16 +36,6 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
         workflow_id: task.workflow_id.clone(),
         task_id: task.task_id,
     }
-}
-
-/// Implements the JOIN predecessor/lease gate in [`crate::task::TaskStore::claim_many`]
-/// for both claim and recovery. Parent IDs record provenance, not execution dependencies.
-fn executable_where(rules_parameter: &str) -> String {
-    format!(
-        "(wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))
-         AND (wt.status IN ('pending', 'running') OR (wt.status = 'collecting' AND ({})))",
-        join::ready(rules_parameter)
-    )
 }
 
 /// The source settlement has already acquired the write lock in this transaction.
@@ -139,98 +127,12 @@ async fn fail_blocked_joins(
 }
 
 impl SqliteTaskRepo {
-    pub fn new(pool: SqlitePool, graph: Arc<dyn ErasedGraph>) -> Self {
+    pub fn new(pool: SqlitePool, graph: Arc<dyn ErasedGraph>, worker_id: Option<Arc<str>>) -> Self {
         Self {
             pool,
             graph,
-            worker_id: None,
+            worker_id,
         }
-    }
-
-    pub(crate) fn for_worker(
-        pool: SqlitePool,
-        graph: Arc<dyn ErasedGraph>,
-        worker_id: &str,
-    ) -> Self {
-        Self {
-            pool,
-            graph,
-            worker_id: Some(worker_id.to_owned()),
-        }
-    }
-
-    pub(super) fn check_workflow(&self, workflow_id: &str) -> Result<(), StorageError> {
-        if workflow_id != self.graph.workflow_id() {
-            return Err(StorageError::InvalidFanout {
-                detail: format!(
-                    "workflow {workflow_id} does not match repository graph {}",
-                    self.graph.workflow_id()
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    /// Insert a task in an application-owned transaction.
-    /// Without an explicit run ID, the allocated task ID starts a new run.
-    /// Insertion acquires the write lock before routing into the destination scope.
-    #[cfg(test)]
-    pub(super) async fn insert_task(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        seed: &TaskSeed,
-    ) -> Result<TaskRecord, StorageError> {
-        let mut task = seed.task.clone();
-        self.check_workflow(&task.workflow_id)?;
-        let task_type =
-            self.graph
-                .task_type_of(&task.name)
-                .ok_or_else(|| StorageError::InvalidFanout {
-                    detail: format!("unknown destination node {}", task.name),
-                })?;
-        task.subgraph_path =
-            self.graph
-                .subgraph_path(&task.name)
-                .ok_or_else(|| StorageError::InvalidFanout {
-                    detail: format!("unknown destination node {}", task.name),
-                })?;
-        let initial_status = if task_type == TaskType::Join
-            && (seed.run_id.is_some() || !seed.parent_task_ids.is_empty())
-        {
-            TaskStatus::Collecting
-        } else {
-            TaskStatus::Pending
-        };
-        let row = super::store::insert_task(
-            tx,
-            &task,
-            initial_status,
-            seed.run_id,
-            seed.scope_id,
-            &seed.parent_task_ids,
-        )
-        .await?;
-        if initial_status == TaskStatus::Collecting {
-            fail_blocked_joins(tx, &task.workflow_id, row.run_id, self.graph.join_rules()).await?;
-            let row = sqlx::query_as::<_, TaskRow>(&format!(
-                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id=?1 AND task_id=?2"
-            ))
-            .bind(&task.workflow_id)
-            .bind(row.task_id)
-            .fetch_one(&mut **tx)
-            .await?;
-            return Ok(row.into());
-        }
-        Ok(row)
-    }
-
-    /// Enqueue in the supplied run, or atomically create a run using the new task ID.
-    #[cfg(test)]
-    pub(crate) async fn enqueue(&self, seed: &TaskSeed) -> Result<TaskRecord, StorageError> {
-        let mut tx = self.pool.begin().await?;
-        let row = self.insert_task(&mut tx, seed).await?;
-        tx.commit().await?;
-        Ok(row)
     }
 
     /// Settle only the current, unexpired claim and enqueue successors in the same commit.
@@ -241,7 +143,8 @@ impl SqliteTaskRepo {
         output: &Value,
         fanouts: &[Successor],
     ) -> Result<TaskRecord, StorageError> {
-        self.check_workflow(&task.workflow_id)?;
+        let graph = self.graph.as_ref();
+        check_workflow(graph, &task.workflow_id)?;
         let mut tx = self.pool.begin().await?;
         let settled = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
@@ -269,7 +172,7 @@ impl SqliteTaskRepo {
             enqueue_fanout_in_tx(
                 &mut tx,
                 &TaskRecord::from(settled.clone()),
-                self.graph.as_ref(),
+                graph,
                 fanout,
                 &mut entries,
             )
@@ -279,7 +182,7 @@ impl SqliteTaskRepo {
             &mut tx,
             &task.workflow_id,
             settled.run_id,
-            self.graph.join_rules(),
+            graph.join_rules(),
         )
         .await?;
         tx.commit().await?;
@@ -293,7 +196,8 @@ impl SqliteTaskRepo {
         error: &str,
         fanouts: &[Successor],
     ) -> Result<(), StorageError> {
-        self.check_workflow(&task.workflow_id)?;
+        let graph = self.graph.as_ref();
+        check_workflow(graph, &task.workflow_id)?;
         let mut tx = self.pool.begin().await?;
         // Settle first so a failure self-edge creates a fresh pending task instead
         // of merging its retry input into the still-running source task.
@@ -327,7 +231,7 @@ impl SqliteTaskRepo {
             enqueue_fanout_in_tx(
                 &mut tx,
                 &TaskRecord::from(settled.clone()),
-                self.graph.as_ref(),
+                graph,
                 fanout,
                 &mut entries,
             )
@@ -337,7 +241,7 @@ impl SqliteTaskRepo {
             &mut tx,
             &task.workflow_id,
             settled.run_id,
-            self.graph.join_rules(),
+            graph.join_rules(),
         )
         .await?;
         tx.commit().await?;
@@ -379,7 +283,7 @@ impl SqliteTaskRepo {
 
     /// Release only this still-valid claim so another worker may reclaim the task.
     pub async fn release_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
-        self.check_workflow(&task.workflow_id)?;
+        check_workflow(self.graph.as_ref(), &task.workflow_id)?;
         let result = sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL,
@@ -410,17 +314,19 @@ impl SqliteTaskRepo {
         workflow_id: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
-        self.check_workflow(workflow_id)?;
-        let executable_where = executable_where("?4");
+        check_workflow(self.graph.as_ref(), workflow_id)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let join_ready = join::ready("?4");
         let mut tx = self.pool.begin().await?;
         let mut rows = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
             WITH candidate AS MATERIALIZED (
                 SELECT wt.task_id FROM tasks wt
-                WHERE wt.workflow_id = ?1 AND {executable_where}
+                WHERE wt.workflow_id = ?1
+                  AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))
+                  AND (wt.status IN ('pending', 'running') OR (wt.status = 'collecting' AND ({join_ready})))
                 ORDER BY wt.task_id LIMIT ?3
             )
             UPDATE tasks
@@ -448,105 +354,8 @@ impl SqliteTaskRepo {
         rows.sort_unstable_by_key(|row| row.task_id);
         Ok(rows.into_iter().map(TaskRecord::from).collect())
     }
-
-    pub async fn list_all(&self, workflow_id: &str) -> Result<Vec<TaskRecord>, StorageError> {
-        let rows = sqlx::query_as::<_, TaskRow>(&format!(
-            "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = ?1 ORDER BY task_id"
-        ))
-        .bind(workflow_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(TaskRecord::from).collect())
-    }
-
-    /// Whether this workflow has claimable execution or final failure settlement work.
-    pub async fn executable_workflow_ids(
-        &self,
-        workflow_id: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        self.check_workflow(workflow_id)?;
-        let executable_where = executable_where("?2");
-        Ok(sqlx::query_scalar(&format!(
-            r#"
-            SELECT DISTINCT wt.workflow_id FROM tasks wt
-            WHERE wt.workflow_id = ?1 AND {executable_where}
-            ORDER BY wt.workflow_id
-            "#
-        ))
-        .bind(workflow_id)
-        .bind(Json(self.graph.join_rules()))
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
-    pub async fn get(
-        &self,
-        workflow_id: &str,
-        task_id: i64,
-    ) -> Result<Option<TaskRecord>, StorageError> {
-        let row = sqlx::query_as::<_, TaskRow>(&format!(
-            "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = ?1 AND task_id = ?2"
-        ))
-        .bind(workflow_id)
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(TaskRecord::from))
-    }
-
-    /// Complete the current claim without creating successors.
-    pub async fn succeed(
-        &self,
-        task: &TaskRecord,
-        output: &Value,
-    ) -> Result<TaskRecord, StorageError> {
-        self.succeed_and_enqueue(task, output, &[]).await
-    }
-
-    pub async fn fail(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
-        self.fail_and_enqueue(task, error, &[]).await
-    }
-
-    pub async fn supersede(&self, task: &TaskRecord, error: &str) -> Result<(), StorageError> {
-        self.set_terminal(task, TaskStatus::Superseded.as_str(), error)
-            .await
-    }
-
-    pub async fn skip(&self, task: &TaskRecord, reason: &str) -> Result<(), StorageError> {
-        self.set_terminal(task, TaskStatus::Skipped.as_str(), reason)
-            .await
-    }
-
-    async fn set_terminal(
-        &self,
-        task: &TaskRecord,
-        status: &str,
-        error: &str,
-    ) -> Result<(), StorageError> {
-        self.check_workflow(&task.workflow_id)?;
-        let result = sqlx::query(
-            r#"
-            UPDATE tasks SET status = ?3, error = ?4, lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND task_id = ?2
-              AND worker_id IS ?7
-              AND status = 'running' AND attempt = ?5
-              AND (attempt <= ?6 OR ?3 IN ('failed', 'superseded'))
-              AND julianday(lease_until) > julianday('now')
-            "#,
-        )
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(status)
-        .bind(error)
-        .bind(task.attempt)
-        .bind(MAX_ATTEMPTS)
-        .bind(self.worker_id.as_deref())
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(claim_lost(task));
-        }
-        Ok(())
-    }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/sqlite.rs"]
+mod tests;

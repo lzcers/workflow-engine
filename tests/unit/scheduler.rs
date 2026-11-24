@@ -152,9 +152,9 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         .build()
         .unwrap(),
     );
-    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone());
+    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone(), None);
     let input = TaskSeed::new("timeout", "pending", json!(41));
-    repo.enqueue(&input).await.unwrap();
+    repo.seed_task(&input).await.unwrap();
     for _ in 1..crate::task::MAX_ATTEMPTS {
         let previous = repo.claim_many("timeout", 1).await.unwrap().remove(0);
         repo.release_claim(&previous).await.unwrap();
@@ -241,8 +241,8 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
         .build()
         .unwrap(),
     );
-    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone());
-    repo.enqueue(&TaskSeed::new("expired", "pending", json!(0)))
+    let repo = SqliteTaskRepo::new(pool.clone(), graph.clone(), None);
+    repo.seed_task(&TaskSeed::new("expired", "pending", json!(0)))
         .await
         .unwrap();
     let claim = repo.claim_many("expired", 1).await.unwrap().remove(0);

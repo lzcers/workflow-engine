@@ -402,6 +402,59 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
 }
 
 #[test]
+fn described_entry_checks_only_its_declared_scope_chain() {
+    let mut description = workflow! {
+        workflow_id: "entries";
+        title: "Entries";
+        context: Ctx;
+        nodes { root => PassThrough }
+        subgraph outer {
+            subgraph inner { nodes { leaf => PassThrough } }
+        }
+        edges { root -> outer.inner.leaf }
+    }
+    .unwrap()
+    .describe();
+    let leaf = "outer.inner.leaf";
+    let input = serde_json::Value::Null;
+
+    description.edges[0].target = "unregistered".into();
+    assert!(description.validate_subgraphs().is_err());
+    assert_eq!(
+        description.task(leaf, input.clone()).unwrap().subgraph_path,
+        ["outer", "outer.inner"]
+    );
+
+    let duplicate = description
+        .nodes
+        .iter()
+        .find(|node| node.id == leaf)
+        .unwrap()
+        .clone();
+    description.nodes.push(duplicate);
+    assert!(description.task(leaf, input.clone()).is_err());
+    description.nodes.pop();
+    description.subgraphs.push(description.subgraphs[0].clone());
+    assert!(description.task(leaf, input.clone()).is_err());
+    description.subgraphs.pop();
+    description.subgraphs[0].parent_id = Some("outer.inner".into());
+    assert!(description.task(leaf, input.clone()).is_err());
+    description.subgraphs.remove(0);
+    assert!(description.task(leaf, input.clone()).is_err());
+    assert!(
+        description
+            .task("root", input.clone())
+            .unwrap()
+            .subgraph_path
+            .is_empty()
+    );
+    assert!(matches!(
+        description.task("unknown", input),
+        Err(workflow_engine::EngineError::UnknownNode(_))
+    ));
+}
+
+#[test]
 fn interleaved_subgraph_declarations_preserve_construction_order() {
     let mut order = Vec::new();
     let graph = workflow! {

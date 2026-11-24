@@ -73,20 +73,17 @@ pub struct Successor {
     pub new_scope_per_input: bool,
 }
 
-pub(crate) fn subgraph_path<'a>(
-    subgraphs: &'a [SubgraphDescription],
-    mut current: Option<&'a str>,
-) -> Vec<String> {
-    let mut path = Vec::new();
-    while let Some(id) = current {
-        path.push(id.to_owned());
-        current = subgraphs
-            .iter()
-            .find(|subgraph| subgraph.id == id)
-            .and_then(|subgraph| subgraph.parent_id.as_deref());
-    }
-    path.reverse();
-    path
+fn qualified_parent(id: &str) -> Option<&str> {
+    id.rsplit_once('.').map(|(parent, _)| parent)
+}
+
+/// 已校验的子图 ID 由各级子图全名逐级限定。
+fn subgraph_path(group: Option<&str>) -> impl Iterator<Item = &str> {
+    group.into_iter().flat_map(|id| {
+        id.match_indices('.')
+            .map(move |(separator, _)| &id[..separator])
+            .chain(std::iter::once(id))
+    })
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -169,10 +166,8 @@ impl<Ctx> Graph<Ctx> {
 
     /// 节点所属子图路径；根节点为 Some([])，不存在的节点为 None。
     pub fn subgraph_path(&self, name: &str) -> Option<Vec<String>> {
-        Some(subgraph_path(
-            &self.subgraphs,
-            self.nodes.get(name)?.subgraph_id.as_deref(),
-        ))
+        let group = self.nodes.get(name)?.subgraph_id.as_deref();
+        Some(subgraph_path(group).map(str::to_owned).collect())
     }
 
     /// 所有成功边分别规划；不同 foreach 边不合并，也不按下标隐式配对。

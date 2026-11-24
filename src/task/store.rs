@@ -9,10 +9,28 @@ use serde_json::Value;
 
 use super::{Task, TaskRecord};
 use crate::RunHandle;
-use crate::{error::StorageError, graph::Successor};
+use crate::{
+    error::StorageError,
+    graph::{ErasedGraph, Successor},
+};
 
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
+
+pub(crate) fn check_workflow(
+    graph: &dyn ErasedGraph,
+    workflow_id: &str,
+) -> Result<(), StorageError> {
+    if workflow_id != graph.workflow_id() {
+        return Err(StorageError::InvalidFanout {
+            detail: format!(
+                "workflow {workflow_id} does not match bound graph {}",
+                graph.workflow_id()
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// 将前驱贡献合并到 JOIN 的累积对象；同名 key 合为数组，已有数组及新贡献数组按元素追加。
 /// 后端在结算事务内更新尚未认领的 JOIN。
@@ -45,12 +63,12 @@ pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<
 
 /// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。
 ///
-/// 每张图绑定独立仓储并共享数据库连接池；仓储共享图的只读查询，负责 JOIN 判断。
+/// 仓储绑定工作流图和可选的 worker 身份，从图中读取 JOIN 规则。
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
 /// 具体存储实现使用统一的 [`TaskRecord`] 快照，并将操作限制在任务所属的工作流内。
 ///
 /// 认领资格与结算语义由本契约统一规定，后端负责事务实现；结算必须原子提交任务状态
-/// 与全部后继，失败则整体回滚。认领与恢复扫描必须使用一致的可执行性规则。
+/// 与全部后继，失败则整体回滚。
 pub(crate) trait TaskStore: Sync {
     /// 存储层错误类型：允许不同存储实现定义各自的错误，同时保证引擎层可统一传播
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。

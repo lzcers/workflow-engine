@@ -7,67 +7,47 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::repo::PgTaskRepo;
-use super::{repo::ROW_COLS, rows::TaskRow, scope};
+use super::scope;
 use crate::error::StorageError;
 use crate::graph::Successor;
 use crate::task::TaskStore;
 use crate::task::scope::ScopeEntries;
-use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
-
-/// 入口入队与工作流句柄共享同一事务语义，包括深层子图入口的 scope 链。
-pub(super) async fn insert_task(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    task: &Task,
-    status: TaskStatus,
-    run_id: Option<i64>,
-    source_scope_id: Option<i64>,
-    parent_task_ids: &[i64],
-) -> Result<TaskRecord, StorageError> {
-    // 子图入口需要在写入作用域时引用即将创建的任务。
-    let task_id: i64 =
-        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('tasks', 'task_id'))")
-            .fetch_one(&mut **tx)
-            .await?;
-    let run_id = Some(run_id.unwrap_or(task_id));
-    let scope_id = scope::route(
-        tx,
-        &task.workflow_id,
-        run_id,
-        source_scope_id,
-        &task.subgraph_path,
-        task_id,
-        false,
-        &mut ScopeEntries::new(),
-    )
-    .await?;
-    let sql = format!(
-        "INSERT INTO tasks
-         (workflow_id, task_id, run_id, name, status, parent_task_ids, input_json, scope_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {ROW_COLS}"
-    );
-    let row = sqlx::query_as::<_, TaskRow>(&sql)
-        .bind(&task.workflow_id)
-        .bind(task_id)
-        .bind(run_id)
-        .bind(&task.name)
-        .bind(status.as_str())
-        .bind(parent_task_ids)
-        .bind(&task.input)
-        .bind(scope_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    Ok(row.into())
-}
+use crate::task::store::check_workflow;
+use crate::{Database, RunHandle, Task, TaskRecord};
 
 impl Database<&mut sqlx::Transaction<'_, sqlx::Postgres>> {
-    /// 将任务及其入口作用域写入宿主事务，由调用方提交或回滚。
+    /// 在宿主事务内创建独立运行，同时建立入口所属的子图作用域。
     pub async fn submit(self, task: Task) -> Result<RunHandle, StorageError> {
         let tx = self.0;
-        let root = insert_task(tx, &task, TaskStatus::Pending, None, None, &[]).await?;
-        super::repo::notify_tasks_ready(tx, &task.workflow_id).await?;
+        let run_id: i64 =
+            sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('tasks', 'task_id'))")
+                .fetch_one(&mut **tx)
+                .await?;
+        let scope_id = scope::route(
+            tx,
+            &task.workflow_id,
+            Some(run_id),
+            None,
+            &task.subgraph_path,
+            run_id,
+            false,
+            &mut ScopeEntries::new(),
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO tasks (workflow_id, task_id, run_id, name, status, input_json, scope_id)
+             VALUES ($1, $2, $2, $3, 'pending', $4, $5)",
+        )
+        .bind(&task.workflow_id)
+        .bind(run_id)
+        .bind(task.name)
+        .bind(task.input)
+        .bind(scope_id)
+        .execute(&mut **tx)
+        .await?;
         Ok(RunHandle {
-            workflow_id: root.workflow_id,
-            run_id: root.task_id,
+            workflow_id: task.workflow_id,
+            run_id,
         })
     }
 }
@@ -77,7 +57,7 @@ impl TaskStore for PgTaskRepo {
 
     fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, StorageError>> {
         Box::pin(async move {
-            self.check_workflow(&task.workflow_id)?;
+            check_workflow(self.graph.as_ref(), &task.workflow_id)?;
             Database::from(self.pool.clone()).submit(task).await
         })
     }

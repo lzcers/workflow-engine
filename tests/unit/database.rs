@@ -19,6 +19,7 @@ fn repository(database: &Database) -> SqliteTaskRepo {
                 &[("start", crate::graph::TaskType::Normal, None)],
                 &[],
             ),
+            None,
         ),
         #[cfg(feature = "pg")]
         DatabasePool::Postgres(_) => panic!("SQLite URL must select SQLite"),

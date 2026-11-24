@@ -17,10 +17,6 @@ mod scope;
 mod store;
 
 #[cfg(test)]
-#[path = "../../../tests/unit/sqlite.rs"]
-mod tests;
-
-#[cfg(test)]
 #[path = "../../../tests/unit/sqlite_scheduler.rs"]
 mod scheduler_tests;
 

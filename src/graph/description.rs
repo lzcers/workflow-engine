@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use super::{Graph, Trigger};
+use super::{Graph, Trigger, qualified_parent, subgraph_path};
 
 /// 已构建执行图的可序列化拓扑。节点按 ID 排序，边按成功/失败及各自注册顺序输出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +118,34 @@ impl<Ctx> Graph<Ctx> {
     }
 }
 
+impl SubgraphDescription {
+    fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty() || self.title.trim().is_empty() {
+            return Err("subgraph id and title must not be empty".into());
+        }
+        if qualified_parent(&self.id) != self.parent_id.as_deref() {
+            return Err(format!(
+                "subgraph {} must use its full parent-qualified name",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl NodeDescription {
+    fn scope_path(&self) -> Result<impl Iterator<Item = &str>, String> {
+        let subgraph = self.subgraph_id.as_deref();
+        if subgraph.is_some() && qualified_parent(&self.id) != subgraph {
+            return Err(format!(
+                "node {} must use its full subgraph-qualified name",
+                self.id
+            ));
+        }
+        Ok(subgraph_path(subgraph))
+    }
+}
+
 impl GraphDescription {
     /// 从图描述构造可直接提交的入口任务，并解析其子图作用域。
     pub fn task(
@@ -125,74 +153,71 @@ impl GraphDescription {
         entry: &str,
         input: serde_json::Value,
     ) -> Result<crate::Task, crate::EngineError> {
-        let node = self
-            .nodes
-            .iter()
-            .find(|node| node.id == entry)
+        let mut entries = self.nodes.iter().filter(|node| node.id == entry);
+        let node = entries
+            .next()
             .ok_or_else(|| crate::EngineError::UnknownNode(entry.to_owned()))?;
-        self.validate_subgraphs()
-            .map_err(|detail| crate::error::StorageError::InvalidFanout { detail })?;
+        if entries.next().is_some() {
+            return Err(crate::error::StorageError::InvalidFanout {
+                detail: format!("duplicate node id: {entry}"),
+            }
+            .into());
+        }
         let mut task = crate::Task::new(&self.workflow_id, entry, input);
-        task.subgraph_path = super::subgraph_path(&self.subgraphs, node.subgraph_id.as_deref());
+        task.subgraph_path = self
+            .entry_path(node)
+            .map_err(|detail| crate::error::StorageError::InvalidFanout { detail })?;
         Ok(task)
+    }
+
+    fn entry_path(&self, node: &NodeDescription) -> Result<Vec<String>, String> {
+        let mut path = Vec::new();
+        for id in node.scope_path()? {
+            let mut groups = self.subgraphs.iter().filter(|group| group.id == id);
+            let group = groups
+                .next()
+                .ok_or_else(|| format!("subgraph {id} not registered"))?;
+            if groups.next().is_some() {
+                return Err(format!("duplicate subgraph id: {id}"));
+            }
+            group.validate()?;
+            path.push(id.to_owned());
+        }
+        Ok(path)
     }
 
     /// 校验静态归属以及 foreach 的边界。允许普通边直接连接子图内部节点。
     pub fn validate_subgraphs(&self) -> Result<(), String> {
-        let mut groups = HashMap::new();
-        let node_ids: HashSet<_> = self.nodes.iter().map(|node| node.id.as_str()).collect();
-        for group in &self.subgraphs {
-            if group.id.is_empty() || group.title.trim().is_empty() {
-                return Err("subgraph id and title must not be empty".into());
-            }
-            if groups.insert(group.id.as_str(), group).is_some()
-                || node_ids.contains(group.id.as_str())
-            {
-                return Err(format!("duplicate subgraph id: {}", group.id));
-            }
-            if group.id.rsplit_once('.').map(|(parent, _)| parent) != group.parent_id.as_deref() {
-                return Err(format!(
-                    "subgraph {} must use its full parent-qualified name",
-                    group.id
-                ));
-            }
-        }
-        let mut paths = HashMap::new();
-        for group in &self.subgraphs {
-            let mut path = Vec::new();
-            let mut seen = HashSet::new();
-            let mut current = Some(group.id.as_str());
-            while let Some(id) = current {
-                if !seen.insert(id) {
-                    return Err(format!("subgraph hierarchy contains a cycle at {id}"));
-                }
-                let group = groups
-                    .get(id)
-                    .ok_or_else(|| format!("subgraph {id} not registered"))?;
-                path.push(id.to_owned());
-                current = group.parent_id.as_deref();
-            }
-            path.reverse();
-            paths.insert(group.id.as_str(), path);
-        }
         let mut node_paths = HashMap::new();
         for node in &self.nodes {
-            let path = match node.subgraph_id.as_deref() {
-                Some(id) => paths
-                    .get(id)
-                    .ok_or_else(|| format!("node {}: subgraph {id} not registered", node.id))?
-                    .clone(),
-                None => Vec::new(),
-            };
-            if let Some(id) = node.subgraph_id.as_deref() {
-                if node.id.rsplit_once('.').map(|(parent, _)| parent) != Some(id) {
-                    return Err(format!(
-                        "node {} must use its full subgraph-qualified name",
-                        node.id
-                    ));
-                }
+            if node_paths
+                .insert(node.id.as_str(), node.scope_path()?.collect::<Vec<_>>())
+                .is_some()
+            {
+                return Err(format!("duplicate node id: {}", node.id));
             }
-            node_paths.insert(node.id.as_str(), path);
+        }
+        let mut groups = HashSet::new();
+        for group in &self.subgraphs {
+            if !groups.insert(group.id.as_str()) || node_paths.contains_key(group.id.as_str()) {
+                return Err(format!("duplicate subgraph id: {}", group.id));
+            }
+            group.validate()?;
+        }
+        // 已验证每个父 ID 都是严格更短的限定名前缀，逐条确认父级存在即可保证父链完整。
+        for group in &self.subgraphs {
+            if let Some(parent) = &group.parent_id
+                && !groups.contains(parent.as_str())
+            {
+                return Err(format!("subgraph {parent} not registered"));
+            }
+        }
+        for node in &self.nodes {
+            if let Some(id) = &node.subgraph_id
+                && !groups.contains(id.as_str())
+            {
+                return Err(format!("node {}: subgraph {id} not registered", node.id));
+            }
         }
         for edge in &self.edges {
             let source = node_paths
