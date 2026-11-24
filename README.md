@@ -97,7 +97,7 @@ DDL 只初始化当前 schema，不迁移旧表；旧 schema 数据库需要另�
 `engine.make(graph)` 接收 `Graph<Ctx>` 并返回非泛型的 `Workflow`，构造时立即启动一个后台调度器，
 因此必须在 Tokio runtime 内调用。调度器会认领当前图已有的可执行任务，无需先提交新运行。
 同一 Engine 可以创建不同上下文类型的工作流；它们共享连接池，各自拥有绑定图的仓储和独立的调度器。
-仓储直接实现任务存储接口。`Workflow`、仓储和后台调度器共享同一个 `Graph<Ctx>`，
+`Engine::make` 将同一个 `TaskStore` 交给 `Workflow` 和调度器。两者和仓储共享同一个 `Graph<Ctx>`，
 节点执行仍保留类型约束。宿主可以直接将不同上下文的工作流放入同一集合，
 并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型、子图路径、前驱和触发声明。
 节点查询对未知名称返回 `None`；创建任务及后继时要求目标属于绑定图，且工作流 ID 一致。
@@ -152,7 +152,7 @@ where
 
 ### 从控制面入队，在独立进程执行
 
-多机部署使用共享 PostgreSQL，单机进程也可连接同一个 SQLite 文件。进程可以通过 `Database::connect(url)` 建立连接，或用已有 SQLx 连接池构造 `Database::Postgres(pool)`、`Database::Sqlite(pool)`，然后调用 `database.initialize().await` 建表。
+多机部署使用共享 PostgreSQL，单机进程也可连接同一个 SQLite 文件。进程可以通过 `Database::connect(url)` 建立连接，或用已有 SQLx 连接池构造 `Database::from(pool)`，然后调用 `database.initialize().await` 建表。
 
 每个 `workflow_id` 对应一个不可变定义。向根节点提交独立运行时，只需构造一个任务。
 
@@ -164,13 +164,13 @@ let run = database.submit(Task::new(workflow_id, "start", input)).await?;
 
 控制面接受用户选择的节点时，可用 `description.task(entry, input)?` 校验节点并填好子图路径，再将这个任务交给存储。存储分配 run ID，并为子图入口创建运行时的作用域。
 
-cron 需要同时记录本次触发已处理。通过 `SubmitTask` 可以在已有 SQLx 事务中提交同一个任务，随后推进游标并一起提交。
+cron 需要同时记录本次触发已处理。通过 `Database::in_transaction(&mut tx)` 复用已有的 SQLx 事务，任务和游标一起提交或回滚。
 
 ```rust,ignore
-use workflow_engine::SubmitTask;
+use workflow_engine::Database;
 
 let mut tx = pool.begin().await?;
-let run = tx.submit(task).await?;
+let run = Database::in_transaction(&mut tx).submit(task).await?;
 advance_schedule(&mut tx, next_at).await?;
 tx.commit().await?;
 ```
@@ -182,7 +182,7 @@ let engine = Engine::from_database(database).with_worker(worker_id);
 let workflow = engine.make(graph);
 ```
 
-宿主持有 `Workflow` 以维持调度器生命周期。每个调度器认领本图 `workflow_id` 下的任务，并在每次认领时记录实例 ID。工作流变化时使用新的 ID，旧 ID 的运行由旧 worker 完成。进程内的 `Workflow::submit` 使用同一存储入口，并在提交后唤醒本地调度器。
+宿主持有 `Workflow` 以维持调度器生命周期。每个调度器认领本图 `workflow_id` 下的任务，并在每次认领时记录实例 ID。工作流变化时使用新的 ID，旧 ID 的运行由旧 worker 完成。进程内的 `Workflow::submit` 通过绑定图的 `TaskStore::enqueue` 提交，成功后立即唤醒本地调度器。Server 直接调用 `Database::submit`，两条路径复用相同的数据库写入。
 
 ## 关键机制
 

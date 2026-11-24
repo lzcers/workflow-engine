@@ -28,7 +28,7 @@ pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_
 /// One graph's task repository. Clones share its connection pool and graph.
 #[derive(Clone)]
 pub struct SqliteTaskRepo {
-    pool: SqlitePool,
+    pub(super) pool: SqlitePool,
     graph: Arc<dyn ErasedGraph>,
     worker_id: Option<String>,
 }
@@ -159,7 +159,7 @@ impl SqliteTaskRepo {
         }
     }
 
-    fn check_workflow(&self, workflow_id: &str) -> Result<(), StorageError> {
+    pub(super) fn check_workflow(&self, workflow_id: &str) -> Result<(), StorageError> {
         if workflow_id != self.graph.workflow_id() {
             return Err(StorageError::InvalidFanout {
                 detail: format!(

@@ -1,51 +1,50 @@
 //! 数据库连接、引擎表初始化与任务存储创建；后端选择由连接 URL 决定。
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
-#[cfg(feature = "pg")]
-use crate::backend::pgsql::PgTaskRepo;
-#[cfg(feature = "sqlite")]
-use crate::backend::sqlite::SqliteTaskRepo;
 use crate::error::StorageError;
-use crate::graph::ErasedGraph;
-use crate::task::TaskStore;
 use crate::{RunHandle, Task};
 
-/// 工作流存储的共享连接句柄。
-///
-/// 克隆句柄共享同一个连接池；调用 [`Self::close`] 会关闭所有克隆使用的池。
-/// 后端连接池用于需要与业务 SQL 共用事务的集成，普通初始化与健康检查不需要解包。
+/// 工作流数据库。默认共享连接池，也可以借用宿主事务来提交任务。
 #[derive(Clone)]
-pub enum Database {
+pub struct Database<C = DatabasePool>(pub(crate) C);
+
+/// 通过数据库 URL 选择的共享连接池。
+#[derive(Clone)]
+pub enum DatabasePool {
     #[cfg(feature = "pg")]
     Postgres(sqlx::PgPool),
     #[cfg(feature = "sqlite")]
     Sqlite(sqlx::SqlitePool),
 }
 
-/// 在宿主已有的 PostgreSQL 或 SQLite 事务内提交入口任务，由宿主统一提交或回滚。
-pub trait SubmitTask {
-    fn submit(
-        &mut self,
-        task: Task,
-    ) -> impl std::future::Future<Output = Result<RunHandle, StorageError>> + Send;
-}
-
 #[cfg(feature = "pg")]
-impl SubmitTask for sqlx::Transaction<'_, sqlx::Postgres> {
-    async fn submit(&mut self, task: Task) -> Result<RunHandle, StorageError> {
-        <PgTaskRepo as TaskStore>::enqueue(self, task).await
+impl From<sqlx::PgPool> for Database {
+    fn from(pool: sqlx::PgPool) -> Self {
+        Self(DatabasePool::Postgres(pool))
     }
 }
 
 #[cfg(feature = "sqlite")]
-impl SubmitTask for sqlx::Transaction<'_, sqlx::Sqlite> {
-    async fn submit(&mut self, task: Task) -> Result<RunHandle, StorageError> {
-        <SqliteTaskRepo as TaskStore>::enqueue(self, task).await
+impl From<sqlx::SqlitePool> for Database {
+    fn from(pool: sqlx::SqlitePool) -> Self {
+        Self(DatabasePool::Sqlite(pool))
     }
 }
 
 impl Database {
+    /// 在宿主已有的 SQLx 事务上提交任务，借用在提交任务后结束。
+    pub fn in_transaction<'a, 'c, DB: sqlx::Database>(
+        tx: &'a mut sqlx::Transaction<'c, DB>,
+    ) -> Database<&'a mut sqlx::Transaction<'c, DB>> {
+        Database(tx)
+    }
+
+    /// 访问共享的 SQLx 连接池，可用于开启包含宿主业务写入的事务。
+    pub fn pool(&self) -> &DatabasePool {
+        &self.0
+    }
+
     /// 根据 URL 连接 PostgreSQL 或 SQLite，不创建引擎表、不启动 worker。
     ///
     /// PostgreSQL 使用最多 10 个连接；SQLite 可写文件使用 WAL 和最多 4 个连接。
@@ -62,7 +61,7 @@ impl Database {
                         .acquire_timeout(Duration::from_secs(5))
                         .connect(url)
                         .await?;
-                    Ok(Self::Postgres(pool))
+                    Ok(Self::from(pool))
                 }
                 #[cfg(not(feature = "pg"))]
                 {
@@ -126,7 +125,7 @@ impl Database {
                             }
                         }
                     }
-                    Ok(Self::Sqlite(pool_options.connect_with(options).await?))
+                    Ok(Self::from(pool_options.connect_with(options).await?))
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
@@ -139,66 +138,43 @@ impl Database {
 
     /// 持久化一个独立运行的入口任务，返回已提交的运行身份。
     pub async fn submit(&self, task: Task) -> Result<RunHandle, StorageError> {
-        match self {
+        match &self.0 {
             #[cfg(feature = "pg")]
-            Self::Postgres(pool) => {
+            DatabasePool::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
-                let run = tx.submit(task).await?;
+                let run = Self::in_transaction(&mut tx).submit(task).await?;
                 tx.commit().await?;
                 Ok(run)
             }
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => {
+            DatabasePool::Sqlite(pool) => {
                 let mut tx = pool.begin().await?;
-                let run = tx.submit(task).await?;
+                let run = Self::in_transaction(&mut tx).submit(task).await?;
                 tx.commit().await?;
                 Ok(run)
             }
-        }
-    }
-
-    /// 为一张图创建仓储并共享原始图；不同图的仓储共享当前数据库连接池。
-    /// 由 Engine 内部调用，不重新连接或初始化表。
-    pub(crate) fn task_store(
-        &self,
-        graph: Arc<dyn ErasedGraph>,
-        worker_id: Option<&str>,
-    ) -> Arc<dyn TaskStore<Error = StorageError> + Send> {
-        match (self, worker_id) {
-            #[cfg(feature = "pg")]
-            (Self::Postgres(pool), Some(id)) => {
-                Arc::new(PgTaskRepo::for_worker(pool.clone(), graph, id))
-            }
-            #[cfg(feature = "pg")]
-            (Self::Postgres(pool), None) => Arc::new(PgTaskRepo::new(pool.clone(), graph)),
-            #[cfg(feature = "sqlite")]
-            (Self::Sqlite(pool), Some(id)) => {
-                Arc::new(SqliteTaskRepo::for_worker(pool.clone(), graph, id))
-            }
-            #[cfg(feature = "sqlite")]
-            (Self::Sqlite(pool), None) => Arc::new(SqliteTaskRepo::new(pool.clone(), graph)),
         }
     }
 
     /// 幂等创建引擎自有表。调用方显式选择初始化时机。
     pub async fn initialize(&self) -> Result<(), StorageError> {
-        match self {
+        match &self.0 {
             #[cfg(feature = "pg")]
-            Self::Postgres(pool) => crate::backend::pgsql::migrate(pool).await,
+            DatabasePool::Postgres(pool) => crate::backend::pgsql::migrate(pool).await,
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => crate::backend::sqlite::migrate(pool).await,
+            DatabasePool::Sqlite(pool) => crate::backend::sqlite::migrate(pool).await,
         }
     }
 
     /// 验证连接池能够执行查询，不修改数据或检查业务任务状态。
     pub async fn check(&self) -> Result<(), StorageError> {
-        match self {
+        match &self.0 {
             #[cfg(feature = "pg")]
-            Self::Postgres(pool) => {
+            DatabasePool::Postgres(pool) => {
                 sqlx::query("SELECT 1").execute(pool).await?;
             }
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => {
+            DatabasePool::Sqlite(pool) => {
                 sqlx::query("SELECT 1").execute(pool).await?;
             }
         }
@@ -207,11 +183,11 @@ impl Database {
 
     /// 关闭共享连接池，等待已借出的连接归还。
     pub async fn close(&self) {
-        match self {
+        match &self.0 {
             #[cfg(feature = "pg")]
-            Self::Postgres(pool) => pool.close().await,
+            DatabasePool::Postgres(pool) => pool.close().await,
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(pool) => pool.close().await,
+            DatabasePool::Sqlite(pool) => pool.close().await,
         }
     }
 }

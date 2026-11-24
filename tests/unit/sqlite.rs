@@ -6,7 +6,7 @@ use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 use super::{SqliteTaskRepo, migrate};
 #[path = "graph_fixture.rs"]
 mod graph_fixture;
-use crate::SubmitTask;
+use crate::Database;
 use crate::backend::task_fixture::TaskSeed;
 use crate::error::StorageError;
 use crate::graph::{Successor, TaskType};
@@ -1049,7 +1049,10 @@ async fn transactional_submit_and_claims_follow_workflow_and_worker_ownership() 
     let replacement = SqliteTaskRepo::for_worker(pool.clone(), graph, "worker-b");
 
     let mut tx = pool.begin().await.unwrap();
-    let run = tx.submit(task.clone()).await.unwrap();
+    let run = Database::in_transaction(&mut tx)
+        .submit(task.clone())
+        .await
+        .unwrap();
     tx.rollback().await.unwrap();
     assert!(first.get(id, run.run_id).await.unwrap().is_none());
     assert_eq!(
@@ -1061,7 +1064,10 @@ async fn transactional_submit_and_claims_follow_workflow_and_worker_ownership() 
     );
 
     let mut tx = pool.begin().await.unwrap();
-    let run = tx.submit(task).await.unwrap();
+    let run = Database::in_transaction(&mut tx)
+        .submit(task)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     assert!(
         other

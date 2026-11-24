@@ -2,7 +2,7 @@
 
 use crate::{
     backend::sqlite::SqliteTaskRepo,
-    database::Database,
+    database::{Database, DatabasePool},
     error::StorageError,
     task::{Task, TaskStatus},
 };
@@ -11,8 +11,8 @@ use serde_json::json;
 mod graph_fixture;
 
 fn repository(database: &Database) -> SqliteTaskRepo {
-    match database {
-        Database::Sqlite(pool) => SqliteTaskRepo::new(
+    match database.pool() {
+        DatabasePool::Sqlite(pool) => SqliteTaskRepo::new(
             pool.clone(),
             graph_fixture::graph(
                 "connection-check",
@@ -21,7 +21,7 @@ fn repository(database: &Database) -> SqliteTaskRepo {
             ),
         ),
         #[cfg(feature = "pg")]
-        Database::Postgres(_) => panic!("SQLite URL must select SQLite"),
+        DatabasePool::Postgres(_) => panic!("SQLite URL must select SQLite"),
     }
 }
 

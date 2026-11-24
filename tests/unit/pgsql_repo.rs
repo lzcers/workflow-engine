@@ -156,9 +156,12 @@ async fn submitted_tasks_follow_workflow_and_worker_ownership() {
         &[("analysis.entry", "finish")],
     );
     let mut tx = pool.begin().await.unwrap();
-    use crate::SubmitTask;
+    use crate::Database;
     let task = graph.describe().task("analysis.entry", json!(1)).unwrap();
-    let submitted = tx.submit(task).await.unwrap();
+    let submitted = Database::in_transaction(&mut tx)
+        .submit(task)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let other_id = "distributed-other";

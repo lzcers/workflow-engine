@@ -31,12 +31,12 @@
 
 ## 实例启动与提交
 
-`Engine::make(graph)` 构造 Workflow 和 Scheduler，并启动一次后台 `scheduler.run()`。
+`Engine::make(graph)` 为图和 worker 绑定一个 `TaskStore`，将同一实例交给 Workflow 和 Scheduler，并启动后台 `scheduler.run()`。
 因此 `make` 必须在 Tokio runtime 内调用。调度器开始认领该图已有的可执行任务，无需先提交新运行。
 每次 `Workflow::submit(entry, input)` 按以下顺序执行：
 
-1. 将输入序列化为 JSON，根据图描述校验入口并构造带子图路径的 `Task`。节点 `In` 类型的反序列化检查留到实际执行阶段。
-2. 调用 `Database::submit(task)`。存储层在同一事务内分配 run ID、创建子图实例并保存入口任务。
+1. 将输入序列化为 JSON，从执行图读取入口节点的子图路径并构造 `Task`。节点 `In` 类型的反序列化检查留到实际执行阶段。
+2. 调用该图的 `TaskStore::enqueue(task)`。后端通过 `Database::submit(task)` 在同一事务内分配 run ID、创建子图实例并保存入口任务。
 3. 调用共享 `Notify::notify_one()` 唤醒认领，返回包含 `workflow_id` 和 `run_id` 的 `RunHandle`。
 
 成功返回表示入口任务已持久化并安排执行，不等待节点完成。提交不会创建调度器，
@@ -46,7 +46,7 @@
 宿主从 `Workflow::triggers()` 获取节点名及声明，自行注册触发器并在事件到达时调用 `submit`。
 Scheduler 不注册或监听触发源；已入队的 Event 任务按普通任务认领、执行与结算。
 
-控制面可以通过 `SubmitTask` 在已有的 SQLx 事务中调用 `tx.submit(task)`，让 cron 入队与触发游标共同提交。入口任务的 `task_id` 同时标识新 run。后继在执行端结算时继承同一个 `workflow_id` 和 `run_id`。
+控制面可以调用 `Database::in_transaction(&mut tx).submit(task)` 复用已有的 SQLx 事务，让 cron 入队与触发游标共同提交。入口任务的 `task_id` 同时标识新 run。后继在执行端结算时继承同一个 `workflow_id` 和 `run_id`。
 
 Workflow 持有图与存储的共享句柄，Engine 释放不影响它。执行期间需要保留 Workflow；
 实例释放会通过 `Workflow::drop` 中止后台任务，继而取消调度器的在途任务。

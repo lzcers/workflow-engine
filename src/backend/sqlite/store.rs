@@ -13,7 +13,7 @@ use crate::error::StorageError;
 use crate::graph::Successor;
 use crate::task::TaskStore;
 use crate::task::scope::ScopeEntries;
-use crate::{RunHandle, Task, TaskRecord, TaskStatus};
+use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
 
 /// Insert the task and allocate its run and scope in the caller's transaction.
 pub(super) async fn insert_task(
@@ -58,18 +58,25 @@ pub(super) async fn insert_task(
     Ok(row.into())
 }
 
-impl TaskStore for SqliteTaskRepo {
-    type Database = sqlx::Sqlite;
-    type Error = StorageError;
-
-    async fn enqueue(
-        tx: &mut sqlx::Transaction<'_, Self::Database>,
-        task: Task,
-    ) -> Result<RunHandle, StorageError> {
+impl Database<&mut sqlx::Transaction<'_, sqlx::Sqlite>> {
+    /// 将任务及其入口作用域写入宿主事务，由调用方提交或回滚。
+    pub async fn submit(self, task: Task) -> Result<RunHandle, StorageError> {
+        let tx = self.0;
         let root = insert_task(tx, &task, TaskStatus::Pending, None, None, &[]).await?;
         Ok(RunHandle {
             workflow_id: root.workflow_id,
             run_id: root.task_id,
+        })
+    }
+}
+
+impl TaskStore for SqliteTaskRepo {
+    type Error = StorageError;
+
+    fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, StorageError>> {
+        Box::pin(async move {
+            self.check_workflow(&task.workflow_id)?;
+            Database::from(self.pool.clone()).submit(task).await
         })
     }
 

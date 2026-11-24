@@ -52,22 +52,12 @@ pub(crate) fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<
 /// 认领资格与结算语义由本契约统一规定，后端负责事务实现；结算必须原子提交任务状态
 /// 与全部后继，失败则整体回滚。认领与恢复扫描必须使用一致的可执行性规则。
 pub(crate) trait TaskStore: Sync {
-    /// 入口入队使用调用方的数据库事务；调度器通过仓储实例执行其余操作。
-    type Database: sqlx::Database
-    where
-        Self: Sized;
-
     /// 存储层错误类型：允许不同存储实现定义各自的错误，同时保证引擎层可统一传播
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// 在已有事务中写入独立运行的入口及子图作用域。
-    fn enqueue(
-        tx: &mut sqlx::Transaction<'_, Self::Database>,
-        task: Task,
-    ) -> impl std::future::Future<Output = Result<RunHandle, Self::Error>> + Send
-    where
-        Self: Sized;
+    /// 提交当前图的独立入口任务，事务提交成功后返回运行身份。
+    fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, Self::Error>>;
 
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
     /// 时返回少于 `limit` 甚至空列表，按任务 ID 排序。`limit` 为 0 时直接返回空列表。

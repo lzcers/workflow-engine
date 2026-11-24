@@ -10,7 +10,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::backend::task_fixture::TaskSeed;
 use crate::{
     backend::sqlite::{SqliteTaskRepo, migrate},
-    database::Database,
+    database::{Database, DatabasePool},
     dsl,
     graph::{JoinNode, Node, NodeContext, NodeError},
     scheduler::Scheduler,
@@ -78,10 +78,10 @@ impl Node<Context> for Sum {
 async fn dsl_workflow_persists_fanout_join_and_final_output() {
     let database = Database::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();
-    let pool = match &database {
-        Database::Sqlite(pool) => pool.clone(),
+    let pool = match database.pool() {
+        DatabasePool::Sqlite(pool) => pool.clone(),
         #[cfg(feature = "pg")]
-        Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
+        DatabasePool::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
     };
 
     // start ─┬─ worker × 2 ─┬─ collect (JOIN) ─ total
@@ -234,10 +234,10 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
 async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
     let database = Database::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();
-    let pool = match &database {
-        Database::Sqlite(pool) => pool.clone(),
+    let pool = match database.pool() {
+        DatabasePool::Sqlite(pool) => pool.clone(),
         #[cfg(feature = "pg")]
-        Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
+        DatabasePool::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
     };
     let (completed, mut completions) = mpsc::unbounded_channel();
     let graph = dsl::workflow! {
@@ -358,10 +358,10 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
     for use_foreach in [false, true] {
         let database = Database::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
-        let pool = match &database {
-            Database::Sqlite(pool) => pool.clone(),
+        let pool = match database.pool() {
+            DatabasePool::Sqlite(pool) => pool.clone(),
             #[cfg(feature = "pg")]
-            Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
+            DatabasePool::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
         };
         let starts: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         let releases: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
@@ -518,10 +518,10 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
     for fail_source_a in [false, true] {
         let database = Database::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
-        let pool = match &database {
-            Database::Sqlite(pool) => pool.clone(),
+        let pool = match database.pool() {
+            DatabasePool::Sqlite(pool) => pool.clone(),
             #[cfg(feature = "pg")]
-            Database::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
+            DatabasePool::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
         };
         let starts: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         let releases: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();

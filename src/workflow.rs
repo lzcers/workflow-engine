@@ -5,10 +5,11 @@ use std::{any::Any, sync::Arc, time::Duration};
 use serde::Serialize;
 use tokio::{sync::Notify, task::JoinHandle};
 
-use crate::database::Database;
-use crate::graph::{ErasedGraph, GraphDescription};
+use crate::error::StorageError;
+use crate::graph::ErasedGraph;
 use crate::scheduler::Scheduler;
-use crate::{EngineError, Graph, NodeContext, Trigger};
+use crate::task::TaskStore;
+use crate::{EngineError, Graph, NodeContext, Task, Trigger};
 
 /// 一张固定图的非泛型工作流句柄，由 [`crate::Engine::make`] 创建。
 ///
@@ -18,8 +19,7 @@ use crate::{EngineError, Graph, NodeContext, Trigger};
 /// 执行期间需保留此实例；丢弃 Workflow 会取消调度器及在途任务。
 pub struct Workflow {
     graph: Arc<dyn ErasedGraph>,
-    description: GraphDescription,
-    database: Database,
+    store: Arc<dyn TaskStore<Error = StorageError> + Send>,
     worker: JoinHandle<()>,
     wake: Arc<Notify>,
 }
@@ -31,23 +31,22 @@ impl Drop for Workflow {
 }
 
 impl Workflow {
-    pub(crate) fn new<Ctx>(graph: Graph<Ctx>, database: Database, worker_id: Option<&str>) -> Self
+    pub(crate) fn new<Ctx>(
+        graph: Arc<Graph<Ctx>>,
+        store: Arc<dyn TaskStore<Error = StorageError> + Send>,
+    ) -> Self
     where
         Ctx: NodeContext + Sync + 'static,
     {
-        let graph = Arc::new(graph);
-        let description = graph.describe();
-        let store = database.task_store(graph.clone(), worker_id);
         let wake = Arc::new(Notify::new());
-        let scheduler =
-            Scheduler::new(graph.clone(), store, Duration::from_secs(1)).with_wake(wake.clone());
+        let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_secs(1))
+            .with_wake(wake.clone());
         let worker = tokio::spawn(async move {
             scheduler.run().await;
         });
         Self {
             graph,
-            description,
-            database,
+            store,
             worker,
             wake,
         }
@@ -86,8 +85,16 @@ impl Workflow {
         entry: &str,
         input: impl Serialize,
     ) -> Result<RunHandle, EngineError> {
-        let task = self.description.task(entry, serde_json::to_value(input)?)?;
-        let run = self.database.submit(task).await?;
+        let mut task = Task::new(
+            self.graph.workflow_id(),
+            entry,
+            serde_json::to_value(input)?,
+        );
+        task.subgraph_path = self
+            .graph
+            .subgraph_path(entry)
+            .ok_or_else(|| EngineError::UnknownNode(entry.to_owned()))?;
+        let run = self.store.enqueue(task).await?;
         self.wake.notify_one();
         Ok(run)
     }

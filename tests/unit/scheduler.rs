@@ -303,14 +303,10 @@ impl Store {
 }
 
 impl TaskStore for Store {
-    type Database = sqlx::Sqlite;
     type Error = io::Error;
 
-    async fn enqueue(
-        _: &mut sqlx::Transaction<'_, Self::Database>,
-        _: crate::Task,
-    ) -> Result<crate::RunHandle, Self::Error> {
-        unreachable!("run_task receives an existing claim")
+    fn enqueue(&self, _: crate::Task) -> BoxFuture<'_, Result<crate::RunHandle, Self::Error>> {
+        Box::pin(async { unreachable!("run_task receives an existing claim") })
     }
 
     fn claim_many<'a>(

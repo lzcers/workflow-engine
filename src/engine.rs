@@ -1,5 +1,8 @@
 //! 可复用的引擎入口：连接数据库、创建共享存储并装配工作流实例。
 
+use std::sync::Arc;
+
+use crate::backend::TaskStoreFactory;
 use crate::database::Database;
 pub use crate::error::StorageError;
 use crate::{Graph, NodeContext, Workflow};
@@ -20,22 +23,23 @@ pub enum EngineError {
 /// 每次 [`Self::make`] 根据图创建独立的 Workflow 和 Scheduler，并立即启动后台调度。
 /// 默认使用 SQLite，也可通过 `pg` feature 启用 PostgreSQL。
 pub struct Engine {
-    database: Database,
+    stores: TaskStoreFactory,
     worker_id: Option<String>,
 }
 
 impl Engine {
     /// 根据 URL 连接数据库并幂等初始化引擎表。
     pub async fn new(url: &str) -> Result<Self, EngineError> {
-        let database = Database::connect(url).await?;
-        database.initialize().await?;
-        Ok(Self::from_database(database))
+        Ok(Self {
+            stores: TaskStoreFactory::connect(url).await?,
+            worker_id: None,
+        })
     }
 
     /// 复用宿主已经初始化的存储连接。
     pub fn from_database(database: Database) -> Self {
         Self {
-            database,
+            stores: TaskStoreFactory(database),
             worker_id: None,
         }
     }
@@ -60,6 +64,8 @@ impl Engine {
     where
         Ctx: NodeContext + Sync + 'static,
     {
-        Workflow::new(graph, self.database.clone(), self.worker_id.as_deref())
+        let graph = Arc::new(graph);
+        let store = self.stores.bind(graph.clone(), self.worker_id.as_deref());
+        Workflow::new(graph, store)
     }
 }

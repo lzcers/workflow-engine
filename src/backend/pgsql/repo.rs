@@ -194,7 +194,7 @@ async fn fail_blocked_joins(
 /// 当前工作流的 pgsql 仓储；克隆共享连接池和原始图。
 #[derive(Clone)]
 pub struct PgTaskRepo {
-    pool: PgPool,
+    pub(super) pool: PgPool,
     graph: Arc<dyn ErasedGraph>,
     worker_id: Option<String>,
 }
@@ -229,7 +229,7 @@ impl PgTaskRepo {
         }
     }
 
-    fn check_workflow(&self, workflow_id: &str) -> Result<(), StorageError> {
+    pub(super) fn check_workflow(&self, workflow_id: &str) -> Result<(), StorageError> {
         if workflow_id != self.graph.workflow_id() {
             return Err(StorageError::InvalidFanout {
                 detail: format!(
