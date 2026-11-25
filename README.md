@@ -7,7 +7,7 @@
 
 - 公共 API 围绕 `graph`、`engine`、`workflow`、`task` 和 `dsl` 组织；节点、上下文与建边接口属于图定义。
 - 通过 `Engine` 使用数据库，默认启用 SQLite；`pg` / `sqlite` feature 只选择后端，至少启用一个，也可同时启用。
-- 通过 `Engine::new(url).await` 创建可复用引擎，再用 `engine.make(graph)` 创建非泛型 `Workflow` 句柄并启动后台调度。
+- 通过 `Engine::new(url).await` 创建可复用引擎，再用 `engine.make(graph)`（或 `engine.make_with(graph, options)`）创建非泛型 `Workflow` 句柄并启动后台调度。
 - `Workflow::submit` 创建独立运行并唤醒调度器；数据库连接、任务存储、后端仓储和调度器由库内部管理。
 
 ## 公共模块
@@ -15,8 +15,8 @@
 | 模块 | 职责 |
 | --- | --- |
 | [`graph`](src/graph) | `Graph`、构图接口、节点 `Node`、上下文 `NodeContext`、`JoinNode`、成功/失败边与图描述 |
-| [`engine`](src/engine.rs) | `Engine` 按 URL 初始化共享连接池，通过 `make` 为不同的图创建工作流实例；`EngineError` 描述初始化与提交错误 |
-| [`workflow`](src/workflow.rs) | 单图 `Workflow` 提交独立运行并自动执行，返回 `RunHandle` |
+| [`engine`](src/engine.rs) | `Engine` 按 URL 初始化共享连接池，通过 `make` / `make_with` 为不同的图创建工作流实例；`EngineError` 描述初始化与提交错误 |
+| [`workflow`](src/workflow.rs) | 单图 `Workflow` 提交独立运行、自动执行并支持 `shutdown()` 优雅停机，返回 `RunHandle`，提供 `WorkerOptions` |
 | [`task`](src/task) | 任务输入 `Task`、任务快照 `TaskRecord` 与状态 `TaskStatus` |
 | [`dsl`](src/dsl.rs) | `workflow!` 宏将 `nodes { … }` 和 `edges { … }` 展开为图构建链，并做编译期类型接线校验 |
 
@@ -134,8 +134,8 @@ where
 选定入口需要能触达后续 JOIN 所需的前驱；多次 submit 不能补齐同一次运行的多个入口。
 `RunHandle` 保存 `workflow_id` 和 `run_id`。入口任务的 ID 即 `run_id`。
 提交成功后立即唤醒认领，返回时不等待运行结束。调度器执行当前图下所有已提交及后续
-提交的运行，空闲时持续等待。每个 Workflow 的所有运行共享一个调度器、8 个执行槽和
-1 秒轮询周期，提交不会再创建调度器。
+提交的运行，空闲时持续等待。每个 Workflow 的所有运行共享一个调度器，默认 8 个执行槽和
+1 秒轮询周期（可通过 `WorkerOptions` 自定义），提交不会再创建调度器。
 
 执行期间需要保持 Workflow 存活。正常退出可调用 `workflow.shutdown().await` 停止认领新任务并等待在途任务完成；
 直接丢弃 Workflow 会通过 Drop 取消后台调度器和在途节点，不等待结算完成；已持久化的任务仍保留在数据库。Engine 释放后 Workflow 仍可使用。
@@ -202,6 +202,9 @@ let workflow = engine.make(graph);
   attempt 和数据库时间下的租约有效性，过期租约不能复活，旧执行者不能提交结果。
   引擎不限制节点运行时长；业务超时由节点自行控制。终态提交后停止续租，回调仍占执行槽，
   由节点自行控制回调时长，并随 Workflow 释放而取消。
+- **可重试指数退避**：节点返回 `NodeError::Retryable` 且 `attempt < MAX_ATTEMPTS` 时，
+  调度器通过 `schedule_retry` 将任务置回 `pending`、清空租约并写入退避时间 `available_at`
+  （1s、2s…），不触发 `on_error`；`NodeError::Permanent` 或预算耗尽后再进入失败边规划与失败结算。
 - **统一最终失败**：`attempt` 是认领代次，引擎统一限制业务执行次数。
   `attempt > MAX_ATTEMPTS` 的认领只进行最终失败处理，不调用 `on_start` 和 `execute`。
   最后一次租约过期时记录租约失效原因，提前释放记录预算耗尽原因；恢复认领保留原因。
@@ -252,7 +255,7 @@ workflow-engine = { path = "../workflow-engine", default-features = false, featu
 
 构建一张图有两种方式（见 [`graph`](src/graph) 和 [`dsl`](src/dsl.rs)）：
 
-1. 命令式 `Graph::<Ctx>::builder(workflow_id, title, ctx).node(..).edge(..)…build()`；
+1. 命令式 `Graph::<Ctx>::builder(workflow_id, title, ctx).node(..).edge(..)…build()`（搭配 `graph::{passthrough, when, map, foreach, on_error, when_error}`）；
 2. 声明式 `dsl::workflow!(workflow_id: id; title: title; context: ctx; nodes { … } edges { … })`。
 
 图直接持有工作流身份、标题、上下文与构造完成的节点。

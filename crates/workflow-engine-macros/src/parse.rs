@@ -20,7 +20,6 @@ mod keyword {
     syn::custom_keyword!(when_error);
 }
 
-#[derive(Clone)]
 pub struct Workflow {
     pub workflow_id: Expr,
     pub title: Expr,
@@ -28,34 +27,30 @@ pub struct Workflow {
     pub region: Region,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct Region {
     pub items: Vec<RegionItem>,
     pub edges: Vec<Edge>,
 }
 
 /// A declaration in source order.
-#[derive(Clone)]
 pub enum RegionItem {
     Node(Node),
     Subgraph(Subgraph),
 }
 
-#[derive(Clone)]
 pub struct Node {
     pub name: Ident,
     pub instance: Expr,
     pub attributes: Vec<Attribute>,
 }
 
-#[derive(Clone)]
 pub struct Subgraph {
     pub name: Ident,
     pub attributes: Vec<Attribute>,
     pub region: Region,
 }
 
-#[derive(Clone)]
 pub struct NodePath {
     pub segments: Vec<Ident>,
 }
@@ -70,14 +65,12 @@ impl NodePath {
     }
 }
 
-#[derive(Clone)]
 pub struct Edge {
     pub source: NodePath,
     pub target: NodePath,
     pub clause: EdgeClause,
 }
 
-#[derive(Clone)]
 pub enum EdgeClause {
     Passthrough,
     Map(Expr),
