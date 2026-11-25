@@ -7,18 +7,16 @@ use std::collections::HashMap;
 
 use super::{join, scope};
 use crate::task::{
-    MAX_ATTEMPTS,
+    JoinRule, MAX_ATTEMPTS, SettlementRules, Successor,
     scope::{ScopeEntries, route_path},
+    store::{FanoutSource, LEASE_DURATION, merge_join_inputs},
 };
 use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
-use crate::graph::{ErasedGraph, JoinRule, Successor};
 use crate::{TaskRecord, TaskStatus};
-
-use crate::task::store::{FanoutSource, LEASE_DURATION, check_workflow, merge_join_inputs};
 
 /// Columns suitable for application queries against the same task table.
 pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
@@ -41,9 +39,9 @@ fn claim_lost(task: &TaskRecord) -> StorageError {
 /// The source settlement has already acquired the write lock in this transaction.
 async fn enqueue_fanouts_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    graph: &dyn ErasedGraph,
     source: &FanoutSource<'_>,
     fanouts: &[Successor],
+    rules: &SettlementRules,
 ) -> Result<(), StorageError> {
     if !fanouts.is_empty() {
         let chain = scope::chain(tx, source.workflow_id, source.scope_id).await?;
@@ -52,16 +50,10 @@ async fn enqueue_fanouts_in_tx(
             if plan.inputs.is_empty() {
                 continue;
             }
-            let destination =
-                graph
-                    .subgraph_path(plan.dst)
-                    .ok_or_else(|| StorageError::InvalidFanout {
-                        detail: format!("unknown successor node {}", plan.dst),
-                    })?;
             let (parent, entered) = route_path(
                 &chain,
                 source.run_id,
-                &destination,
+                &plan.subgraph_path,
                 plan.new_scope_per_input,
             )?;
             if plan.new_scope_per_input {
@@ -99,7 +91,7 @@ async fn enqueue_fanouts_in_tx(
             }
         }
     }
-    advance_joins(tx, source.workflow_id, source.run_id, graph.join_rules()).await
+    advance_joins(tx, source.workflow_id, source.run_id, &rules.join_rules).await
 }
 
 async fn collect_join(
@@ -216,12 +208,11 @@ impl SqliteTaskRepo {
     /// Successors inherit the current database run_id and scope_id, including business updates.
     pub async fn succeed_and_enqueue(
         &self,
-        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         output: &Value,
         fanouts: &[Successor],
+        rules: &SettlementRules,
     ) -> Result<(), StorageError> {
-        check_workflow(graph, &task.workflow_id)?;
         let mut tx = self.pool.begin().await?;
         let (run_id, scope_id) = sqlx::query_as(&format!(
             r#"
@@ -248,7 +239,7 @@ impl SqliteTaskRepo {
             run_id,
             scope_id,
         };
-        enqueue_fanouts_in_tx(&mut tx, graph, &source, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, &source, fanouts, rules).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -256,12 +247,11 @@ impl SqliteTaskRepo {
     /// Fence the source claim before generating failure successors or cascading failures.
     pub async fn fail_and_enqueue(
         &self,
-        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         error: &str,
         fanouts: &[Successor],
+        rules: &SettlementRules,
     ) -> Result<(), StorageError> {
-        check_workflow(graph, &task.workflow_id)?;
         let mut tx = self.pool.begin().await?;
         // Settle first so a failure self-edge creates a fresh pending task instead
         // of merging its retry input into the still-running source task.
@@ -278,7 +268,7 @@ impl SqliteTaskRepo {
         )
         .bind(&task.workflow_id)
         .bind(task.task_id)
-        .bind(if fanouts.is_empty() {
+        .bind(if fanouts.iter().all(|plan| plan.inputs.is_empty()) {
             TaskStatus::Failed.as_str()
         } else {
             TaskStatus::Superseded.as_str()
@@ -294,7 +284,7 @@ impl SqliteTaskRepo {
             run_id,
             scope_id,
         };
-        enqueue_fanouts_in_tx(&mut tx, graph, &source, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, &source, fanouts, rules).await?;
         tx.commit().await?;
         Ok(())
     }

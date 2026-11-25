@@ -2,20 +2,57 @@
 //!
 //! 各数据库后端复用本模块的纯数据转换，并通过各自的 SQL、锁与事务落实 [`TaskStore`] 契约。
 
-use futures::future::BoxFuture;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
+use futures::future::BoxFuture;
+use serde::Serialize;
 use serde_json::Value;
 
-use super::{Task, TaskRecord};
-use crate::RunHandle;
-use crate::{
-    error::StorageError,
-    graph::{ErasedGraph, Successor},
-};
+use super::{Task, TaskRecord, TaskStatus};
+use crate::{RunHandle, error::StorageError};
 
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
+
+/// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
+#[derive(Debug, Clone)]
+pub struct Successor {
+    pub dst: &'static str,
+    /// 从根到目标所属子图的完整子图 ID，根节点为空。
+    pub subgraph_path: Vec<String>,
+    pub inputs: Vec<Value>,
+    /// 成功路由到 JOIN 时收集输入，其余后继直接等待认领。
+    pub initial_status: TaskStatus,
+    /// 每项输入创建独立的子图调用；为 false 时，同次结算的普通跨入边共享调用。
+    pub new_scope_per_input: bool,
+}
+
+/// JOIN 的直接前驱与仍可能创建输入的全部上游，在图构建后固定。
+#[derive(Debug, Clone, Serialize)]
+pub struct JoinRule {
+    pub predecessors: Vec<JoinPredecessor>,
+    pub upstreams: Vec<String>,
+}
+
+/// 外部前驱只对应触发当前子图实例的入口任务。深度从最外层子图的 0 开始。
+#[derive(Debug, Clone, Serialize)]
+pub struct JoinPredecessor {
+    pub name: String,
+    pub entry_depth: Option<usize>,
+}
+
+/// 图构建时预计算的静态结算规则，由存储层在结算事务内消费。
+#[derive(Debug, Default, Clone)]
+pub struct SettlementRules {
+    pub join_rules: HashMap<String, JoinRule>,
+}
+
+impl SettlementRules {
+    /// 是否包含需要运行级串行锁的跨任务规则。
+    pub fn needs_run_lock(&self) -> bool {
+        !self.join_rules.is_empty()
+    }
+}
 
 /// 后继路由使用源任务的身份，以及结算时数据库中的运行和作用域。
 pub(crate) struct FanoutSource<'a> {
@@ -23,21 +60,6 @@ pub(crate) struct FanoutSource<'a> {
     pub task_id: i64,
     pub run_id: Option<i64>,
     pub scope_id: Option<i64>,
-}
-
-pub(crate) fn check_workflow(
-    graph: &dyn ErasedGraph,
-    workflow_id: &str,
-) -> Result<(), StorageError> {
-    if workflow_id != graph.workflow_id() {
-        return Err(StorageError::InvalidFanout {
-            detail: format!(
-                "workflow {workflow_id} does not match settlement graph {}",
-                graph.workflow_id()
-            ),
-        });
-    }
-    Ok(())
 }
 
 /// 在已有 JOIN 输入上按边的输出顺序合并整批贡献。
@@ -82,8 +104,8 @@ fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<(), Storage
 
 /// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。
 ///
-/// 同一引擎的工作流共用仓储，按 workflow_id 认领任务，结算时从图读取路由和 JOIN 规则。
-/// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
+/// 同一引擎的工作流共用仓储，按 workflow_id 认领任务，结算时消费预计算的 [`SettlementRules`]。
+/// 调度器把图规划结果（成功后继 / 失败后继）和静态规则统一交给本存储落库，自身不触碰任何业务字段；
 /// 具体存储实现使用统一的 [`TaskRecord`] 快照，并将操作限制在任务所属的工作流内。
 ///
 /// 认领资格与结算语义由本契约统一规定，后端负责事务实现；结算必须原子提交任务状态
@@ -133,25 +155,25 @@ pub(crate) trait TaskStore: Sync {
     /// 依赖永久失败会令已有及晚创建的 JOIN 失败，不影响其他实例。
     fn settle_success<'a>(
         &'a self,
-        graph: &'a dyn ErasedGraph,
         task: &'a TaskRecord,
         output: &'a Value,
         successors: &'a [Successor],
+        rules: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), Self::Error>>;
 
     /// 在同一事务内结算失败，并入队失败后继或级联已有依赖任务。
     ///
-    /// `successors` 非空时标记 `superseded`；为空时标记 `failed`，并将同一工作流、
+    /// `successors` 存在非空输入时标记 `superseded`；否则标记 `failed`，并将同一工作流、
     /// 同一 run 中按前驱名称和作用域关系依赖该实例来源的 collecting JOIN 标记失败。
     /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
     /// 失败后继同样将源任务 ID 写入 parent_task_ids，每条失败路由输入创建一条直接执行的后继。
     /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
     fn settle_failure<'a>(
         &'a self,
-        graph: &'a dyn ErasedGraph,
         task: &'a TaskRecord,
         message: &'a str,
         successors: &'a [Successor],
+        rules: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), Self::Error>>;
 
     /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务在下一轮认领即可

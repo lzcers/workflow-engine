@@ -156,7 +156,7 @@ flowchart TD
 租约有效且仍有执行次数时，按顺序执行 `NodeContext::fork(task)`、`on_start` 和节点 `execute`。
 每个任务获得独立上下文，图和节点实例仍通过共享句柄复用。
 
-执行成功后，`Graph::plan_success` 生成后继，并转换为存储使用的 `FanoutPlan`。
+执行成功后，`Graph::plan_success` 生成携带目标子图路径的后继列表 `Successor`。
 若成功后继规划出错，则转为永久业务错误，进入同一失败路径。
 
 执行或成功后继规划失败时，用原始输入和错误调用 `Graph::plan_failure`，
@@ -189,7 +189,7 @@ flowchart TD
 
 ### 结算阶段
 
-调度器在结算时传入当前图，供存储查询目标子图和 JOIN 规则。存储在结算事务中再次验证任务状态、`attempt`
+调度器在结算时传入图预计算的静态 `SettlementRules`（如 JOIN 规则）以及自带目标子图路径的后继列表，存储不依赖执行图本身。存储在结算事务中再次验证任务状态、`attempt`
 以及数据库时间下的租约有效性；旧认领不能提交结果或创建后继。
 仅用于最终失败处理的认领也不能提交成功状态。
 
@@ -256,7 +256,7 @@ Scheduler 只轮询自己绑定的图。应用需要为要恢复的图创建并�
 | --- | --- |
 | [src/workflow.rs](../src/workflow.rs) | 构造时启动、`submit`、就绪通知、`Workflow::drop` |
 | [src/scheduler.rs](../src/scheduler.rs) | `run_loop` → `claim_and_spawn` → `run_task`，续租期间执行、规划及结算，提交后调用回调 |
-| [src/task/store.rs](../src/task/store.rs) | 存储契约、`renew_claim`、`FanoutPlan`、租约时长 |
+| [src/task/store.rs](../src/task/store.rs) | 存储契约、`renew_claim`、`Successor`、`SettlementRules`、租约时长 |
 | [src/graph/mod.rs](../src/graph/mod.rs) | 节点执行、成功与失败后继规划 |
 | [src/backend/pgsql/repo.rs](../src/backend/pgsql/repo.rs) | PostgreSQL 认领、续租和原子结算 |
 | [src/backend/sqlite/repo.rs](../src/backend/sqlite/repo.rs) | SQLite 认领、续租和原子结算 |

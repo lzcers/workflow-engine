@@ -6,17 +6,16 @@
 use std::collections::HashMap;
 
 use super::{join, scope};
-use crate::graph::{ErasedGraph, JoinRule, Successor};
 use crate::task::{
-    MAX_ATTEMPTS,
+    JoinRule, MAX_ATTEMPTS, SettlementRules, Successor,
     scope::{ScopeEntries, route_path},
+    store::{FanoutSource, LEASE_DURATION, merge_join_inputs},
 };
 use serde_json::Value;
 use sqlx::{PgPool, types::Json};
 
 use super::rows::TaskRow;
 use crate::error::StorageError;
-use crate::task::store::{FanoutSource, LEASE_DURATION, check_workflow, merge_join_inputs};
 use crate::{TaskRecord, TaskStatus};
 
 /// 最终失败恢复认领保存的原因，重复恢复时保留第一次记录。
@@ -95,12 +94,12 @@ async fn settle_in_tx<'a>(
 }
 
 /// 事务内按子图边界生成后继，JOIN 按运行、实例和节点名累积。
-/// 含 JOIN 的图在进入此处前获取运行锁，覆盖 JOIN 首次创建的窗口。
+/// 含跨任务结算规则的图在进入此处前获取运行锁，覆盖 JOIN 首次创建的窗口。
 async fn enqueue_fanouts_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    graph: &dyn ErasedGraph,
     source: &FanoutSource<'_>,
     fanouts: &[Successor],
+    rules: &SettlementRules,
 ) -> Result<(), StorageError> {
     if !fanouts.is_empty() {
         let chain = scope::chain(tx, source.workflow_id, source.scope_id).await?;
@@ -109,16 +108,10 @@ async fn enqueue_fanouts_in_tx(
             if plan.inputs.is_empty() {
                 continue;
             }
-            let destination =
-                graph
-                    .subgraph_path(plan.dst)
-                    .ok_or_else(|| StorageError::InvalidFanout {
-                        detail: format!("unknown successor node {}", plan.dst),
-                    })?;
             let (parent, entered) = route_path(
                 &chain,
                 source.run_id,
-                &destination,
+                &plan.subgraph_path,
                 plan.new_scope_per_input,
             )?;
             if plan.new_scope_per_input {
@@ -156,7 +149,7 @@ async fn enqueue_fanouts_in_tx(
             }
         }
     }
-    advance_joins(tx, source.workflow_id, source.run_id, graph.join_rules()).await
+    advance_joins(tx, source.workflow_id, source.run_id, &rules.join_rules).await
 }
 
 async fn collect_join(
@@ -293,13 +286,13 @@ impl PgTaskRepo {
         .ok_or_else(|| claim_lost(task))
     }
 
-    /// 无 JOIN 时只锁当前任务；JOIN 结算必须按最新的运行身份先锁运行，再锁任务。
+    /// 无跨任务规则时只锁当前任务；否则必须按最新的运行身份先锁运行，再锁任务。
     async fn lock_settlement(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        graph: &dyn ErasedGraph,
         task: &TaskRecord,
+        rules: &SettlementRules,
     ) -> Result<(), StorageError> {
-        if graph.join_rules().is_empty() {
+        if !rules.needs_run_lock() {
             Self::lock_task(tx, task).await?;
             return Ok(());
         }
@@ -323,21 +316,20 @@ impl PgTaskRepo {
     /// 当前认领成功结算与边界路由、后继入队在同一事务提交。
     pub async fn succeed_and_enqueue(
         &self,
-        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         output: &Value,
         fanouts: &[Successor],
+        rules: &SettlementRules,
     ) -> Result<(), StorageError> {
-        check_workflow(graph, &task.workflow_id)?;
         // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
         let mut tx = self
             .pool
             .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await?;
-        Self::lock_settlement(&mut tx, graph, task).await?;
+        Self::lock_settlement(&mut tx, task, rules).await?;
         let settled =
             settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
-        enqueue_fanouts_in_tx(&mut tx, graph, &settled, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, &settled, fanouts, rules).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -345,25 +337,24 @@ impl PgTaskRepo {
     /// 当前认领先结算，再原子生成失败后继或级联失败；过期执行者没有写权限。
     pub async fn fail_and_enqueue(
         &self,
-        graph: &dyn ErasedGraph,
         task: &TaskRecord,
         error: &str,
         fanouts: &[Successor],
+        rules: &SettlementRules,
     ) -> Result<(), StorageError> {
-        check_workflow(graph, &task.workflow_id)?;
         // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
         let mut tx = self
             .pool
             .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await?;
-        Self::lock_settlement(&mut tx, graph, task).await?;
-        let status = if fanouts.is_empty() {
+        Self::lock_settlement(&mut tx, task, rules).await?;
+        let status = if fanouts.iter().all(|plan| plan.inputs.is_empty()) {
             TaskStatus::Failed
         } else {
             TaskStatus::Superseded
         };
         let settled = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
-        enqueue_fanouts_in_tx(&mut tx, graph, &settled, fanouts).await?;
+        enqueue_fanouts_in_tx(&mut tx, &settled, fanouts, rules).await?;
         tx.commit().await?;
         Ok(())
     }

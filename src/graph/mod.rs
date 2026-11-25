@@ -5,13 +5,12 @@
 //!
 //! [`GraphBuilder`] 负责注册节点、追加边、组装并校验。
 
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use super::edge::{AnyFailureEdge, AnySuccessEdge};
 use super::node::{AnyNode, TypeFingerprint};
-use crate::task::TaskStatus;
+use crate::task::{JoinPredecessor, JoinRule, SettlementRules, Successor, TaskStatus};
 
 mod builder;
 mod description;
@@ -36,20 +35,6 @@ struct GraphNode<Ctx> {
     subgraph_id: Option<String>,
 }
 
-/// JOIN 的直接前驱与仍可能创建输入的全部上游，在图构建后固定。
-#[derive(Debug, Serialize)]
-pub struct JoinRule {
-    pub predecessors: Vec<JoinPredecessor>,
-    pub upstreams: Vec<String>,
-}
-
-/// 外部前驱只对应触发当前子图实例的入口任务。深度从最外层子图的 0 开始。
-#[derive(Debug, Serialize)]
-pub struct JoinPredecessor {
-    pub name: String,
-    pub entry_depth: Option<usize>,
-}
-
 /// 图引擎：节点注册表 + 成功/失败边集合，持有上下文与节点实例，负责执行、后继规划、静态校验。
 ///
 /// 成功边与失败边分置两个集合，
@@ -62,18 +47,7 @@ pub struct Graph<Ctx> {
     subgraphs: Vec<SubgraphDescription>,
     success_edges: Vec<Box<dyn AnySuccessEdge>>,
     failure_edges: Vec<Box<dyn AnyFailureEdge>>,
-    join_rules: HashMap<String, JoinRule>,
-}
-
-/// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
-#[derive(Debug, Clone)]
-pub struct Successor {
-    pub dst: &'static str,
-    pub inputs: Vec<Value>,
-    /// 成功路由到 JOIN 时收集输入，其余后继直接等待认领。
-    pub initial_status: TaskStatus,
-    /// 每项输入创建独立的子图调用；为 false 时，同次结算的普通跨入边共享调用。
-    pub new_scope_per_input: bool,
+    settlement_rules: SettlementRules,
 }
 
 fn qualified_parent(id: &str) -> Option<&str> {
@@ -181,7 +155,7 @@ impl<Ctx> Graph<Ctx> {
             if inputs.is_empty() {
                 continue;
             }
-            let initial_status = if self.join_rules.contains_key(edge.dst()) {
+            let initial_status = if self.settlement_rules.join_rules.contains_key(edge.dst()) {
                 if inputs.iter().any(|input| !input.is_object()) {
                     return Err(EdgeError::BadDstIn {
                         src: edge.src(),
@@ -197,6 +171,9 @@ impl<Ctx> Graph<Ctx> {
             };
             plans.push(Successor {
                 dst: edge.dst(),
+                subgraph_path: self
+                    .subgraph_path(edge.dst())
+                    .expect("validated edge destination"),
                 inputs,
                 initial_status,
                 new_scope_per_input: edge.is_foreach(),
@@ -220,6 +197,9 @@ impl<Ctx> Graph<Ctx> {
             }
             plans.push(Successor {
                 dst: edge.dst(),
+                subgraph_path: self
+                    .subgraph_path(edge.dst())
+                    .expect("validated edge destination"),
                 inputs,
                 initial_status: TaskStatus::Pending,
                 new_scope_per_input: false,
@@ -228,17 +208,19 @@ impl<Ctx> Graph<Ctx> {
         Ok(plans)
     }
 
-    /// 存储在结算时使用这些规则，按 JOIN 的作用域匹配来源并推进就绪或失败状态。
-    pub fn join_rules(&self) -> &HashMap<String, JoinRule> {
-        &self.join_rules
+    /// 存储在结算时使用这些预计算的静态规则，按作用域匹配来源并推进就绪或失败状态。
+    pub fn settlement_rules(&self) -> &SettlementRules {
+        &self.settlement_rules
     }
 
-    fn compute_join_rules(&self) -> HashMap<String, JoinRule> {
-        self.nodes
+    fn compute_settlement_rules(&self) -> SettlementRules {
+        let join_rules = self
+            .nodes
             .iter()
             .filter(|(_, entry)| entry.node.task_type() == TaskType::Join)
             .map(|(&name, _)| (name.to_owned(), self.join_rule(name)))
-            .collect()
+            .collect();
+        SettlementRules { join_rules }
     }
 
     fn join_rule(&self, dst: &str) -> JoinRule {

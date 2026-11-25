@@ -16,9 +16,9 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    graph::{Graph, Successor},
+    graph::Graph,
     node::{NodeContext, NodeError},
-    task::{MAX_ATTEMPTS, TaskRecord, TaskStore, store::LEASE_DURATION},
+    task::{MAX_ATTEMPTS, Successor, TaskRecord, TaskStore, store::LEASE_DURATION},
 };
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -332,15 +332,16 @@ where
     Ctx: NodeContext + Sync + 'static,
     S: TaskStore + ?Sized,
 {
+    let rules = graph.settlement_rules();
     match outcome {
         ExecutionOutcome::Success {
             output, successors, ..
-        } => store.settle_success(graph, task, output, successors).await,
+        } => store.settle_success(task, output, successors, rules).await,
         ExecutionOutcome::Failure {
             error, successors, ..
         } => {
             store
-                .settle_failure(graph, task, &error.to_string(), successors)
+                .settle_failure(task, &error.to_string(), successors, rules)
                 .await
         }
     }

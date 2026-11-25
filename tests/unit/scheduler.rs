@@ -26,8 +26,7 @@ use crate::{
     Graph, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, migrate},
     edge::on_error,
-    graph::{ErasedGraph, Successor},
-    task::{TaskStore, store::LEASE_DURATION},
+    task::{SettlementRules, Successor, TaskStore, store::LEASE_DURATION},
 };
 
 struct Context {
@@ -359,10 +358,10 @@ impl TaskStore for Store {
 
     fn settle_success<'a>(
         &'a self,
-        _: &'a dyn ErasedGraph,
         _: &'a TaskRecord,
         _: &'a Value,
         _: &'a [Successor],
+        _: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move {
             self.settlements.fetch_add(1, Ordering::SeqCst);
@@ -376,10 +375,10 @@ impl TaskStore for Store {
 
     fn settle_failure<'a>(
         &'a self,
-        _: &'a dyn ErasedGraph,
         _: &'a TaskRecord,
         _: &'a str,
         _: &'a [Successor],
+        _: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), Self::Error>> {
         Box::pin(async { panic!("lease loss must not be recorded as a business failure") })
     }

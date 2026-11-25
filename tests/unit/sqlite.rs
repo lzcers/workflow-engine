@@ -9,11 +9,10 @@ use sqlx::types::Json;
 #[path = "graph_fixture.rs"]
 mod graph_fixture;
 use crate::Database;
-use crate::backend::task_fixture::{TaskSeed, join_plan, plan};
+use crate::backend::task_fixture::{TaskSeed, join_plan, plan, scoped_plan};
 use crate::error::StorageError;
-use crate::graph::{ErasedGraph, Successor, TaskType};
-use crate::task::MAX_ATTEMPTS;
-use crate::task::TaskStore;
+use crate::graph::{Graph, TaskType};
+use crate::task::{MAX_ATTEMPTS, Successor, TaskStore};
 use crate::{TaskRecord, TaskStatus};
 use TaskType::{Join, Normal};
 use graph_fixture::graph as make_graph;
@@ -48,19 +47,28 @@ impl SqliteTaskRepo {
     }
 
     /// Construct existing runs, scope ancestry and partially collected JOINs for storage tests.
-    pub(crate) async fn seed_task(
+    pub(crate) async fn seed_task<Ctx>(
         &self,
-        graph: &dyn ErasedGraph,
+        graph: &Graph<Ctx>,
         seed: &TaskSeed,
     ) -> Result<TaskRecord, StorageError> {
         let task = &seed.task;
-        super::check_workflow(graph, &task.workflow_id)?;
+        if task.workflow_id != graph.workflow_id() {
+            return Err(StorageError::InvalidFanout {
+                detail: format!(
+                    "workflow {} does not match seed graph {}",
+                    task.workflow_id,
+                    graph.workflow_id()
+                ),
+            });
+        }
         let path = graph
             .subgraph_path(&task.name)
             .ok_or_else(|| StorageError::InvalidFanout {
                 detail: format!("unknown task node {}", task.name),
             })?;
-        let collecting = graph.join_rules().contains_key(&task.name)
+        let rules = graph.settlement_rules();
+        let collecting = rules.join_rules.contains_key(&task.name)
             && (seed.run_id.is_some() || !seed.parent_task_ids.is_empty());
         let status = if collecting {
             TaskStatus::Collecting
@@ -101,7 +109,7 @@ impl SqliteTaskRepo {
             .execute(&mut *tx)
             .await?;
         if collecting {
-            advance_joins(&mut tx, &task.workflow_id, Some(run_id), graph.join_rules()).await?;
+            advance_joins(&mut tx, &task.workflow_id, Some(run_id), &rules.join_rules).await?;
         }
         let row = sqlx::query_as::<_, TaskRow>(&format!(
             "SELECT {ROW_COLS} FROM tasks WHERE task_id = ?1"
@@ -118,7 +126,7 @@ async fn memory_repo(
     workflow_id: &str,
     nodes: &[(&'static str, TaskType, Option<&str>)],
     edges: &[(&'static str, &'static str)],
-) -> (SqlitePool, SqliteTaskRepo, Arc<dyn ErasedGraph>) {
+) -> (SqlitePool, SqliteTaskRepo, Arc<Graph<()>>) {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -210,7 +218,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
 
     let output = json!([null, {"result": "完成"}]);
     let claimed = repo.claim_many("workflow", 1).await.unwrap().remove(0);
-    repo.succeed_and_enqueue(graph, &claimed, &output, &[])
+    repo.succeed_and_enqueue(&claimed, &output, &[], graph.settlement_rules())
         .await
         .unwrap();
     let settled = get(&repo, &first).await;
@@ -301,12 +309,13 @@ async fn settlement_promotes_a_waiting_join_when_the_last_source_emits_no_succes
     assert!(claimed[0].lease_until.is_some());
     assert!(repo.claim_many("deps", 10).await.unwrap().is_empty());
 
+    let rules = graph.settlement_rules();
     let input = json!({"first": 1});
     repo.settle_success(
-        graph,
         &claimed[0],
         &input,
         &[join_plan("child", vec![input.clone()])],
+        rules,
     )
     .await
     .unwrap();
@@ -321,7 +330,7 @@ async fn settlement_promotes_a_waiting_join_when_the_last_source_emits_no_succes
     assert!(repo.claim_many("deps", 10).await.unwrap().is_empty());
 
     assert_eq!(claimed[1].task_id, last_source.task_id);
-    repo.settle_success(graph, &claimed[1], &json!(null), &[])
+    repo.settle_success(&claimed[1], &json!(null), &[], rules)
         .await
         .unwrap();
     let ready = get(&repo, &child).await;
@@ -396,10 +405,11 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
         recovery.error.as_deref(),
         Some("task lease expired; retry budget exhausted")
     );
+    let rules = graph.settlement_rules();
     for result in [
-        repo.settle_success(graph, &recovery, &json!("too late"), &[])
+        repo.settle_success(&recovery, &json!("too late"), &[], rules)
             .await,
-        repo.fail_and_enqueue(graph, &third[0], "old worker", &[])
+        repo.fail_and_enqueue(&third[0], "old worker", &[], rules)
             .await,
     ] {
         assert!(matches!(result, Err(StorageError::ClaimLost { .. })));
@@ -411,15 +421,15 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
     assert_eq!(next_recovery.attempt, 5);
     assert_eq!(next_recovery.error, recovery.error);
     assert!(matches!(
-        repo.fail_and_enqueue(graph, &recovery, "stale recovery", &[])
+        repo.fail_and_enqueue(&recovery, "stale recovery", &[], rules)
             .await,
         Err(StorageError::ClaimLost { .. })
     ));
     repo.fail_and_enqueue(
-        graph,
         &next_recovery,
         next_recovery.error.as_deref().unwrap(),
         &[],
+        rules,
     )
     .await
     .unwrap();
@@ -446,9 +456,14 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
         recovery.error.as_deref(),
         Some("task retry budget exhausted")
     );
-    repo.fail_and_enqueue(graph, &recovery, recovery.error.as_deref().unwrap(), &[])
-        .await
-        .unwrap();
+    repo.fail_and_enqueue(
+        &recovery,
+        recovery.error.as_deref().unwrap(),
+        &[],
+        graph.settlement_rules(),
+    )
+    .await
+    .unwrap();
     assert_eq!(get(&repo, &zero).await.status, TaskStatus::Failed);
 }
 
@@ -483,7 +498,8 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
             .position(|task| task.task_id == wrong_run.task_id)
             .unwrap(),
     );
-    repo.settle_success(graph, &wrong_claim, &json!({}), &[])
+    let rules = graph.settlement_rules();
+    repo.settle_success(&wrong_claim, &json!({}), &[], rules)
         .await
         .unwrap();
     assert_eq!(
@@ -499,10 +515,10 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
 
     let contribution = |input| join_plan("collect", vec![input]);
     repo.settle_success(
-        graph,
         &claimed[0],
         &json!("a"),
         &[contribution(json!({"image": "a"}))],
+        rules,
     )
     .await
     .unwrap();
@@ -515,10 +531,10 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         .unwrap();
     assert!(repo.claim_many("join", 10).await.unwrap().is_empty());
     repo.settle_success(
-        graph,
         &claimed[1],
         &json!("b"),
         &[contribution(json!({"image": "b"}))],
+        rules,
     )
     .await
     .unwrap();
@@ -539,10 +555,10 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
     let text_claim = repo.claim_many("join", 10).await.unwrap().remove(0);
     assert_eq!(text_claim.task_id, text.task_id);
     repo.settle_success(
-        graph,
         &text_claim,
         &json!("text"),
         &[contribution(json!({"text": "text"}))],
+        rules,
     )
     .await
     .unwrap();
@@ -597,12 +613,13 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
         }
     }
     let sources = repo.claim_many("fanin", 10).await.unwrap();
+    let rules = graph.settlement_rules();
     for source in &sources {
         let contribution = join_plan(
             "collect",
             vec![source.input.clone(), json!({"image": "tail"})],
         );
-        repo.succeed_and_enqueue(graph, source, &source.input, &[contribution])
+        repo.succeed_and_enqueue(source, &source.input, &[contribution], rules)
             .await
             .unwrap();
     }
@@ -645,22 +662,21 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         .await
         .unwrap()
         .remove(0);
+    let rules = graph.settlement_rules();
     let valid = plan("child", vec![json!("a"), json!("b")]);
     let scoped = Successor {
-        dst: "analysis.child",
         new_scope_per_input: true,
-
-        ..valid.clone()
+        ..scoped_plan("analysis.child", &["analysis"], vec![json!("a"), json!("b")])
     };
     let invalid = plan("invalid", vec![json!({})]);
     sqlx::query("CREATE TRIGGER reject_invalid BEFORE INSERT ON tasks WHEN NEW.name = 'invalid' BEGIN SELECT RAISE(ABORT, 'invalid successor'); END")
         .execute(&pool).await.unwrap();
     assert!(
         repo.settle_success(
-            graph,
             &claimed,
             &json!({"done": true}),
-            &[valid.clone(), invalid]
+            &[valid.clone(), invalid],
+            rules,
         )
         .await
         .is_err()
@@ -671,10 +687,13 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     assert_eq!(repo.list_all("atomic_success").await.unwrap().len(), 1);
     assert!(matches!(
         repo.settle_success(
-            graph,
             &claimed,
             &json!({}),
-            &[plan("undeclared", vec![json!({})])]
+            &[Successor {
+                new_scope_per_input: true,
+                ..plan("child", vec![json!({})])
+            }],
+            rules,
         )
         .await,
         Err(StorageError::InvalidFanout { .. })
@@ -688,15 +707,15 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         .await
         .unwrap();
     repo.settle_success(
-        graph,
         &claimed,
         &json!({"done": true}),
         &[valid.clone(), scoped],
+        rules,
     )
     .await
     .unwrap();
     assert!(matches!(
-        repo.settle_success(graph, &claimed, &json!({"done": true}), &[valid])
+        repo.settle_success(&claimed, &json!({"done": true}), &[valid], rules)
             .await,
         Err(StorageError::ClaimLost { .. })
     ));
@@ -762,18 +781,19 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert!(claimed.attempt > MAX_ATTEMPTS);
     assert_eq!(expired.scope_id, task.scope_id);
     assert_eq!(claimed.scope_id, task.scope_id);
-    let recovery = plan("analysis.recovery", vec![json!({"retry": true})]);
+    let rules = graph.settlement_rules();
+    let recovery = scoped_plan("analysis.recovery", &["analysis"], vec![json!({"retry": true})]);
     let invalid = plan("invalid", vec![json!({})]);
     sqlx::query("CREATE TRIGGER reject_invalid BEFORE INSERT ON tasks WHEN NEW.name = 'invalid' BEGIN SELECT RAISE(ABORT, 'invalid successor'); END")
         .execute(&pool).await.unwrap();
     let message = claimed.error.as_deref().unwrap();
     assert!(matches!(
-        repo.settle_failure(graph, &expired, message, std::slice::from_ref(&recovery))
+        repo.settle_failure(&expired, message, std::slice::from_ref(&recovery), rules)
             .await,
         Err(StorageError::ClaimLost { .. })
     ));
     assert!(
-        repo.settle_failure(graph, &claimed, message, &[recovery.clone(), invalid])
+        repo.settle_failure(&claimed, message, &[recovery.clone(), invalid], rules)
             .await
             .is_err()
     );
@@ -787,7 +807,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
         .await
         .unwrap();
 
-    repo.settle_failure(graph, &claimed, message, &[recovery])
+    repo.settle_failure(&claimed, message, &[recovery], rules)
         .await
         .unwrap();
     let settled = get(&repo, &task).await;
@@ -795,7 +815,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert_eq!(settled.error.as_deref(), Some(message));
     assert!(settled.lease_until.is_none());
     assert!(matches!(
-        repo.settle_failure(graph, &claimed, message, &[]).await,
+        repo.settle_failure(&claimed, message, &[], rules).await,
         Err(StorageError::ClaimLost { .. })
     ));
     assert_eq!(repo.list_all("atomic_failure").await.unwrap().len(), 2);
@@ -808,7 +828,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
     assert_eq!(recovery.run_id, Some(4));
     assert_eq!(recovery.scope_id, Some(21));
     assert_eq!(recovery.parent_task_ids, [task.task_id]);
-    repo.settle_failure(graph, &recovery, message, &[])
+    repo.settle_failure(&recovery, message, &[], rules)
         .await
         .unwrap();
     assert_eq!(get(&repo, &recovery).await.status, TaskStatus::Failed);
@@ -824,10 +844,10 @@ async fn failure_fanout_to_the_same_name_creates_a_fresh_task() {
 
     let source = repo.claim_many("same_name", 1).await.unwrap().remove(0);
     repo.settle_failure(
-        graph,
         &source,
         "retry requested",
         &[plan("retry", vec![json!({"retry": true})])],
+        graph.settlement_rules(),
     )
     .await
     .unwrap();
@@ -861,7 +881,7 @@ async fn release_and_settlement_stay_in_their_workflow() {
     assert_eq!(reclaimed.attempt, 2);
     assert!(repo.claim_many("theirs", 1).await.unwrap().is_empty());
 
-    repo.settle_success(graph, &reclaimed, &json!("ours"), &[])
+    repo.settle_success(&reclaimed, &json!("ours"), &[], graph.settlement_rules())
         .await
         .unwrap();
     assert_eq!(get(&repo, &ours).await.status, TaskStatus::Succeeded);
@@ -935,8 +955,9 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
     .execute(&pool)
     .await
     .unwrap();
+    let rules = graph.settlement_rules();
     assert!(
-        repo.settle_failure(graph, &root, message, &[])
+        repo.settle_failure(&root, message, &[], rules)
             .await
             .is_err()
     );
@@ -951,7 +972,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .await
         .unwrap();
 
-    repo.settle_failure(graph, &root, message, &[])
+    repo.settle_failure(&root, message, &[], rules)
         .await
         .unwrap();
     assert_eq!(get(&repo, &root).await.status, TaskStatus::Failed);
@@ -1042,11 +1063,12 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
             .iter()
             .find(|task| task.task_id == completed.task_id)
             .unwrap();
-        repo.settle_success(graph, completed_claim, &json!("done"), &[])
+        let rules = graph.settlement_rules();
+        repo.settle_success(completed_claim, &json!("done"), &[], rules)
             .await
             .unwrap();
 
-        repo.settle_failure(graph, root_claim, "permanent failure", &[])
+        repo.settle_failure(root_claim, "permanent failure", &[], rules)
             .await
             .unwrap();
 
@@ -1115,12 +1137,13 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
         let mut wrong_task = claim.clone();
         wrong_task.task_id += 1;
         assert!(repo.renew_claim(&wrong_task).await.unwrap().is_none());
+        let rules = graph.settlement_rules();
         if previous_attempts == MAX_ATTEMPTS {
-            repo.settle_failure(graph, &claim, "budget exhausted", &[])
+            repo.settle_failure(&claim, "budget exhausted", &[], rules)
                 .await
                 .unwrap();
         } else {
-            repo.settle_success(graph, &claim, &json!("done"), &[])
+            repo.settle_success(&claim, &json!("done"), &[], rules)
                 .await
                 .unwrap();
         }
@@ -1157,20 +1180,21 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
     let before = serde_json::to_value(&second).unwrap();
 
     assert!(repo.renew_claim(&first).await.unwrap().is_none());
+    let rules = graph.settlement_rules();
     let fanout = plan("forbidden", vec![json!("stale")]);
     for result in [
         repo.release_claim(&first).await,
         repo.settle_success(
-            graph,
             &first,
             &json!("stale"),
             std::slice::from_ref(&fanout),
+            rules,
         )
         .await,
-        repo.settle_failure(graph, &first, "stale", std::slice::from_ref(&fanout))
+        repo.settle_failure(&first, "stale", std::slice::from_ref(&fanout), rules)
             .await,
-        repo.settle_failure(graph, &first, "stale", &[]).await,
-        repo.settle_success(graph, &first, &json!("stale"), &[])
+        repo.settle_failure(&first, "stale", &[], rules).await,
+        repo.settle_success(&first, &json!("stale"), &[], rules)
             .await,
     ] {
         assert!(matches!(result, Err(StorageError::ClaimLost { .. })));
@@ -1181,7 +1205,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
     );
     assert_eq!(repo.list_all("fencing").await.unwrap().len(), 2);
     assert_eq!(get(&repo, &child).await.status, TaskStatus::Pending);
-    repo.settle_success(graph, &second, &json!("current"), &[])
+    repo.settle_success(&second, &json!("current"), &[], rules)
         .await
         .unwrap();
     assert_eq!(get(&repo, &second).await.output, Some(json!("current")));
@@ -1207,9 +1231,8 @@ async fn transactional_submit_and_reclaim_within_a_workflow() {
         .unwrap();
     migrate(&pool).await.unwrap();
     let other_id = "published-other";
-    let other_graph = make_graph(other_id, &nodes, &edges);
     let declared = make_graph(id, &nodes, &edges);
-    let graph = declared.as_ref();
+    let rules = declared.settlement_rules();
     let task = declared
         .describe()
         .task("analysis.entry", json!(42))
@@ -1243,34 +1266,22 @@ async fn transactional_submit_and_reclaim_within_a_workflow() {
     assert_eq!(root.task_id, run.run_id);
     assert!(root.scope_id.is_some());
     assert_eq!(root.input, json!(42));
-    assert!(
-        first
-            .settle_success(other_graph.as_ref(), &root, &json!(1), &[])
-            .await
-            .is_err()
-    );
-    assert!(
-        first
-            .settle_failure(other_graph.as_ref(), &root, "wrong workflow", &[])
-            .await
-            .is_err()
-    );
 
     first.release_claim(&root).await.unwrap();
     let recovered = replacement.claim_many(id, 1).await.unwrap().pop().unwrap();
     assert_eq!(recovered.attempt, root.attempt + 1);
     assert!(
         first
-            .settle_failure(graph, &root, "stale claim", &[])
+            .settle_failure(&root, "stale claim", &[], rules)
             .await
             .is_err()
     );
     replacement
         .settle_success(
-            graph,
             &recovered,
             &json!(42),
             &[plan("finish", vec![json!(42)])],
+            rules,
         )
         .await
         .unwrap();
@@ -1298,12 +1309,13 @@ async fn lease_expiry_rejects_settlement_even_without_takeover() {
     .execute(&pool)
     .await
     .unwrap();
+    let rules = graph.settlement_rules();
     assert!(repo.renew_claim(&claim).await.unwrap().is_none());
     for result in [
         repo.release_claim(&claim).await,
-        repo.settle_success(graph, &claim, &json!("expired"), &[])
+        repo.settle_success(&claim, &json!("expired"), &[], rules)
             .await,
-        repo.fail_and_enqueue(graph, &claim, "expired", &[]).await,
+        repo.fail_and_enqueue(&claim, "expired", &[], rules).await,
     ] {
         assert!(
             matches!(result, Err(StorageError::ClaimLost { .. })),
@@ -1429,7 +1441,12 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     );
     let task_id = tasks[0].task_id;
     repo_a
-        .settle_success(graph, &tasks[0], &json!({"saved": true}), &[])
+        .settle_success(
+            &tasks[0],
+            &json!({"saved": true}),
+            &[],
+            graph.settlement_rules(),
+        )
         .await
         .unwrap();
 
@@ -1450,13 +1467,13 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
     let sources = repo_a.claim_many("concurrent_fanin", 4).await.unwrap();
     let results = futures::future::join_all(sources.iter().enumerate().map(|(index, source)| {
         let repo = if index % 2 == 0 { &repo_a } else { &repo_b };
-        let graph = fanin_graph.as_ref();
+        let rules = fanin_graph.settlement_rules();
         async move {
             repo.succeed_and_enqueue(
-                graph,
                 source,
                 &source.input,
                 &[join_plan("collect", vec![json!({"worker": source.input})])],
+                rules,
             )
             .await
             .unwrap();

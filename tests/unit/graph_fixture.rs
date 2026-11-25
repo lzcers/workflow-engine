@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Graph, JoinNode, Node, NodeError, Trigger,
-    graph::{ErasedGraph, TaskType, map},
+    graph::{TaskType, map},
 };
 
 struct Pass;
@@ -38,7 +38,7 @@ pub fn graph(
     workflow_id: &str,
     nodes: &[(&'static str, TaskType, Option<&str>)],
     edges: &[(&'static str, &'static str)],
-) -> Arc<dyn ErasedGraph> {
+) -> Arc<Graph<()>> {
     let mut builder = Graph::builder(workflow_id, workflow_id, ());
     let mut subgraphs = BTreeSet::new();
     for (_, _, subgraph) in nodes {

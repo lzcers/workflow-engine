@@ -9,8 +9,7 @@ use serde_json::Value;
 use super::repo::PgTaskRepo;
 use super::scope;
 use crate::error::StorageError;
-use crate::graph::{ErasedGraph, Successor};
-use crate::task::TaskStore;
+use crate::task::{SettlementRules, Successor, TaskStore};
 use crate::{Database, RunHandle, Task, TaskRecord};
 
 impl Database<&mut sqlx::Transaction<'_, sqlx::Postgres>> {
@@ -74,23 +73,23 @@ impl TaskStore for PgTaskRepo {
     /// 原子成功结算：写入输出并入队全部成功后继，后继使用任务最新的分组键。
     fn settle_success<'a>(
         &'a self,
-        graph: &'a dyn ErasedGraph,
         task: &'a TaskRecord,
         output: &'a Value,
         successors: &'a [Successor],
+        rules: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.succeed_and_enqueue(graph, task, output, successors))
+        Box::pin(self.succeed_and_enqueue(task, output, successors, rules))
     }
 
     /// 原子失败结算：标记终态，并入队失败后继或级联已有依赖任务。
     fn settle_failure<'a>(
         &'a self,
-        graph: &'a dyn ErasedGraph,
         task: &'a TaskRecord,
         message: &'a str,
         successors: &'a [Successor],
+        rules: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.fail_and_enqueue(graph, task, message, successors))
+        Box::pin(self.fail_and_enqueue(task, message, successors, rules))
     }
 
     /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务下一轮认领即可重入。
