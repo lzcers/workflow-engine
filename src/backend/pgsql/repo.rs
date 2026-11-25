@@ -7,7 +7,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use super::{rows::TaskRow, scope};
-use crate::backend::ROW_COLS;
+use crate::backend::{
+    BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, ROW_COLS, UPSTREAM_FAILED_ERR, claim_lost,
+};
 use crate::error::StorageError;
 use crate::task::{
     Dispatch, JoinRule, MAX_ATTEMPTS, SettlementRules, Successor, TaskStore,
@@ -16,10 +18,6 @@ use crate::task::{
     store::{FanoutSource, LEASE_DURATION, merge_join_inputs},
 };
 use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
-
-/// 最终失败恢复认领保存的原因，重复恢复时保留第一次记录。
-const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted";
-const LEASE_EXPIRED_ERR: &str = "task lease expired; retry budget exhausted";
 
 impl Database<&mut sqlx::Transaction<'_, sqlx::Postgres>> {
     /// 在宿主事务内创建独立运行，同时建立入口所属的子图作用域。
@@ -76,13 +74,6 @@ async fn lock_run(
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-fn claim_lost(task: &TaskRecord) -> StorageError {
-    StorageError::ClaimLost {
-        workflow_id: task.workflow_id.clone(),
-        task_id: task.task_id,
-    }
 }
 
 /// 仅当前有效认领可以提交终态。持有行锁后再检查租约，返回最新身份供后继使用。
@@ -297,12 +288,13 @@ async fn advance_joins(
     if !transitions.failed.is_empty() {
         sqlx::query(
             "UPDATE tasks
-             SET status = 'failed', error = 'upstream dependency failed',
+             SET status = 'failed', error = $3,
                  lease_until = NULL, updated_at = clock_timestamp()
              WHERE workflow_id = $1 AND task_id = ANY($2)",
         )
         .bind(workflow_id)
         .bind(&transitions.failed)
+        .bind(UPSTREAM_FAILED_ERR)
         .execute(&mut **tx)
         .await?;
     }

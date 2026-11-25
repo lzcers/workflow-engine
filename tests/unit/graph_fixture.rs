@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Graph, JoinNode, Node, NodeError, Trigger,
-    graph::{TaskType, map},
+    graph::{TaskType, passthrough},
 };
 
 struct Pass;
@@ -71,9 +71,7 @@ pub fn graph(
         };
     }
     for &(source, destination) in edges {
-        builder = builder.edge(map(source, destination, |value: &Value| {
-            vec![value.clone()]
-        }));
+        builder = builder.edge(passthrough::<Value>(source, destination));
     }
     Arc::new(builder.build().unwrap())
 }

@@ -6,8 +6,7 @@
 //! - 失败边：吃失败节点的**输入 + 错误**，条件命中后透传或经 `map` 扇出为 `dst` 输入，
 //!   构成后向回退图（不约束为回退，也可做按错误类型分流、降级兜底等一般路由）。
 //!
-//! 构造期即完成类型检查与规划闭包擦除，图中直接持有 `Vec<SuccessEdge>` / `Vec<FailureEdge>`，
-//! 无多余中间 trait 或双重装箱。
+//! 构造期即完成类型检查与单层规划闭包擦除，图中直接持有 `Vec<SuccessEdge>` / `Vec<FailureEdge>`。
 
 mod builder;
 
@@ -18,13 +17,28 @@ use super::node::{NodeError, TypeFingerprint};
 
 pub use builder::{
     ErrorWhenBuilder, WhenBuilder, foreach, foreach_checked, map, map_checked, on_error,
-    on_error_checked, passthrough_checked, when, when_checked, when_error, when_error_checked,
-    when_error_map_checked, when_map_checked,
+    on_error_checked, passthrough, passthrough_checked, when, when_checked, when_error,
+    when_error_checked, when_error_map_checked, when_map_checked,
 };
 
 type SuccessPlanner = Box<dyn Fn(&Value) -> Result<Vec<Value>, EdgeError> + Send + Sync>;
 type FailurePlanner =
     Box<dyn Fn(&Value, &NodeError) -> Result<Vec<Value>, EdgeError> + Send + Sync>;
+
+fn serialize_inputs<DstIn: Serialize>(
+    src: &'static str,
+    inputs: impl IntoIterator<Item = DstIn>,
+) -> Result<Vec<Value>, EdgeError> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            serde_json::to_value(input).map_err(|e| EdgeError::BadDstIn {
+                src,
+                detail: e.to_string(),
+            })
+        })
+        .collect()
+}
 
 /// 边的路由与分发模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,16 +63,16 @@ pub struct SuccessEdge {
 }
 
 impl SuccessEdge {
-    pub(crate) fn new<SrcOut, DstIn>(
+    pub(crate) fn new<SrcOut, DstIn, F>(
         src: &'static str,
         dst: &'static str,
         mode: EdgeMode,
-        when: Option<Box<dyn Fn(&SrcOut) -> bool + Send + Sync>>,
-        map: Option<Box<dyn Fn(&SrcOut) -> Vec<DstIn> + Send + Sync>>,
+        plan: F,
     ) -> Self
     where
-        SrcOut: Serialize + DeserializeOwned + 'static,
+        SrcOut: DeserializeOwned + 'static,
         DstIn: Serialize + 'static,
+        F: Fn(SrcOut) -> Vec<DstIn> + Send + Sync + 'static,
     {
         let planner: SuccessPlanner = Box::new(move |out: &Value| {
             let out: SrcOut =
@@ -66,28 +80,7 @@ impl SuccessEdge {
                     src,
                     detail: e.to_string(),
                 })?;
-            if let Some(cond) = &when
-                && !cond(&out)
-            {
-                return Ok(Vec::new());
-            }
-            match &map {
-                Some(transform) => transform(&out)
-                    .into_iter()
-                    .map(|input| {
-                        serde_json::to_value(input).map_err(|e| EdgeError::BadDstIn {
-                            src,
-                            detail: e.to_string(),
-                        })
-                    })
-                    .collect(),
-                None => Ok(vec![serde_json::to_value(&out).map_err(|e| {
-                    EdgeError::BadDstIn {
-                        src,
-                        detail: e.to_string(),
-                    }
-                })?]),
-            }
+            serialize_inputs(src, plan(out))
         });
         Self {
             src,
@@ -135,49 +128,24 @@ pub struct FailureEdge {
 }
 
 impl FailureEdge {
-    pub(crate) fn new<SrcIn, DstIn>(
+    pub(crate) fn new<SrcIn, DstIn, F>(
         src: &'static str,
         dst: &'static str,
-        when: Option<Box<dyn Fn(&SrcIn, &NodeError) -> bool + Send + Sync>>,
-        map: Option<Box<dyn Fn(&SrcIn, &NodeError) -> Vec<DstIn> + Send + Sync>>,
+        mode: EdgeMode,
+        plan: F,
     ) -> Self
     where
-        SrcIn: Serialize + DeserializeOwned + 'static,
+        SrcIn: DeserializeOwned + 'static,
         DstIn: Serialize + 'static,
+        F: Fn(SrcIn, &NodeError) -> Vec<DstIn> + Send + Sync + 'static,
     {
-        let mode = if map.is_some() {
-            EdgeMode::Map
-        } else {
-            EdgeMode::Passthrough
-        };
         let planner: FailurePlanner = Box::new(move |input: &Value, err: &NodeError| {
             let input: SrcIn =
                 serde_json::from_value(input.clone()).map_err(|e| EdgeError::BadSrcIn {
                     src,
                     detail: e.to_string(),
                 })?;
-            if let Some(cond) = &when
-                && !cond(&input, err)
-            {
-                return Ok(Vec::new());
-            }
-            match &map {
-                Some(transform) => transform(&input, err)
-                    .into_iter()
-                    .map(|input| {
-                        serde_json::to_value(input).map_err(|e| EdgeError::BadDstIn {
-                            src,
-                            detail: e.to_string(),
-                        })
-                    })
-                    .collect(),
-                None => Ok(vec![serde_json::to_value(&input).map_err(|e| {
-                    EdgeError::BadDstIn {
-                        src,
-                        detail: e.to_string(),
-                    }
-                })?]),
-            }
+            serialize_inputs(src, plan(input, err))
         });
         Self {
             src,

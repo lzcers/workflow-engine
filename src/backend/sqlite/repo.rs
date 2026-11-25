@@ -10,7 +10,9 @@ use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
 use super::{rows::TaskRow, scope};
-use crate::backend::ROW_COLS;
+use crate::backend::{
+    BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, ROW_COLS, UPSTREAM_FAILED_ERR, claim_lost,
+};
 use crate::error::StorageError;
 use crate::task::{
     Dispatch, JoinRule, MAX_ATTEMPTS, SettlementRules, Successor, TaskStore,
@@ -59,13 +61,6 @@ impl Database<&mut sqlx::Transaction<'_, sqlx::Sqlite>> {
             workflow_id: task.workflow_id,
             run_id,
         })
-    }
-}
-
-fn claim_lost(task: &TaskRecord) -> StorageError {
-    StorageError::ClaimLost {
-        workflow_id: task.workflow_id.clone(),
-        task_id: task.task_id,
     }
 }
 
@@ -280,12 +275,13 @@ async fn advance_joins(
     if !transitions.failed.is_empty() {
         sqlx::query(
             "UPDATE tasks
-             SET status = 'failed', error = 'upstream dependency failed',
+             SET status = 'failed', error = ?3,
                  lease_until = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE workflow_id = ?1 AND task_id IN (SELECT value FROM json_each(?2))",
         )
         .bind(workflow_id)
         .bind(Json(&transitions.failed))
+        .bind(UPSTREAM_FAILED_ERR)
         .execute(&mut **tx)
         .await?;
     }
@@ -325,7 +321,6 @@ impl TaskStore for SqliteTaskRepo {
             if limit == 0 {
                 return Ok(Vec::new());
             }
-            let mut tx = self.pool.begin().await?;
             let mut rows = sqlx::query_as::<_, TaskRow>(&format!(
                 r#"
                 WITH candidate AS MATERIALIZED (
@@ -339,9 +334,7 @@ impl TaskStore for SqliteTaskRepo {
                 UPDATE tasks
                 SET status = 'running',
                     error = CASE WHEN attempt >= {MAX_ATTEMPTS} THEN COALESCE(error,
-                        CASE WHEN lease_until IS NOT NULL
-                             THEN 'task lease expired; retry budget exhausted'
-                             ELSE 'task retry budget exhausted' END)
+                        CASE WHEN lease_until IS NOT NULL THEN ?4 ELSE ?5 END)
                         ELSE NULL END,
                     available_at = NULL,
                     lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?2 || ' seconds'),
@@ -354,9 +347,10 @@ impl TaskStore for SqliteTaskRepo {
             .bind(workflow_id)
             .bind(LEASE_DURATION.as_secs() as i64)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&mut *tx)
+            .bind(LEASE_EXPIRED_ERR)
+            .bind(BUDGET_EXHAUSTED_ERR)
+            .fetch_all(&self.pool)
             .await?;
-            tx.commit().await?;
             rows.sort_unstable_by_key(|row| row.task_id);
             Ok(rows.into_iter().map(TaskRecord::from).collect())
         })
@@ -367,7 +361,6 @@ impl TaskStore for SqliteTaskRepo {
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
         Box::pin(async move {
-            let mut tx = self.pool.begin().await?;
             let lease_until = sqlx::query_scalar(
                 r#"
                 UPDATE tasks
@@ -383,9 +376,8 @@ impl TaskStore for SqliteTaskRepo {
             .bind(task.task_id)
             .bind(task.attempt)
             .bind(LEASE_DURATION.as_secs() as i64)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&self.pool)
             .await?;
-            tx.commit().await?;
             Ok(lease_until)
         })
     }

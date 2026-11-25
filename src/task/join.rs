@@ -145,29 +145,16 @@ impl<'a> RunIndex<'a> {
         if required.is_empty() {
             return false;
         }
-        let local_scopes = self.local_scopes(scope_id);
-
-        for req in &required {
-            match *req {
-                RequiredSource::Entry { task_id } => {
-                    if let Some(&idx) = self.task_by_id.get(&task_id)
-                        && statuses[idx] == TaskStatus::Failed
-                    {
-                        return true;
-                    }
-                }
-                RequiredSource::Local(name) => {
-                    if let Some(indices) = self.tasks_by_name.get(name)
-                        && indices.iter().any(|&idx| {
-                            statuses[idx] == TaskStatus::Failed
-                                && local_scopes.contains(&tasks[idx].scope_id)
-                        })
-                    {
-                        return true;
-                    }
-                }
-            }
+        if required.iter().any(|req| match *req {
+            RequiredSource::Entry { task_id } => self
+                .task_by_id
+                .get(&task_id)
+                .is_some_and(|&idx| statuses[idx] == TaskStatus::Failed),
+            RequiredSource::Local(_) => false,
+        }) {
+            return true;
         }
+        let local_scopes = self.local_scopes(scope_id);
 
         rule.upstreams.iter().any(|upstream| {
             self.tasks_by_name

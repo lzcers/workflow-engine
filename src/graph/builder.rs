@@ -1,9 +1,10 @@
 //! 图构建器：注册节点、追加边、组装并静态校验。
 
+use std::collections::HashMap;
+
 use super::super::edge::{FailureEdge, SuccessEdge};
 use super::super::node::{Node, NodeKey};
 use super::{Graph, GraphNode, SubgraphDescription};
-use std::collections::HashSet;
 
 /// 图构建器：注册节点、追加边、组装并校验。
 pub struct GraphBuilder<Ctx> {
@@ -36,22 +37,14 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
 
     /// 注册节点并附加展示标题与说明。节点身份仍由 `name` 决定，与任务的 name 对应。
     pub fn node_with_description<N: Node<Ctx> + 'static>(
-        mut self,
+        self,
         name: &'static str,
         node: N,
         title: impl Into<String>,
         description: impl Into<String>,
     ) -> Self {
-        self.nodes.push((
-            name,
-            GraphNode {
-                node: Box::new(node),
-                title: title.into(),
-                description: description.into(),
-                subgraph_id: None,
-            },
-        ));
-        self
+        self.node_in_subgraph_with_key(name, node, title, description, None)
+            .0
     }
 
     /// 声明静态子图，不创建可执行节点。ID 是完整点路径。
@@ -105,9 +98,9 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
     /// 组装为 [`Graph`] 并静态校验（拓扑 + 边类型接线指纹；命令式边无编译期检查，
     /// 类型错线在此 build 期提前拒绝）。
     pub fn build(self) -> Result<Graph<Ctx>, String> {
-        let mut names = HashSet::new();
-        for (name, _) in &self.nodes {
-            if !names.insert(*name) {
+        let mut nodes = HashMap::with_capacity(self.nodes.len());
+        for (name, node) in self.nodes {
+            if nodes.insert(name, node).is_some() {
                 return Err(format!("duplicate node name: {name}"));
             }
         }
@@ -115,7 +108,7 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
             workflow_id: self.workflow_id,
             title: self.title,
             context: self.context,
-            nodes: self.nodes.into_iter().collect(),
+            nodes,
             subgraphs: self.subgraphs,
             success_edges: self.success_edges,
             failure_edges: self.failure_edges,

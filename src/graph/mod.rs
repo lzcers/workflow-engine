@@ -1,7 +1,7 @@
 //! 图引擎：节点注册表 + 边集合，负责执行、后继规划、静态校验。
 //!
 //! 构图提供两种方式：
-//! - 命令式：[`Graph::builder`]（搭配 [`when`]/[`map`]/[`foreach`]/[`on_error`]/[`when_error`]），在 `build()` 时做端口类型指纹校验；
+//! - 命令式：[`Graph::builder`]（搭配 [`passthrough`]/[`when`]/[`map`]/[`foreach`]/[`on_error`]/[`when_error`]），在 `build()` 时做端口类型指纹校验；
 //! - 声明式：[`crate::workflow!`] 宏，在编译期完成节点接线类型检查。
 
 use serde_json::Value;
@@ -17,7 +17,7 @@ mod erased;
 pub use builder::GraphBuilder;
 pub use crate::edge::{
     EdgeError, EdgeMode, ErrorWhenBuilder, FailureEdge, SuccessEdge, WhenBuilder, foreach, map,
-    on_error, when, when_error,
+    on_error, passthrough, when, when_error,
 };
 pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
 pub use description::{

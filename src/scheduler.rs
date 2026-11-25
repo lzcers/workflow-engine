@@ -157,7 +157,9 @@ where
 }
 
 fn is_shutting_down(shutdown: &Option<watch::Receiver<bool>>) -> bool {
-    shutdown.as_ref().is_some_and(|rx| *rx.borrow())
+    shutdown
+        .as_ref()
+        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
 }
 
 async fn wait_shutdown(shutdown: &mut Option<watch::Receiver<bool>>) {
