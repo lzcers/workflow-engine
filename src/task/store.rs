@@ -152,6 +152,10 @@ pub(crate) trait TaskStore: Sync {
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error>>;
 
+    /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务在下一轮认领即可
+    /// 重入，不必等待租约过期。仅当前有效认领可以释放，不能释放新执行者的租约。
+    fn release_claim<'a>(&'a self, task: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>>;
+
     /// 在同一事务内写入产物、标记成功并入队全部成功后继。
     ///
     /// 必须校验当前有效认领且 attempt <= MAX_ATTEMPTS；旧执行者和仅用于最终失败的认领不能提交成功。
@@ -192,10 +196,6 @@ pub(crate) trait TaskStore: Sync {
         message: &'a str,
         delay: Duration,
     ) -> BoxFuture<'a, Result<(), Self::Error>>;
-
-    /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务在下一轮认领即可
-    /// 重入，不必等待租约过期。仅当前有效认领可以释放，不能释放新执行者的租约。
-    fn release_claim<'a>(&'a self, task: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>>;
 }
 
 #[cfg(test)]
