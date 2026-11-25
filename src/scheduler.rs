@@ -16,7 +16,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    graph::{ErasedGraph, Graph, Successor},
+    graph::{Graph, Successor},
     node::{NodeContext, NodeError},
     task::{MAX_ATTEMPTS, TaskRecord, TaskStore, store::LEASE_DURATION},
 };
@@ -324,12 +324,12 @@ where
 /// 原子提交任务状态与后继，存储再次校验运行状态、attempt 和租约有效期。
 async fn settle<Ctx, S>(
     store: &S,
-    graph: &dyn ErasedGraph,
+    graph: &Graph<Ctx>,
     task: &TaskRecord,
     outcome: &ExecutionOutcome<Ctx>,
 ) -> Result<(), S::Error>
 where
-    Ctx: NodeContext + Sync,
+    Ctx: NodeContext + Sync + 'static,
     S: TaskStore + ?Sized,
 {
     match outcome {
