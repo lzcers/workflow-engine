@@ -31,7 +31,7 @@
 
 ## 实例启动与提交
 
-`Engine::make(graph)` 将当前图和 Engine 共享的任务存储传给 Workflow 与 Scheduler，然后启动后台 `scheduler.run()`。
+`Engine::make(graph)`（或 `Engine::make_with(graph, options)`）将当前图、共享任务存储及并发/轮询参数传给 Workflow 与 Scheduler，然后启动后台 `scheduler.run()`。
 因此 `make` 必须在 Tokio runtime 内调用。调度器开始认领该图已有的可执行任务，无需先提交新运行。
 每次 `Workflow::submit(entry, input)` 按以下顺序执行：
 
@@ -49,7 +49,8 @@ Scheduler 不注册或监听触发源；已入队的 Event 任务按普通任务
 控制面可以调用 `Database::in_transaction(&mut tx).submit(task)` 复用已有的 SQLx 事务，让 cron 入队与触发游标共同提交。入口任务的 `task_id` 同时标识新 run。后继在执行端结算时继承同一个 `workflow_id` 和 `run_id`。
 
 Workflow 持有图与存储的共享句柄，Engine 释放不影响它。执行期间需要保留 Workflow；
-实例释放会通过 `Workflow::drop` 中止后台任务，继而取消调度器的在途任务。
+正常停机可调用 `workflow.shutdown().await` 停止认领新任务并等待在途任务完成；
+直接释放会通过 `Workflow::drop` 中止后台任务，继而取消调度器的在途任务。
 `RunHandle` 只保存运行身份，持有它不会延长 Workflow 的生命周期。
 
 ## 主调度循环：按空槽补充任务
@@ -231,8 +232,7 @@ flowchart TD
 结算与回调之间还可能发生进程退出或实例取消，因此 `on_success` 和 `on_error` 都不保证必达，
 也没有独立的补发机制。
 
-`NodeError::Retryable` 不会在当前调度器里自动触发退避或重新执行同一任务；业务错误会
-经过失败边规划与失败结算。因结算异常、任务 panic 或租约过期而重新认领时会消耗新的
+`NodeError::Retryable` 在 `attempt < MAX_ATTEMPTS` 时由调度器通过 `TaskStore::schedule_retry` 按指数退避（1s、2s…）重新置回 `pending` 并写入 `available_at`，不触发 `on_error`；当尝试预算耗尽或返回 `NodeError::Permanent` 时，再进入失败边规划与失败结算。因结算异常、任务 panic 或租约过期而重新认领时同样消耗新的
 `attempt`；代次超过 `MAX_ATTEMPTS` 后仅处理最终失败。失败边产生的新任务有自己的
 尝试预算，不属于原任务的重新认领。
 

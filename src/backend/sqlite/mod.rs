@@ -9,12 +9,10 @@
 //! 执行期间自动续租，租约失效后可重新认领；预算耗尽的任务取得新的结算认领，
 //! 由调度器规划失败后继并原子结算，恢复时不再执行节点。
 
-mod join;
 mod repo;
 mod rows;
 mod schema;
 mod scope;
-mod store;
 
 #[cfg(test)]
 #[path = "../../../tests/unit/sqlite_scheduler.rs"]

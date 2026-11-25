@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::database::{Database, DatabasePool};
 pub use crate::error::StorageError;
 use crate::task::TaskStore;
+use crate::workflow::WorkerOptions;
 use crate::{Graph, NodeContext, Workflow};
 
 /// 引擎初始化或工作流提交失败。
@@ -12,6 +13,8 @@ use crate::{Graph, NodeContext, Workflow};
 pub enum EngineError {
     #[error("no node registered for name={0}")]
     UnknownNode(String),
+    #[error("invalid graph description: {0}")]
+    InvalidGraph(String),
     #[error("serialize workflow input: {0}")]
     Input(#[from] serde_json::Error),
     #[error(transparent)]
@@ -60,6 +63,14 @@ impl Engine {
     where
         Ctx: NodeContext + Sync + 'static,
     {
-        Workflow::new(Arc::new(graph), self.store.clone())
+        self.make_with(graph, WorkerOptions::default())
+    }
+
+    /// 使用指定的并发与轮询参数创建工作流实例并启动后台调度器。
+    pub fn make_with<Ctx>(&self, graph: Graph<Ctx>, options: WorkerOptions) -> Workflow
+    where
+        Ctx: NodeContext + Sync + 'static,
+    {
+        Workflow::new(Arc::new(graph), self.store.clone(), options)
     }
 }

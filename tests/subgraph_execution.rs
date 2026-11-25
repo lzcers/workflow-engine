@@ -193,7 +193,7 @@ async fn nested(url: &str) {
     assert_eq!(reports.len(), 3);
     let mut ids = Vec::new();
     for (task, output) in reports {
-        assert_eq!(task.run_id, Some(run.run_id));
+        assert_eq!(task.run_id, run.run_id);
         assert_eq!(output["daily"], output["indicators"]["left"]);
         assert_eq!(output["daily"], output["indicators"]["right"]);
         ids.push(task.scope_id.unwrap());
@@ -207,7 +207,7 @@ async fn nested(url: &str) {
     let scopes = read_scopes(url, "nested-subgraphs").await;
     let scopes: Vec<_> = scopes
         .iter()
-        .filter(|s| s.run_id == Some(run.run_id))
+        .filter(|s| s.run_id == run.run_id)
         .collect();
     assert_eq!(
         scopes.len(),
@@ -230,7 +230,7 @@ async fn nested(url: &str) {
     let scopes = read_scopes(url, "nested-subgraphs").await;
     let direct_scopes: Vec<_> = scopes
         .iter()
-        .filter(|s| s.run_id == Some(direct.run_id))
+        .filter(|s| s.run_id == direct.run_id)
         .collect();
     assert_eq!(direct_scopes.len(), 2);
     assert_eq!(
@@ -286,7 +286,7 @@ async fn entry_and_foreach(url: &str) {
     assert_eq!(
         scopes
             .iter()
-            .filter(|scope| scope.run_id == Some(run.run_id))
+            .filter(|scope| scope.run_id == run.run_id)
             .count(),
         8
     );

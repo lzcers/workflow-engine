@@ -5,14 +5,24 @@
 use std::{collections::HashMap, time::Duration};
 
 use futures::future::BoxFuture;
-use serde::Serialize;
 use serde_json::Value;
 
-use super::{Task, TaskRecord, TaskStatus};
+use super::{Task, TaskRecord};
 use crate::{RunHandle, error::StorageError};
 
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
+
+/// 后继任务在结算事务内的落库与作用域分发方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// 在共享作用域内为每条输入创建独立的 `pending` 任务。
+    Shared,
+    /// 为每条输入建立独立子图作用域并创建 `pending` 任务（foreach）。
+    PerInputScope,
+    /// 在共享作用域内合并至状态为 `collecting` 的 JOIN 任务。
+    Join,
+}
 
 /// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
 #[derive(Debug, Clone)]
@@ -21,21 +31,18 @@ pub struct Successor {
     /// 从根到目标所属子图的完整子图 ID，根节点为空。
     pub subgraph_path: Vec<String>,
     pub inputs: Vec<Value>,
-    /// 成功路由到 JOIN 时收集输入，其余后继直接等待认领。
-    pub initial_status: TaskStatus,
-    /// 每项输入创建独立的子图调用；为 false 时，同次结算的普通跨入边共享调用。
-    pub new_scope_per_input: bool,
+    pub dispatch: Dispatch,
 }
 
 /// JOIN 的直接前驱与仍可能创建输入的全部上游，在图构建后固定。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct JoinRule {
     pub predecessors: Vec<JoinPredecessor>,
     pub upstreams: Vec<String>,
 }
 
 /// 外部前驱只对应触发当前子图实例的入口任务。深度从最外层子图的 0 开始。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct JoinPredecessor {
     pub name: String,
     pub entry_depth: Option<usize>,
@@ -58,7 +65,7 @@ impl SettlementRules {
 pub(crate) struct FanoutSource<'a> {
     pub workflow_id: &'a str,
     pub task_id: i64,
-    pub run_id: Option<i64>,
+    pub run_id: i64,
     pub scope_id: Option<i64>,
 }
 
@@ -174,6 +181,16 @@ pub(crate) trait TaskStore: Sync {
         message: &'a str,
         successors: &'a [Successor],
         rules: &'a SettlementRules,
+    ) -> BoxFuture<'a, Result<(), Self::Error>>;
+
+    /// 将可重试失败的任务放回 pending 并设置下次可认领时间（退避延迟），清空租约并保留本次错误。
+    ///
+    /// 必须校验当前有效认领且 `attempt < MAX_ATTEMPTS`；已失权或预算耗尽的认领不能安排退避重试。
+    fn schedule_retry<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+        message: &'a str,
+        delay: Duration,
     ) -> BoxFuture<'a, Result<(), Self::Error>>;
 
     /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务在下一轮认领即可

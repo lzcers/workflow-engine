@@ -1,5 +1,8 @@
 //! Test seeds may model a task that already belongs to an existing run.
-use crate::{Task, TaskStatus, task::Successor};
+use crate::{
+    Task,
+    task::{Dispatch, Successor},
+};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -26,8 +29,7 @@ pub(crate) fn plan(dst: &'static str, inputs: Vec<Value>) -> Successor {
         dst,
         subgraph_path: Vec::new(),
         inputs,
-        new_scope_per_input: false,
-        initial_status: TaskStatus::Pending,
+        dispatch: Dispatch::Shared,
     }
 }
 
@@ -44,7 +46,7 @@ pub(crate) fn scoped_plan(
 
 pub(crate) fn join_plan(dst: &'static str, inputs: Vec<Value>) -> Successor {
     Successor {
-        initial_status: TaskStatus::Collecting,
+        dispatch: Dispatch::Join,
         ..plan(dst, inputs)
     }
 }

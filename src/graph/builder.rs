@@ -1,6 +1,6 @@
 //! 图构建器：注册节点、追加边、组装并静态校验。
 
-use super::super::edge::{AnyFailureEdge, AnySuccessEdge, FailureEdge, SuccessEdge};
+use super::super::edge::{FailureEdge, SuccessEdge};
 use super::super::node::{Node, NodeKey};
 use super::{Graph, GraphNode, SubgraphDescription};
 use std::collections::HashSet;
@@ -12,8 +12,8 @@ pub struct GraphBuilder<Ctx> {
     context: Ctx,
     nodes: Vec<(&'static str, GraphNode<Ctx>)>,
     subgraphs: Vec<SubgraphDescription>,
-    success_edges: Vec<Box<dyn AnySuccessEdge>>,
-    failure_edges: Vec<Box<dyn AnyFailureEdge>>,
+    success_edges: Vec<SuccessEdge>,
+    failure_edges: Vec<FailureEdge>,
 }
 
 impl<Ctx: Send> GraphBuilder<Ctx> {
@@ -54,29 +54,6 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
         self
     }
 
-    /// 注册实例并返回类型化标识，供 DSL 从实例推导边两端的类型。
-    pub fn node_with_key<N: Node<Ctx> + 'static>(
-        self,
-        name: &'static str,
-        node: N,
-    ) -> (Self, NodeKey<Ctx, N>) {
-        self.node_with_description_and_key(name, node, name, "")
-    }
-
-    /// 注册带展示信息的实例，并保留类型化标识用于编译期接线检查。
-    pub fn node_with_description_and_key<N: Node<Ctx> + 'static>(
-        self,
-        name: &'static str,
-        node: N,
-        title: impl Into<String>,
-        description: impl Into<String>,
-    ) -> (Self, NodeKey<Ctx, N>) {
-        (
-            self.node_with_description(name, node, title, description),
-            NodeKey::new(name),
-        )
-    }
-
     /// 声明静态子图，不创建可执行节点。ID 是完整点路径。
     pub fn subgraph(
         mut self,
@@ -114,14 +91,14 @@ impl<Ctx: Send> GraphBuilder<Ctx> {
     }
 
     /// 追加一条成功边（条件/转换，前向 DAG）。
-    pub fn edge<E: SuccessEdge + 'static>(mut self, e: E) -> Self {
-        self.success_edges.push(Box::new(e));
+    pub fn edge(mut self, e: SuccessEdge) -> Self {
+        self.success_edges.push(e);
         self
     }
 
     /// 追加一条失败边（条件/转换，后向回退图）。
-    pub fn error_edge<E: FailureEdge + 'static>(mut self, e: E) -> Self {
-        self.failure_edges.push(Box::new(e));
+    pub fn error_edge(mut self, e: FailureEdge) -> Self {
+        self.failure_edges.push(e);
         self
     }
 

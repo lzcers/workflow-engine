@@ -1953,22 +1953,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "workflow-engine-dsl"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "workflow-engine-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "workflow-engine-dsl",
 ]
 
 [[package]]

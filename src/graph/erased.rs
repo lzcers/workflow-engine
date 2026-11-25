@@ -24,9 +24,6 @@ pub trait ErasedGraph: Any + Send + Sync {
     /// 静态子图路径；不存在的节点为 None，根节点为 Some([])。
     fn subgraph_path(&self, name: &str) -> Option<Vec<String>>;
 
-    /// 直接成功前驱；不存在的节点为 None。
-    fn predecessors_of(&self, name: &str) -> Option<Vec<String>>;
-
     /// 按节点名排序的外部触发声明。
     fn triggers(&self) -> Vec<(&str, Trigger)>;
 }
@@ -50,10 +47,6 @@ impl<Ctx: Send + Sync + 'static> ErasedGraph for Graph<Ctx> {
 
     fn subgraph_path(&self, name: &str) -> Option<Vec<String>> {
         Graph::subgraph_path(self, name)
-    }
-
-    fn predecessors_of(&self, name: &str) -> Option<Vec<String>> {
-        Graph::predecessors_of(self, name)
     }
 
     fn triggers(&self) -> Vec<(&str, Trigger)> {

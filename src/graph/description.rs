@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use super::{Graph, TaskType, Trigger, qualified_parent, subgraph_path};
+use super::{EdgeMode, Graph, TaskType, Trigger, qualified_parent, subgraph_path};
 
 /// 已构建执行图的可序列化拓扑。节点按 ID 排序，边按成功/失败及各自注册顺序输出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,10 +54,8 @@ pub struct EdgeDescription {
     pub source: String,
     pub target: String,
     pub kind: EdgeKind,
-    /// 是否通过 map 转换输入。foreach 和透传边为 false。
-    pub map: bool,
-    /// 成功边是否逐项建立执行作用域；普通边与失败边为 false。
-    pub foreach: bool,
+    /// 边的路由模式：`passthrough`、`map` 或 `foreach`（失败边只为前两者）。
+    pub mode: EdgeMode,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -88,8 +86,7 @@ impl<Ctx> Graph<Ctx> {
                 source: edge.src().to_owned(),
                 target: edge.dst().to_owned(),
                 kind: EdgeKind::Success,
-                map: edge.is_map(),
-                foreach: edge.is_foreach(),
+                mode: edge.mode(),
             })
             .chain(
                 self.failure_edges
@@ -100,8 +97,7 @@ impl<Ctx> Graph<Ctx> {
                         source: edge.src().to_owned(),
                         target: edge.dst().to_owned(),
                         kind: EdgeKind::Failure,
-                        map: edge.is_map(),
-                        foreach: false,
+                        mode: edge.mode(),
                     }),
             )
             .collect();
@@ -154,15 +150,14 @@ impl GraphDescription {
             .next()
             .ok_or_else(|| crate::EngineError::UnknownNode(entry.to_owned()))?;
         if entries.next().is_some() {
-            return Err(crate::error::StorageError::InvalidFanout {
-                detail: format!("duplicate node id: {entry}"),
-            }
-            .into());
+            return Err(crate::EngineError::InvalidGraph(format!(
+                "duplicate node id: {entry}"
+            )));
         }
         let mut task = crate::Task::new(&self.workflow_id, entry, input);
         task.subgraph_path = self
             .entry_path(node)
-            .map_err(|detail| crate::error::StorageError::InvalidFanout { detail })?;
+            .map_err(crate::EngineError::InvalidGraph)?;
         Ok(task)
     }
 
@@ -193,10 +188,13 @@ impl GraphDescription {
                 node.task_type == TaskType::Join.as_str(),
             )
         });
-        let edges = self
-            .edges
-            .iter()
-            .map(|edge| (edge.source.as_str(), edge.target.as_str(), edge.foreach));
+        let edges = self.edges.iter().map(|edge| {
+            (
+                edge.source.as_str(),
+                edge.target.as_str(),
+                edge.mode == EdgeMode::Foreach,
+            )
+        });
         validate_subgraphs(nodes, self.subgraphs.iter(), edges)
     }
 }
@@ -222,7 +220,7 @@ impl<Ctx> Graph<Ctx> {
         let success = self
             .success_edges
             .iter()
-            .map(|e| (e.src(), e.dst(), e.is_foreach()));
+            .map(|e| (e.src(), e.dst(), e.mode() == EdgeMode::Foreach));
         let failure = self.failure_edges.iter().map(|e| (e.src(), e.dst(), false));
         validate_subgraphs(
             nodes.iter().copied(),

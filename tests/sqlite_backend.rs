@@ -110,7 +110,7 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
         for _ in 0..5 {
             let (task, output) = results.recv().await.unwrap();
             observed.push((
-                task.run_id.unwrap(),
+                task.run_id,
                 task.name,
                 task.parent_task_ids,
                 task.input.as_i64().unwrap(),
@@ -183,7 +183,7 @@ async fn make_recovers_persisted_tasks_without_submit() {
     .await
     .expect("make starts pending and expired running tasks without a new submit");
     recovered.sort_unstable();
-    assert_eq!(recovered, [(1, Some(1), 1, 11), (2, Some(2), 2, 21)]);
+    assert_eq!(recovered, [(1, 1, 1, 11), (2, 2, 2, 21)]);
 
     drop(workflow);
     drop(engine);
@@ -274,7 +274,7 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
             let (task, output) = results.recv().await.unwrap();
             outputs.push((
                 task.workflow_id,
-                task.run_id.unwrap(),
+                task.run_id,
                 task.name,
                 output.as_i64().unwrap(),
             ));
@@ -302,7 +302,7 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
         .expect("a subsequent submit wakes the existing scheduler")
         .unwrap();
     assert_eq!(task.workflow_id, "first");
-    assert_eq!(task.run_id, Some(next_run.run_id));
+    assert_eq!(task.run_id, next_run.run_id);
     assert_eq!(task.name, "alternate");
     assert_eq!(output, json!(41));
 
@@ -313,7 +313,7 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
         .expect("dropping the first workflow does not stop the second")
         .unwrap();
     assert_eq!(task.workflow_id, "second");
-    assert_eq!(task.run_id, Some(next_run.run_id));
+    assert_eq!(task.run_id, next_run.run_id);
     assert_eq!(output, json!(51));
 }
 
@@ -399,7 +399,7 @@ async fn workflow_shares_slots_across_concurrent_submissions() {
         let mut completed_runs = Vec::new();
         for _ in 0..12 {
             let (task, _) = completions.recv().await.unwrap();
-            completed_runs.push(task.run_id.unwrap());
+            completed_runs.push(task.run_id);
         }
         completed_runs
     })
@@ -424,6 +424,6 @@ async fn workflow_shares_slots_across_concurrent_submissions() {
         .await
         .expect("the later run settles without an explicit start")
         .unwrap();
-    assert_eq!(task.run_id, Some(next_run.run_id));
+    assert_eq!(task.run_id, next_run.run_id);
     assert_eq!(output, json!(99));
 }

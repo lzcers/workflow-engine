@@ -224,8 +224,8 @@ where
 
 /// 图节点统一的错误类型：区分「可重试」与「永久失败」。
 ///
-/// - [`NodeError::Retryable`]：瞬时错误（如 LLM 调用超时、网络抖动）。失败边可以据此安排新的任务；无匹配后继时，当前任务以失败结算。
-/// - [`NodeError::Permanent`]：确定性错误（如序列化失败、意外输出），重试无意义。
+/// - [`NodeError::Retryable`]：瞬时错误（如 LLM 调用超时、网络抖动）。在 `attempt < MAX_ATTEMPTS` 时由调度器按指数退避重新入队重试；耗尽重试预算后进入失败边规划与失败结算。
+/// - [`NodeError::Permanent`]：确定性错误（如序列化失败、意外输出），不自动重试，直接进入失败边规划与失败结算。
 ///
 /// `From<String>` 默认映射为 [`NodeError::Retryable`]，使经 `?` 传播的 exec 层错误
 /// （多为瞬时调用）无需显式标注；确定性错误请在构造处用 [`NodeError::permanent`] 显式声明。

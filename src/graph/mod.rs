@@ -8,17 +8,16 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-use super::edge::{AnyFailureEdge, AnySuccessEdge};
 use super::node::{AnyNode, TypeFingerprint};
-use crate::task::{JoinPredecessor, JoinRule, SettlementRules, Successor, TaskStatus};
+use crate::task::{Dispatch, JoinPredecessor, JoinRule, SettlementRules, Successor};
 
 mod builder;
 mod description;
 mod erased;
 
 pub use crate::edge::{
-    EdgeError, EdgeImpl, ErrorWhenBuilder, FailureEdge, FailureEdgeImpl, SuccessEdge, WhenBuilder,
-    foreach, map, on_error, when, when_error,
+    EdgeError, EdgeMode, ErrorWhenBuilder, FailureEdge, SuccessEdge, WhenBuilder, foreach, map,
+    on_error, when, when_error,
 };
 pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
 pub use builder::GraphBuilder;
@@ -45,8 +44,8 @@ pub struct Graph<Ctx> {
     context: Ctx,
     nodes: HashMap<&'static str, GraphNode<Ctx>>,
     subgraphs: Vec<SubgraphDescription>,
-    success_edges: Vec<Box<dyn AnySuccessEdge>>,
-    failure_edges: Vec<Box<dyn AnyFailureEdge>>,
+    success_edges: Vec<SuccessEdge>,
+    failure_edges: Vec<FailureEdge>,
     settlement_rules: SettlementRules,
 }
 
@@ -155,7 +154,7 @@ impl<Ctx> Graph<Ctx> {
             if inputs.is_empty() {
                 continue;
             }
-            let initial_status = if self.settlement_rules.join_rules.contains_key(edge.dst()) {
+            let dispatch = if self.settlement_rules.join_rules.contains_key(edge.dst()) {
                 if inputs.iter().any(|input| !input.is_object()) {
                     return Err(EdgeError::BadDstIn {
                         src: edge.src(),
@@ -165,9 +164,11 @@ impl<Ctx> Graph<Ctx> {
                         ),
                     });
                 }
-                TaskStatus::Collecting
+                Dispatch::Join
+            } else if edge.mode() == EdgeMode::Foreach {
+                Dispatch::PerInputScope
             } else {
-                TaskStatus::Pending
+                Dispatch::Shared
             };
             plans.push(Successor {
                 dst: edge.dst(),
@@ -175,8 +176,7 @@ impl<Ctx> Graph<Ctx> {
                     .subgraph_path(edge.dst())
                     .expect("validated edge destination"),
                 inputs,
-                initial_status,
-                new_scope_per_input: edge.is_foreach(),
+                dispatch,
             });
         }
         Ok(plans)
@@ -201,8 +201,7 @@ impl<Ctx> Graph<Ctx> {
                     .subgraph_path(edge.dst())
                     .expect("validated edge destination"),
                 inputs,
-                initial_status: TaskStatus::Pending,
-                new_scope_per_input: false,
+                dispatch: Dispatch::Shared,
             });
         }
         Ok(plans)

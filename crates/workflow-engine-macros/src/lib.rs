@@ -1,5 +1,7 @@
 //! Typed expansion of the shared workflow syntax tree.
 
+mod parse;
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{format_ident, quote};
@@ -8,7 +10,8 @@ use syn::{
     Attribute, Expr, Ident, Meta, Path, Result, Token,
     parse::{Parse, ParseStream},
 };
-use workflow_engine_dsl::{EdgeClause, NodePath, Region, RegionItem, Workflow};
+
+use parse::{EdgeClause, NodePath, Region, RegionItem, Workflow};
 
 struct Input {
     engine: Path,

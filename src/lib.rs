@@ -31,4 +31,4 @@ pub use database::{Database, DatabasePool};
 pub use engine::{Engine, EngineError};
 pub use graph::{Graph, JoinNode, Node, NodeContext, NodeError, Trigger};
 pub use task::{Task, TaskRecord, TaskStatus};
-pub use workflow::{RunHandle, Workflow};
+pub use workflow::{RunHandle, WorkerOptions, Workflow};

@@ -10,7 +10,7 @@ use crate::{TaskRecord, TaskStatus};
 pub struct TaskRow {
     pub workflow_id: String,
     pub task_id: i64,
-    pub run_id: Option<i64>,
+    pub run_id: i64,
     pub scope_id: Option<i64>,
     #[sqlx(json)]
     pub parent_task_ids: Vec<i64>,

@@ -14,7 +14,7 @@ use crate::{
     dsl,
     graph::{JoinNode, Node, NodeContext, NodeError},
     scheduler::Scheduler,
-    task::{TaskRecord, TaskStatus},
+    task::{TaskRecord, TaskStatus, TaskStore},
 };
 
 #[derive(Default)]
@@ -126,9 +126,9 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         )
         .await
         .unwrap();
-    assert_eq!(root.run_id, Some(root.task_id));
+    assert_eq!(root.run_id, root.task_id);
     assert!(root.parent_task_ids.is_empty());
-    assert_eq!(other_root.run_id, Some(other_root.task_id));
+    assert_eq!(other_root.run_id, other_root.task_id);
     assert_ne!(root.run_id, other_root.run_id);
     let scheduler = Scheduler::new(
         graph.clone(),

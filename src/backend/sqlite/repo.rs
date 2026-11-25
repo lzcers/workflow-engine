@@ -3,23 +3,23 @@
 //! Each task transaction starts with INSERT or UPDATE. That statement acquires the
 //! write lock before any reads used to plan fanout or merge JOIN contributions.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
-use super::{join, scope};
-use crate::task::{
-    JoinRule, MAX_ATTEMPTS, SettlementRules, Successor,
-    scope::{ScopeEntries, route_path},
-    store::{FanoutSource, LEASE_DURATION, merge_join_inputs},
-};
+use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::{SqlitePool, types::Json};
 
-use super::rows::TaskRow;
+use super::{rows::TaskRow, scope};
 use crate::error::StorageError;
-use crate::{TaskRecord, TaskStatus};
+use crate::task::{
+    Dispatch, JoinRule, MAX_ATTEMPTS, SettlementRules, Successor, TaskStore,
+    join::{self, RunScope, RunTask},
+    scope::{ScopeEntries, route_path},
+    store::{FanoutSource, LEASE_DURATION, merge_join_inputs},
+};
+use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
 
-/// Columns suitable for application queries against the same task table.
-pub const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
+pub(crate) const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
     lease_until, attempt, \
     input_json, output_json, error, created_at, updated_at";
 
@@ -29,11 +29,84 @@ pub struct SqliteTaskRepo {
     pub(super) pool: SqlitePool,
 }
 
+impl Database<&mut sqlx::Transaction<'_, sqlx::Sqlite>> {
+    /// 提交独立运行的入口。首次 INSERT 在分配 ID 时取得写锁。
+    pub async fn submit(self, task: Task) -> Result<RunHandle, StorageError> {
+        let tx = self.0;
+        let run_id = sqlx::query(
+            "INSERT INTO tasks (workflow_id, name, status, input_json)
+             VALUES (?1, ?2, 'pending', ?3)",
+        )
+        .bind(&task.workflow_id)
+        .bind(&task.name)
+        .bind(&task.input)
+        .execute(&mut **tx)
+        .await?
+        .last_insert_rowid();
+        let scope_id = scope::enter(
+            tx,
+            &task.workflow_id,
+            run_id,
+            run_id,
+            None,
+            &task.subgraph_path,
+            None,
+        )
+        .await?;
+        sqlx::query("UPDATE tasks SET run_id = task_id, scope_id = ?1 WHERE task_id = ?2")
+            .bind(scope_id)
+            .bind(run_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(RunHandle {
+            workflow_id: task.workflow_id,
+            run_id,
+        })
+    }
+}
+
 fn claim_lost(task: &TaskRecord) -> StorageError {
     StorageError::ClaimLost {
         workflow_id: task.workflow_id.clone(),
         task_id: task.task_id,
     }
+}
+
+/// 仅当前有效认领可以提交终态；先执行写语句取得写锁再检查数据库时钟。
+async fn settle_in_tx<'a>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task: &'a TaskRecord,
+    status: TaskStatus,
+    output: Option<&Value>,
+    error: Option<&str>,
+) -> Result<FanoutSource<'a>, StorageError> {
+    let (run_id, scope_id) = sqlx::query_as(&format!(
+        r#"
+        UPDATE tasks
+        SET status = ?3, output_json = ?4, error = ?5, lease_until = NULL, available_at = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE workflow_id = ?1 AND task_id = ?2
+          AND status = 'running' AND attempt = ?6
+          AND (?3 IN ('failed', 'superseded') OR attempt <= {MAX_ATTEMPTS})
+          AND julianday(lease_until) > julianday('now')
+        RETURNING run_id, scope_id
+        "#
+    ))
+    .bind(&task.workflow_id)
+    .bind(task.task_id)
+    .bind(status.as_str())
+    .bind(output)
+    .bind(error)
+    .bind(task.attempt)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| claim_lost(task))?;
+    Ok(FanoutSource {
+        workflow_id: &task.workflow_id,
+        task_id: task.task_id,
+        run_id,
+        scope_id,
+    })
 }
 
 /// The source settlement has already acquired the write lock in this transaction.
@@ -50,14 +123,27 @@ async fn enqueue_fanouts_in_tx(
             if plan.inputs.is_empty() {
                 continue;
             }
-            let (parent, entered) = route_path(
-                &chain,
-                source.run_id,
-                &plan.subgraph_path,
-                plan.new_scope_per_input,
-            )?;
-            if plan.new_scope_per_input {
-                for input in &plan.inputs {
+            let per_input_scope = plan.dispatch == Dispatch::PerInputScope;
+            let (parent, entered) =
+                route_path(&chain, source.run_id, &plan.subgraph_path, per_input_scope)?;
+            match plan.dispatch {
+                Dispatch::PerInputScope => {
+                    for input in &plan.inputs {
+                        let scope_id = scope::enter(
+                            tx,
+                            source.workflow_id,
+                            source.run_id,
+                            source.task_id,
+                            parent,
+                            entered,
+                            None,
+                        )
+                        .await?;
+                        insert_task(tx, source, plan.dst, TaskStatus::Pending, scope_id, input)
+                            .await?;
+                    }
+                }
+                Dispatch::Shared => {
                     let scope_id = scope::enter(
                         tx,
                         source.workflow_id,
@@ -65,28 +151,26 @@ async fn enqueue_fanouts_in_tx(
                         source.task_id,
                         parent,
                         entered,
-                        None,
+                        Some(&mut entries),
                     )
                     .await?;
-                    insert_task(tx, source, plan, scope_id, input).await?;
+                    for input in &plan.inputs {
+                        insert_task(tx, source, plan.dst, TaskStatus::Pending, scope_id, input)
+                            .await?;
+                    }
                 }
-                continue;
-            }
-            let scope_id = scope::enter(
-                tx,
-                source.workflow_id,
-                source.run_id,
-                source.task_id,
-                parent,
-                entered,
-                Some(&mut entries),
-            )
-            .await?;
-            if plan.initial_status == TaskStatus::Collecting {
-                collect_join(tx, source, plan, scope_id).await?;
-            } else {
-                for input in &plan.inputs {
-                    insert_task(tx, source, plan, scope_id, input).await?;
+                Dispatch::Join => {
+                    let scope_id = scope::enter(
+                        tx,
+                        source.workflow_id,
+                        source.run_id,
+                        source.task_id,
+                        parent,
+                        entered,
+                        Some(&mut entries),
+                    )
+                    .await?;
+                    collect_join(tx, source, plan, scope_id).await?;
                 }
             }
         }
@@ -102,7 +186,7 @@ async fn collect_join(
 ) -> Result<(), StorageError> {
     let existing = sqlx::query_as::<_, (i64, Json<Vec<i64>>, Value)>(
         "SELECT task_id, parent_task_ids, input_json FROM tasks
-         WHERE workflow_id = ?1 AND name = ?2 AND run_id IS ?3 AND scope_id IS ?4
+         WHERE workflow_id = ?1 AND name = ?2 AND run_id = ?3 AND scope_id IS ?4
            AND status = 'collecting' ORDER BY task_id LIMIT 1",
     )
     .bind(source.workflow_id)
@@ -129,7 +213,15 @@ async fn collect_join(
         .await?;
     } else {
         let input = merge_join_inputs(None, &plan.inputs)?;
-        insert_task(tx, source, plan, scope_id, &input).await?;
+        insert_task(
+            tx,
+            source,
+            plan.dst,
+            TaskStatus::Collecting,
+            scope_id,
+            &input,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -137,7 +229,8 @@ async fn collect_join(
 async fn insert_task(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     source: &FanoutSource<'_>,
-    plan: &Successor,
+    dst: &str,
+    status: TaskStatus,
     scope_id: Option<i64>,
     input: &Value,
 ) -> Result<(), StorageError> {
@@ -147,8 +240,8 @@ async fn insert_task(
     )
     .bind(source.workflow_id)
     .bind(source.run_id)
-    .bind(plan.dst)
-    .bind(plan.initial_status.as_str())
+    .bind(dst)
+    .bind(status.as_str())
     .bind(Json([source.task_id]))
     .bind(input)
     .bind(scope_id)
@@ -157,45 +250,59 @@ async fn insert_task(
     Ok(())
 }
 
-/// 全部后继写入后，在本次运行内传播失败并冻结已收齐的 JOIN 输入。
+/// 全部后继写入后，读取当前运行的轻量状态快照，通过共享纯 Rust 规则推进 JOIN 状态。
 async fn advance_joins(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
-    run_id: Option<i64>,
+    run_id: i64,
     rules: &HashMap<String, JoinRule>,
 ) -> Result<(), StorageError> {
     if rules.is_empty() {
         return Ok(());
     }
-    let collecting = "wt.workflow_id = ?1 AND wt.run_id IS ?2 AND wt.status = 'collecting'";
-    let fail = format!(
-        "UPDATE tasks AS wt SET status = 'failed', error = 'upstream dependency failed',
-            lease_until = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE {collecting} AND ({})",
-        join::failed("?3")
-    );
-    loop {
-        let changed = sqlx::query(&fail)
-            .bind(workflow_id)
-            .bind(run_id)
-            .bind(Json(rules))
-            .execute(&mut **tx)
-            .await?
-            .rows_affected();
-        if changed == 0 {
-            break;
-        }
-    }
-    sqlx::query(&format!(
-        "UPDATE tasks AS wt SET status = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE {collecting} AND ({})",
-        join::ready("?3")
-    ))
+    let tasks = sqlx::query_as::<_, RunTask>(
+        "SELECT task_id, name, status, scope_id FROM tasks WHERE workflow_id = ?1 AND run_id = ?2",
+    )
     .bind(workflow_id)
     .bind(run_id)
-    .bind(Json(rules))
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
+    if !tasks.iter().any(|task| task.status == TaskStatus::Collecting) {
+        return Ok(());
+    }
+    let scopes = sqlx::query_as::<_, RunScope>(
+        "SELECT scope_id, parent_scope_id, trigger_task_id FROM scopes
+         WHERE workflow_id = ?1 AND run_id = ?2",
+    )
+    .bind(workflow_id)
+    .bind(run_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let transitions = join::advance_joins(&tasks, &scopes, rules);
+    if !transitions.failed.is_empty() {
+        sqlx::query(
+            "UPDATE tasks
+             SET status = 'failed', error = 'upstream dependency failed',
+                 lease_until = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE workflow_id = ?1 AND task_id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(workflow_id)
+        .bind(Json(&transitions.failed))
+        .execute(&mut **tx)
+        .await?;
+    }
+    if !transitions.ready.is_empty() {
+        sqlx::query(
+            "UPDATE tasks
+             SET status = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE workflow_id = ?1 AND task_id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(workflow_id)
+        .bind(Json(&transitions.ready))
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -204,9 +311,7 @@ impl SqliteTaskRepo {
         Self { pool }
     }
 
-    /// Settle only the current, unexpired claim and enqueue successors in the same commit.
-    /// Successors inherit the current database run_id and scope_id, including business updates.
-    pub async fn succeed_and_enqueue(
+    async fn settle_success_impl(
         &self,
         task: &TaskRecord,
         output: &Value,
@@ -214,38 +319,13 @@ impl SqliteTaskRepo {
         rules: &SettlementRules,
     ) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;
-        let (run_id, scope_id) = sqlx::query_as(&format!(
-            r#"
-            UPDATE tasks
-            SET status = 'succeeded', output_json = ?3, error = NULL, lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND task_id = ?2
-              AND status = 'running' AND attempt = ?4
-              AND attempt <= {MAX_ATTEMPTS}
-              AND julianday(lease_until) > julianday('now')
-            RETURNING run_id, scope_id
-            "#
-        ))
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(output)
-        .bind(task.attempt)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| claim_lost(task))?;
-        let source = FanoutSource {
-            workflow_id: &task.workflow_id,
-            task_id: task.task_id,
-            run_id,
-            scope_id,
-        };
+        let source = settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
         enqueue_fanouts_in_tx(&mut tx, &source, fanouts, rules).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Fence the source claim before generating failure successors or cascading failures.
-    pub async fn fail_and_enqueue(
+    async fn settle_failure_impl(
         &self,
         task: &TaskRecord,
         error: &str,
@@ -253,45 +333,49 @@ impl SqliteTaskRepo {
         rules: &SettlementRules,
     ) -> Result<(), StorageError> {
         let mut tx = self.pool.begin().await?;
-        // Settle first so a failure self-edge creates a fresh pending task instead
-        // of merging its retry input into the still-running source task.
-        let (run_id, scope_id) = sqlx::query_as(
-            r#"
-            UPDATE tasks
-            SET status = ?3, error = ?4, lease_until = NULL,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE workflow_id = ?1 AND task_id = ?2
-              AND status = 'running' AND attempt = ?5
-              AND julianday(lease_until) > julianday('now')
-            RETURNING run_id, scope_id
-            "#,
-        )
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(if fanouts.iter().all(|plan| plan.inputs.is_empty()) {
-            TaskStatus::Failed.as_str()
+        let status = if fanouts.iter().all(|plan| plan.inputs.is_empty()) {
+            TaskStatus::Failed
         } else {
-            TaskStatus::Superseded.as_str()
-        })
-        .bind(error)
-        .bind(task.attempt)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| claim_lost(task))?;
-        let source = FanoutSource {
-            workflow_id: &task.workflow_id,
-            task_id: task.task_id,
-            run_id,
-            scope_id,
+            TaskStatus::Superseded
         };
+        let source = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
         enqueue_fanouts_in_tx(&mut tx, &source, fanouts, rules).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Renew only a live claim without advancing its generation. Acquire the write lock
-    /// before evaluating database time so a lease that expired while waiting stays expired.
-    pub async fn renew_claim(
+    async fn schedule_retry_impl(
+        &self,
+        task: &TaskRecord,
+        error: &str,
+        delay: Duration,
+    ) -> Result<(), StorageError> {
+        let result = sqlx::query(&format!(
+            r#"
+            UPDATE tasks
+            SET status = 'pending', error = ?3, lease_until = NULL,
+                available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?5 || ' seconds'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE workflow_id = ?1 AND task_id = ?2
+              AND status = 'running' AND attempt = ?4
+              AND attempt < {MAX_ATTEMPTS}
+              AND julianday(lease_until) > julianday('now')
+            "#
+        ))
+        .bind(&task.workflow_id)
+        .bind(task.task_id)
+        .bind(error)
+        .bind(task.attempt)
+        .bind(delay.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(claim_lost(task));
+        }
+        Ok(())
+    }
+
+    async fn renew_claim_impl(
         &self,
         task: &TaskRecord,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
@@ -317,8 +401,7 @@ impl SqliteTaskRepo {
         Ok(lease_until)
     }
 
-    /// Release only this still-valid claim so another worker may reclaim the task.
-    pub async fn release_claim(&self, task: &TaskRecord) -> Result<(), StorageError> {
+    async fn release_claim_impl(&self, task: &TaskRecord) -> Result<(), StorageError> {
         let result = sqlx::query(
             r#"
             UPDATE tasks SET lease_until = NULL,
@@ -339,10 +422,7 @@ impl SqliteTaskRepo {
         Ok(())
     }
 
-    /// Claim a bounded batch, including expired tasks that need final failure settlement.
-    /// Each claim advances the fencing generation. Claims above the retry budget may only settle failure;
-    /// they never execute the node again. The write transaction serializes competing workers.
-    pub async fn claim_many(
+    async fn claim_many_impl(
         &self,
         workflow_id: &str,
         limit: usize,
@@ -357,6 +437,7 @@ impl SqliteTaskRepo {
                 SELECT wt.task_id FROM tasks wt
                 WHERE wt.workflow_id = ?1
                   AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))
+                  AND (wt.available_at IS NULL OR julianday(wt.available_at) <= julianday('now'))
                   AND wt.status IN ('pending', 'running')
                 ORDER BY wt.task_id LIMIT ?3
             )
@@ -366,7 +447,8 @@ impl SqliteTaskRepo {
                     CASE WHEN lease_until IS NOT NULL
                          THEN 'task lease expired; retry budget exhausted'
                          ELSE 'task retry budget exhausted' END)
-                    ELSE error END,
+                    ELSE NULL END,
+                available_at = NULL,
                 lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?2 || ' seconds'),
                 attempt = attempt + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -382,6 +464,65 @@ impl SqliteTaskRepo {
         tx.commit().await?;
         rows.sort_unstable_by_key(|row| row.task_id);
         Ok(rows.into_iter().map(TaskRecord::from).collect())
+    }
+}
+
+impl TaskStore for SqliteTaskRepo {
+    type Error = StorageError;
+
+    fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, StorageError>> {
+        Box::pin(async move { Database::from(self.pool.clone()).submit(task).await })
+    }
+
+    fn claim_many<'a>(
+        &'a self,
+        workflow_id: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
+        Box::pin(self.claim_many_impl(workflow_id, limit))
+    }
+
+    fn renew_claim<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
+        Box::pin(self.renew_claim_impl(task))
+    }
+
+    fn settle_success<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+        output: &'a Value,
+        successors: &'a [Successor],
+        rules: &'a SettlementRules,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(self.settle_success_impl(task, output, successors, rules))
+    }
+
+    fn settle_failure<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+        message: &'a str,
+        successors: &'a [Successor],
+        rules: &'a SettlementRules,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(self.settle_failure_impl(task, message, successors, rules))
+    }
+
+    fn schedule_retry<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+        message: &'a str,
+        delay: Duration,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(self.schedule_retry_impl(task, message, delay))
+    }
+
+    fn release_claim<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(self.release_claim_impl(task))
     }
 }
 

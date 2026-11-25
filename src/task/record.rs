@@ -14,7 +14,6 @@ pub enum TaskStatus {
     Running,
     Succeeded,
     Failed,
-    Skipped,
     /// 失败已由后继任务接管。
     Superseded,
 }
@@ -27,7 +26,6 @@ impl TaskStatus {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
-            Self::Skipped => "skipped",
             Self::Superseded => "superseded",
         }
     }
@@ -61,7 +59,7 @@ pub struct TaskRecord {
     pub workflow_id: String,
     pub task_id: i64,
     /// 一次完整运行的身份；进入新的执行作用域时保持不变。
-    pub run_id: Option<i64>,
+    pub run_id: i64,
     /// 当前子图执行实例；父子关系保存在 scopes 表，None 为运行根作用域。
     pub scope_id: Option<i64>,
     /// 来源任务按贡献顺序去重。独立入口为空。

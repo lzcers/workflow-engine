@@ -1,15 +1,15 @@
 //! 单图调度器：认领当前工作流所有运行的任务，执行节点并将图规划交给存储结算。
 //!
-//! 调度循环只负责补充执行槽；单个任务依次完成业务执行与后继规划、原子结算和成功回调。
+//! 调度循环只负责补充执行槽；单个任务依次完成业务执行与后继规划、原子结算（或可重试退避入队）和回调。
 //! 执行及结算期间自动续租，存储校验认领归属；节点自行控制运行超时，所有 run 共享并发额度。
-//! 调度循环随所属实例释放而取消，同时取消在途任务。
+//! 收到停机信号后停止认领新任务并等待在途任务完成；若整个 future 被直接取消则中止在途任务。
 
 use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use futures::FutureExt;
 use serde_json::Value;
 use tokio::{
-    sync::Notify,
+    sync::{Notify, watch},
     task::JoinSet,
     time::{Instant, sleep, sleep_until},
 };
@@ -21,12 +21,12 @@ use crate::{
     task::{MAX_ATTEMPTS, Successor, TaskRecord, TaskStore, store::LEASE_DURATION},
 };
 
-const DEFAULT_MAX_CONCURRENCY: usize = 8;
+pub(crate) const DEFAULT_MAX_CONCURRENCY: usize = 8;
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(LEASE_DURATION.as_secs() / 3);
 const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 当前图的调度器，负责认领、并发执行与结算，JOIN 就绪状态由存储在结算时更新。
-pub struct Scheduler<Ctx, Store>
+/// 当前图的调度器，负责认领、并发执行、退避重试与结算，JOIN 就绪状态由存储在结算时更新。
+pub(crate) struct Scheduler<Ctx, Store>
 where
     Ctx: NodeContext + Sync + 'static,
     Store: TaskStore + ?Sized,
@@ -36,6 +36,7 @@ where
     poll: Duration,
     max_concurrency: usize,
     wake: Arc<Notify>,
+    shutdown: Option<watch::Receiver<bool>>,
 }
 
 impl<Ctx, Store> Scheduler<Ctx, Store>
@@ -44,35 +45,41 @@ where
     Store: TaskStore + Send + ?Sized + 'static,
 {
     /// 由固定的图与共享任务存储构造调度器，按 workflow_id 认领所有运行的任务。
-    pub fn new(graph: Arc<Graph<Ctx>>, store: Arc<Store>, poll: Duration) -> Self {
+    pub(crate) fn new(graph: Arc<Graph<Ctx>>, store: Arc<Store>, poll: Duration) -> Self {
         Self {
             store,
             graph,
             poll,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             wake: Arc::new(Notify::new()),
+            shutdown: None,
         }
     }
 
     /// 设置当前调度器所有 run 共享的并发任务上限（默认 8，至少 1）。
-    /// 执行槽覆盖业务执行、数据库结算和成功回调。
-    pub fn with_max_concurrency(mut self, n: usize) -> Self {
+    /// 执行槽覆盖业务执行、数据库结算和回调。
+    pub(crate) fn with_max_concurrency(mut self, n: usize) -> Self {
         self.max_concurrency = n.max(1);
         self
     }
 
     /// 挂接任务就绪通知，有空槽时立即唤醒认领。
-    pub fn with_wake(mut self, wake: Arc<Notify>) -> Self {
+    pub(crate) fn with_wake(mut self, wake: Arc<Notify>) -> Self {
         self.wake = wake;
         self
     }
 
-    /// 持续驱动当前图，直到此 future 被取消。
+    /// 挂接优雅停机信号：收到 `true` 后停止认领新任务并等待在途任务结束。
+    pub(crate) fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// 持续驱动当前图，直到收到停机信号并在途任务全部退出，或此 future 被取消。
     ///
     /// 调用方负责确保只有一个运行循环；Workflow 在创建时启动一次。
-    /// Workflow 释放时取消此 future；取消会中止在途节点，无法等待结算。
     /// 调度循环 panic 时取消并等待全部在途任务，再传播 panic。
-    pub async fn run(&self) {
+    pub(crate) async fn run(&self) {
         let mut in_flight = JoinSet::new();
         let outcome = AssertUnwindSafe(self.run_loop(&mut in_flight))
             .catch_unwind()
@@ -84,6 +91,7 @@ where
     }
 
     async fn run_loop(&self, in_flight: &mut JoinSet<()>) {
+        let mut shutdown = self.shutdown.clone();
         loop {
             while let Some(result) = in_flight.try_join_next() {
                 if let Err(e) = result {
@@ -91,14 +99,24 @@ where
                 }
             }
 
+            if is_shutting_down(&shutdown) {
+                while let Some(result) = in_flight.join_next().await {
+                    if let Err(e) = result {
+                        error!(error = %e, "settle task join failed");
+                    }
+                }
+                return;
+            }
+
             let available = self.max_concurrency - in_flight.len();
             if available > 0 && self.claim_and_spawn(in_flight, available).await > 0 {
                 continue;
             }
 
-            // 满槽时只等待任务结束，不做无效轮询，也不消耗就绪通知。
+            // 满槽时只等待任务结束或停机信号，不做无效轮询，也不消耗就绪通知。
             tokio::select! {
                 biased;
+                _ = wait_shutdown(&mut shutdown), if shutdown.is_some() => {}
                 result = in_flight.join_next(), if !in_flight.is_empty() => {
                     if let Some(Err(e)) = result {
                         error!(error = %e, "settle task join failed");
@@ -138,12 +156,39 @@ where
     }
 }
 
+fn is_shutting_down(shutdown: &Option<watch::Receiver<bool>>) -> bool {
+    shutdown.as_ref().is_some_and(|rx| *rx.borrow())
+}
+
+async fn wait_shutdown(shutdown: &mut Option<watch::Receiver<bool>>) {
+    let Some(rx) = shutdown.as_mut() else {
+        std::future::pending::<()>().await;
+        unreachable!()
+    };
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn retry_delay(attempt: i32) -> Duration {
+    let shift = u32::try_from(attempt.saturating_sub(1))
+        .unwrap_or(0)
+        .min(10);
+    Duration::from_secs(1u64 << shift)
+}
+
 /// 业务执行与后继规划的结果。成功时保留上下文，供提交后的 on_success 使用。
 enum ExecutionOutcome<Ctx> {
     Success {
         context: Ctx,
         output: Value,
         successors: Vec<Successor>,
+    },
+    Retry {
+        error: NodeError,
+        delay: Duration,
     },
     Failure {
         context: Option<Ctx>,
@@ -152,7 +197,7 @@ enum ExecutionOutcome<Ctx> {
     },
 }
 
-/// 执行和结算期间维持认领，终态提交后停止续租并调用回调。
+/// 执行和结算期间维持认领，终态提交或退避入队后停止续租并按需调用回调。
 #[tracing::instrument(
     name = "settle",
     skip_all,
@@ -264,6 +309,7 @@ async fn maintain_claim<S: TaskStore + ?Sized>(
 }
 
 /// fork 独立上下文并规划结算；预算耗尽的认领只走最终失败流程，不再执行节点。
+/// 可重试错误在 `attempt < MAX_ATTEMPTS` 时安排指数退避重试，用完预算后进入失败路径。
 async fn execute_and_plan<Ctx>(graph: &Graph<Ctx>, task: &TaskRecord) -> ExecutionOutcome<Ctx>
 where
     Ctx: NodeContext + Sync,
@@ -291,6 +337,16 @@ where
             // 无法规划成功后继时，按不可重试的业务错误进入失败路径。
             Err(error) => NodeError::permanent(error.to_string()),
         },
+        Err(error) if error.is_retryable() && task.attempt < MAX_ATTEMPTS => {
+            let delay = retry_delay(task.attempt);
+            warn!(
+                error = %error,
+                attempt = task.attempt,
+                delay_secs = delay.as_secs(),
+                "task failed with retryable error; scheduling backoff retry"
+            );
+            return ExecutionOutcome::Retry { error, delay };
+        }
         Err(error) => error,
     };
     plan_failure(graph, task, Some(context), error)
@@ -321,7 +377,7 @@ where
     }
 }
 
-/// 原子提交任务状态与后继，存储再次校验运行状态、attempt 和租约有效期。
+/// 原子提交任务状态与后继，或写入退避重试时间；存储再次校验运行状态、attempt 和租约有效期。
 async fn settle<Ctx, S>(
     store: &S,
     graph: &Graph<Ctx>,
@@ -337,6 +393,9 @@ where
         ExecutionOutcome::Success {
             output, successors, ..
         } => store.settle_success(task, output, successors, rules).await,
+        ExecutionOutcome::Retry { error, delay } => {
+            store.schedule_retry(task, &error.to_string(), *delay).await
+        }
         ExecutionOutcome::Failure {
             error, successors, ..
         } => {
@@ -359,6 +418,7 @@ where
         } => {
             graph.on_success(&task.name, &mut context, &output).await;
         }
+        ExecutionOutcome::Retry { .. } => {}
         ExecutionOutcome::Failure { context, error, .. } => {
             // 恢复结算不依赖业务上下文；即使 fork 或错误钩子卡住，终态与后继已经持久化。
             let mut context = match context {

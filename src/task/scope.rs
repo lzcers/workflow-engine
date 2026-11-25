@@ -10,7 +10,7 @@ use crate::error::StorageError;
 pub struct ScopeRecord {
     pub workflow_id: String,
     pub scope_id: i64,
-    pub run_id: Option<i64>,
+    pub run_id: i64,
     pub subgraph_id: String,
     pub parent_scope_id: Option<i64>,
     pub trigger_task_id: i64,
@@ -22,7 +22,7 @@ pub(crate) type ScopeEntries = HashMap<(Option<i64>, String), i64>;
 /// 返回继续执行所在的祖先实例，以及需要新进入的子图路径。
 pub(crate) fn route_path<'a>(
     chain: &[ScopeRecord],
-    run_id: Option<i64>,
+    run_id: i64,
     destination: &'a [String],
     foreach: bool,
 ) -> Result<(Option<i64>, &'a [String]), StorageError> {

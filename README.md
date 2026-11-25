@@ -27,7 +27,7 @@
 
 PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下文实现
 `NodeContext`，`fork` 接收 `&TaskRecord`，不依赖数据库任务类型。`TaskStatus` 使用枚举，序列化为
-`pending`、`collecting`、`running`、`succeeded`、`failed`、`skipped`、`superseded`；数据库中的未知状态
+`pending`、`collecting`、`running`、`succeeded`、`failed`、`superseded`；数据库中的未知状态
 会返回解码错误。任务模型由两个后端共享。
 `Task` 表示独立运行的入口，包含 `workflow_id`、节点名、输入和子图路径。根节点用 `Task::new(workflow_id, name, input)`，图描述的 `task(entry, input)` 可为任意已注册节点解析路径。
 `Database::submit(task)` 将入口持久化，以新任务 ID 作为 `run_id`。执行端结算时，后继继承该运行 ID。
@@ -64,7 +64,7 @@ edges { etfs -> analysis.daily foreach }
 
 跨边界边直接引用真实节点的完整点路径。子图可以嵌套；例如内层 `analysis.detail` 的
 父子图为 `analysis`。`nodes` 块可以与 `subgraph` 交错，节点构造表达式按声明顺序求值。
-宏通过 `workflow-engine-dsl` 解析子图定义；边仍通过类型化 NodeKey 在编译期检查。
+宏通过 `workflow-engine-macros` 解析子图定义；边仍通过类型化 NodeKey 在编译期检查。
 
 任务只保存当前 `scope_id`，`scopes` 表保存每次子图调用的 `subgraph_id`、父 scope 和
 入口任务。根作用域为 NULL。进入子图创建实例，内部继承实例，退出时恢复目标层的父实例；
@@ -94,10 +94,10 @@ DDL 只初始化当前 schema，不迁移旧表；旧 schema 数据库需要另�
 ## 引擎与工作流实例
 
 `Engine::new(url).await` 连接数据库、幂等创建引擎表并持有共享连接池。
-`engine.make(graph)` 接收 `Graph<Ctx>` 并返回非泛型的 `Workflow`，构造时立即启动一个后台调度器，
+`engine.make(graph)`（或 `engine.make_with(graph, WorkerOptions { .. })`）接收 `Graph<Ctx>` 并返回非泛型的 `Workflow`，构造时立即启动一个后台调度器，
 因此必须在 Tokio runtime 内调用。调度器会认领当前图已有的可执行任务，无需先提交新运行。
 同一 Engine 可以创建不同上下文类型的工作流。每个 `Workflow` 与自己的调度器共享同一个 `Graph<Ctx>`，节点执行保留类型约束。宿主可以直接将不同上下文的工作流放入同一集合，
-并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型、子图路径、前驱和触发声明。
+并通过 `workflow.graph()` 查询原始图的身份、描述、节点类型、子图路径和触发声明。
 节点查询对未知名称返回 `None`；提交入口时要求节点属于当前工作流的图，后继在图规划阶段填入目标子图路径。
 需要具体上下文或其他图操作时，调用 `workflow.graph_as::<Ctx>()` 获取 `Option<&Graph<Ctx>>`；
 类型不匹配返回 `None`。图访问直接读取共享对象，不保存独立的节点类型或触发配置副本。
@@ -137,8 +137,8 @@ where
 提交的运行，空闲时持续等待。每个 Workflow 的所有运行共享一个调度器、8 个执行槽和
 1 秒轮询周期，提交不会再创建调度器。
 
-执行期间需要保持 Workflow 存活。丢弃 Workflow 会取消后台调度器和在途节点，不能等待
-结算完成；已持久化的任务仍保留在数据库。Engine 释放后 Workflow 仍可使用。
+执行期间需要保持 Workflow 存活。正常退出可调用 `workflow.shutdown().await` 停止认领新任务并等待在途任务完成；
+直接丢弃 Workflow 会通过 Drop 取消后台调度器和在途节点，不等待结算完成；已持久化的任务仍保留在数据库。Engine 释放后 Workflow 仍可使用。
 
 进程重启后，连接同一持久化数据库并为相同 `workflow_id` 重新 `make(graph)`，即可恢复
 存量任务，无需新的 `submit`。遗留的 `running` 任务等待旧租约过期后重新认领并从节点
@@ -303,8 +303,7 @@ let description = graph.describe();
 
 节点可通过 `.node(...)`、`.node_with_key(...)` 或 DSL 注册；重复节点名在 `build()` 时返回错误。
 成功边和失败边分别以 `kind: "success"` / `"failure"` 标识，平行边独立保留。
-成功边与失败边都通过 `map` 字段标记显式转换。逐项进入子图的边标记为
-`foreach: true`、`map: false`。透传边的两个标记均为 `false`，包括带条件的透传边。
+每条边通过 `mode` 枚举标记路由模式：`passthrough`（透传，含带条件的透传边）、`map`（显式转换）或 `foreach`（逐项进入独立子图作用域，仅成功边）。
 边 ID 为 `success:0`、`failure:0` 等当前图内编号；注册顺序变化后不保证跨版本稳定。
 工作流身份和标题只在图中定义；应用注册表直接索引完整的图描述，不重复指定身份和名称。
 运行状态仍由任务存储管理，无需另外维护一份画布拓扑。

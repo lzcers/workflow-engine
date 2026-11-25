@@ -12,7 +12,7 @@ use crate::Database;
 use crate::backend::task_fixture::{TaskSeed, join_plan, plan, scoped_plan};
 use crate::error::StorageError;
 use crate::graph::{Graph, TaskType};
-use crate::task::{MAX_ATTEMPTS, Successor, TaskStore};
+use crate::task::{Dispatch, MAX_ATTEMPTS, Successor, TaskStore};
 use crate::{TaskRecord, TaskStatus};
 use TaskType::{Join, Normal};
 use graph_fixture::graph as make_graph;
@@ -91,11 +91,11 @@ impl SqliteTaskRepo {
         .last_insert_rowid();
         let run_id = seed.run_id.unwrap_or(task_id);
         let chain = scope::chain(&mut tx, &task.workflow_id, seed.scope_id).await?;
-        let (parent, entered) = crate::task::scope::route_path(&chain, Some(run_id), &path, false)?;
+        let (parent, entered) = crate::task::scope::route_path(&chain, run_id, &path, false)?;
         let scope_id = scope::enter(
             &mut tx,
             &task.workflow_id,
-            Some(run_id),
+            run_id,
             task_id,
             parent,
             entered,
@@ -109,7 +109,7 @@ impl SqliteTaskRepo {
             .execute(&mut *tx)
             .await?;
         if collecting {
-            advance_joins(&mut tx, &task.workflow_id, Some(run_id), &rules.join_rules).await?;
+            advance_joins(&mut tx, &task.workflow_id, run_id, &rules.join_rules).await?;
         }
         let row = sqlx::query_as::<_, TaskRow>(&format!(
             "SELECT {ROW_COLS} FROM tasks WHERE task_id = ?1"
@@ -194,10 +194,10 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         .await
         .unwrap();
     assert_ne!(first.task_id, second.task_id);
-    assert_eq!(second.run_id, Some(second.task_id));
+    assert_eq!(second.run_id, second.task_id);
     assert_ne!(other.task_id, first.task_id);
     assert_ne!(other.task_id, second.task_id);
-    assert_eq!(other.run_id, Some(other.task_id));
+    assert_eq!(other.run_id, other.task_id);
     assert_eq!(first.name, "root");
     assert!(first.parent_task_ids.is_empty());
     assert_eq!(first.input, input.task.input);
@@ -212,13 +212,13 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         [first.task_id, second.task_id]
     );
     assert_eq!(rows[0].input, input.task.input);
-    assert_eq!(rows[0].run_id, Some(42));
+    assert_eq!(rows[0].run_id, 42);
     assert_eq!(rows[1].run_id, second.run_id);
     assert!(repo.get("missing", 1).await.unwrap().is_none());
 
     let output = json!([null, {"result": "完成"}]);
     let claimed = repo.claim_many("workflow", 1).await.unwrap().remove(0);
-    repo.succeed_and_enqueue(&claimed, &output, &[], graph.settlement_rules())
+    repo.settle_success(&claimed, &output, &[], graph.settlement_rules())
         .await
         .unwrap();
     let settled = get(&repo, &first).await;
@@ -241,7 +241,7 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         .seed_task(graph, &new_task("workflow", "next"))
         .await
         .unwrap();
-    assert_eq!(next.run_id, Some(next.task_id));
+    assert_eq!(next.run_id, next.task_id);
     assert_ne!(next.run_id, second.run_id);
 
     for name in ["undeclared", "analysis"] {
@@ -255,14 +255,14 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
         .seed_task(
             graph,
             &TaskSeed {
-                run_id: first.run_id,
+                run_id: Some(first.run_id),
 
                 ..new_task("workflow", "analysis.entry")
             },
         )
         .await
         .unwrap();
-    for (run_id, scope_id) in [(first.run_id, Some(i64::MAX)), (Some(43), scoped.scope_id)] {
+    for (run_id, scope_id) in [(Some(first.run_id), Some(i64::MAX)), (Some(43), scoped.scope_id)] {
         let invalid = TaskSeed {
             run_id,
             scope_id,
@@ -294,10 +294,10 @@ async fn settlement_promotes_a_waiting_join_when_the_last_source_emits_no_succes
         .await
         .unwrap();
     let mut last_source = new_task("deps", "root");
-    last_source.run_id = root.run_id;
+    last_source.run_id = Some(root.run_id);
     let last_source = repo.seed_task(graph, &last_source).await.unwrap();
     let mut missing = new_task("deps", "missing_dependency");
-    missing.run_id = root.run_id;
+    missing.run_id = Some(root.run_id);
 
     let missing = repo.seed_task(graph, &missing).await.unwrap();
 
@@ -370,7 +370,7 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
         .await
         .unwrap();
     let mut child = new_task("retry", "child");
-    child.run_id = task.run_id;
+    child.run_id = Some(task.run_id);
 
     child.parent_task_ids = vec![task.task_id];
     let child = repo.seed_task(graph, &child).await.unwrap();
@@ -409,7 +409,7 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
     for result in [
         repo.settle_success(&recovery, &json!("too late"), &[], rules)
             .await,
-        repo.fail_and_enqueue(&third[0], "old worker", &[], rules)
+        repo.settle_failure(&third[0], "old worker", &[], rules)
             .await,
     ] {
         assert!(matches!(result, Err(StorageError::ClaimLost { .. })));
@@ -421,11 +421,11 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
     assert_eq!(next_recovery.attempt, 5);
     assert_eq!(next_recovery.error, recovery.error);
     assert!(matches!(
-        repo.fail_and_enqueue(&recovery, "stale recovery", &[], rules)
+        repo.settle_failure(&recovery, "stale recovery", &[], rules)
             .await,
         Err(StorageError::ClaimLost { .. })
     ));
-    repo.fail_and_enqueue(
+    repo.settle_failure(
         &next_recovery,
         next_recovery.error.as_deref().unwrap(),
         &[],
@@ -456,7 +456,7 @@ async fn exhausted_tasks_are_claimed_for_fenced_final_failure_settlement() {
         recovery.error.as_deref(),
         Some("task retry budget exhausted")
     );
-    repo.fail_and_enqueue(
+    repo.settle_failure(
         &recovery,
         recovery.error.as_deref().unwrap(),
         &[],
@@ -619,7 +619,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
             "collect",
             vec![source.input.clone(), json!({"image": "tail"})],
         );
-        repo.succeed_and_enqueue(source, &source.input, &[contribution], rules)
+        repo.settle_success(source, &source.input, &[contribution], rules)
             .await
             .unwrap();
     }
@@ -627,7 +627,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
     assert_eq!(joins.len(), 3);
     assert_eq!(
         joins.iter().map(|join| join.run_id).collect::<HashSet<_>>(),
-        HashSet::from([Some(1), Some(2), Some(0)])
+        HashSet::from([1, 2, 0])
     );
     for join in joins {
         assert_eq!(
@@ -665,7 +665,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     let rules = graph.settlement_rules();
     let valid = plan("child", vec![json!("a"), json!("b")]);
     let scoped = Successor {
-        new_scope_per_input: true,
+        dispatch: Dispatch::PerInputScope,
         ..scoped_plan("analysis.child", &["analysis"], vec![json!("a"), json!("b")])
     };
     let invalid = plan("invalid", vec![json!({})]);
@@ -690,7 +690,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
             &claimed,
             &json!({}),
             &[Successor {
-                new_scope_per_input: true,
+                dispatch: Dispatch::PerInputScope,
                 ..plan("child", vec![json!({})])
             }],
             rules,
@@ -721,7 +721,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
     ));
     assert_eq!(repo.list_all("atomic_success").await.unwrap().len(), 5);
     let settled = get(&repo, &claimed).await;
-    assert_eq!(settled.run_id, Some(9));
+    assert_eq!(settled.run_id, 9);
     assert_eq!(settled.scope_id, None);
     assert_eq!(settled.status, TaskStatus::Succeeded);
     assert!(settled.lease_until.is_none());
@@ -733,7 +733,7 @@ async fn success_and_all_fanouts_commit_or_roll_back_together() {
         [&json!("a"), &json!("b"), &json!("a"), &json!("b")]
     );
     for (index, child) in children.into_iter().enumerate() {
-        assert_eq!(child.run_id, Some(9));
+        assert_eq!(child.run_id, 9);
         assert_eq!(child.scope_id.is_some(), index >= 2);
         assert_eq!(child.parent_task_ids, [task.task_id]);
     }
@@ -825,7 +825,7 @@ async fn failure_and_recovery_fanouts_are_atomic_and_do_not_depend_on_failed_par
         .unwrap()
         .remove(0);
     assert_eq!(recovery.name, "analysis.recovery");
-    assert_eq!(recovery.run_id, Some(4));
+    assert_eq!(recovery.run_id, 4);
     assert_eq!(recovery.scope_id, Some(21));
     assert_eq!(recovery.parent_task_ids, [task.task_id]);
     repo.settle_failure(&recovery, message, &[], rules)
@@ -908,14 +908,14 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .await
         .unwrap();
     let mut child = new_task("cascade", "child");
-    child.run_id = root.run_id;
+    child.run_id = Some(root.run_id);
     child.parent_task_ids = vec![root.task_id];
     let child = repo.seed_task(graph, &child).await.unwrap();
     let join = repo
         .seed_task(
             graph,
             &TaskSeed {
-                run_id: root.run_id,
+                run_id: Some(root.run_id),
 
                 ..new_task("cascade", "join")
             },
@@ -989,7 +989,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .seed_task(
             graph,
             &TaskSeed {
-                run_id: root.run_id,
+                run_id: Some(root.run_id),
 
                 ..new_task("cascade", "late_join")
             },
@@ -1004,7 +1004,7 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
 
 #[tokio::test]
 async fn cascade_matches_runs_only_for_join_predecessors() {
-    let runs = [Some(10), Some(20), Some(30), Some(0)];
+    let runs = [10, 20, 30, 0];
     for source_run in runs {
         let (_, repo, declared) = memory_repo(
             "cascade_runs",
@@ -1019,20 +1019,20 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
         .await;
         let graph = declared.as_ref();
         let mut root = new_task("cascade_runs", "root");
-        root.run_id = source_run;
+        root.run_id = Some(source_run);
         let root = repo.seed_task(graph, &root).await.unwrap();
         let mut targets = Vec::new();
 
         for run_id in runs {
             let mut child = new_task("cascade_runs", "child");
-            child.run_id = run_id;
+            child.run_id = Some(run_id);
             child.parent_task_ids = vec![root.task_id];
             targets.push(repo.seed_task(graph, &child).await.unwrap());
             targets.push(
                 repo.seed_task(
                     graph,
                     &TaskSeed {
-                        run_id: run_id,
+                        run_id: Some(run_id),
 
                         ..new_task("cascade_runs", "join")
                     },
@@ -1043,7 +1043,7 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
         }
 
         let mut other_workflow = new_task("other", "child");
-        other_workflow.run_id = source_run;
+        other_workflow.run_id = Some(source_run);
         other_workflow.parent_task_ids = vec![root.task_id];
         let other_graph = make_graph("other", &[("child", Normal, None)], &[]);
         let other_workflow = repo
@@ -1052,7 +1052,7 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
             .unwrap();
 
         let mut completed = new_task("cascade_runs", "completed");
-        completed.run_id = source_run;
+        completed.run_id = Some(source_run);
         let completed = repo.seed_task(graph, &completed).await.unwrap();
         let claims = repo.claim_many("cascade_runs", 10).await.unwrap();
         let root_claim = claims
@@ -1169,7 +1169,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
         .await
         .unwrap();
     let mut child = new_task("fencing", "child");
-    child.run_id = root.run_id;
+    child.run_id = Some(root.run_id);
     child.parent_task_ids = vec![root.task_id];
     let child = repo.seed_task(graph, &child).await.unwrap();
     let first = repo.claim_many("fencing", 1).await.unwrap().remove(0);
@@ -1288,7 +1288,7 @@ async fn transactional_submit_and_reclaim_within_a_workflow() {
     assert!(first.claim_many(other_id, 1).await.unwrap().is_empty());
     let child = first.claim_many(id, 1).await.unwrap().pop().unwrap();
     assert_eq!(child.parent_task_ids, [root.task_id]);
-    assert_eq!(child.run_id, Some(run.run_id));
+    assert_eq!(child.run_id, run.run_id);
     assert_eq!(child.scope_id, None);
 }
 
@@ -1315,7 +1315,7 @@ async fn lease_expiry_rejects_settlement_even_without_takeover() {
         repo.release_claim(&claim).await,
         repo.settle_success(&claim, &json!("expired"), &[], rules)
             .await,
-        repo.fail_and_enqueue(&claim, "expired", &[], rules).await,
+        repo.settle_failure(&claim, "expired", &[], rules).await,
     ] {
         assert!(
             matches!(result, Err(StorageError::ClaimLost { .. })),
@@ -1469,7 +1469,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
         let repo = if index % 2 == 0 { &repo_a } else { &repo_b };
         let rules = fanin_graph.settlement_rules();
         async move {
-            repo.succeed_and_enqueue(
+            repo.settle_success(
                 source,
                 &source.input,
                 &[join_plan("collect", vec![json!({"worker": source.input})])],

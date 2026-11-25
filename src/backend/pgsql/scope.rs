@@ -27,7 +27,7 @@ pub(super) async fn chain(
 pub(super) async fn enter(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
-    run_id: Option<i64>,
+    run_id: i64,
     trigger_task_id: i64,
     mut parent: Option<i64>,
     entered: &[String],

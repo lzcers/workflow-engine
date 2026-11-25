@@ -1,5 +1,10 @@
 use std::future::Future;
-use workflow_engine::{Graph, Node, NodeError, Trigger, graph::TaskType, workflow};
+use workflow_engine::{
+    Graph, Node, NodeError, Trigger,
+    graph::{EdgeMode, TaskType},
+    task::Dispatch,
+    workflow,
+};
 
 struct Ctx;
 
@@ -47,21 +52,18 @@ fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
     .unwrap();
 
     let description = graph.describe();
-    assert!(!description.edges[0].foreach);
-    assert!(description.edges[1].foreach);
-    assert!(!description.edges[2].foreach);
-    assert!(description.edges[0].map);
-    assert!(!description.edges[1].map);
-    assert!(description.edges[2].map);
+    assert_eq!(description.edges[0].mode, EdgeMode::Map);
+    assert_eq!(description.edges[1].mode, EdgeMode::Foreach);
+    assert_eq!(description.edges[2].mode, EdgeMode::Map);
     assert_eq!(
-        serde_json::to_value(description).unwrap()["edges"][1]["foreach"],
-        true
+        serde_json::to_value(description).unwrap()["edges"][1]["mode"],
+        "foreach"
     );
     for input in [serde_json::json!([1]), serde_json::json!([1, 2, 3])] {
         let plans = graph.plan_success("source", &input).unwrap();
         assert_eq!(plans.len(), 2);
-        assert!(!plans[0].new_scope_per_input);
-        assert!(plans[1].new_scope_per_input);
+        assert_eq!(plans[0].dispatch, Dispatch::Shared);
+        assert_eq!(plans[1].dispatch, Dispatch::PerInputScope);
         for plan in plans {
             assert_eq!(plan.dst, "analysis.destination");
             assert_eq!(graph.task_type_of(plan.dst), Some(TaskType::Normal));
@@ -81,7 +83,7 @@ fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
             &NodeError::retryable("retry"),
         )
         .unwrap();
-    assert!(!failure[0].new_scope_per_input);
+    assert_eq!(failure[0].dispatch, Dispatch::Shared);
 }
 
 #[test]

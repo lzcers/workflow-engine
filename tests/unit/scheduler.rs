@@ -383,6 +383,15 @@ impl TaskStore for Store {
         Box::pin(async { panic!("lease loss must not be recorded as a business failure") })
     }
 
+    fn schedule_retry<'a>(
+        &'a self,
+        _: &'a TaskRecord,
+        _: &'a str,
+        _: Duration,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        Box::pin(async { panic!("lease loss must not be recorded as a retry") })
+    }
+
     fn release_claim<'a>(&'a self, _: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>> {
         Box::pin(async move {
             self.releases.fetch_add(1, Ordering::SeqCst);
@@ -461,7 +470,7 @@ fn claim() -> TaskRecord {
     TaskRecord {
         workflow_id: "renewal".into(),
         task_id: 1,
-        run_id: Some(1),
+        run_id: 1,
         scope_id: None,
         parent_task_ids: vec![],
         name: "node".into(),

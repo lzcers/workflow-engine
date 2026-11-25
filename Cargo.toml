@@ -41,5 +41,5 @@ name = "sqlite_backend"
 required-features = ["sqlite"]
 
 [workspace]
-members = ["crates/workflow-engine-dsl", "crates/workflow-engine-macros"]
+members = ["crates/workflow-engine-macros"]
 resolver = "3"
