@@ -23,7 +23,6 @@ pub enum EngineError {
 /// 每次 [`Self::make`] 根据图创建独立的 Workflow 和 Scheduler，并立即启动后台调度。
 /// 默认使用 SQLite，也可通过 `pg` feature 启用 PostgreSQL。
 pub struct Engine {
-    database: Database,
     store: Arc<dyn TaskStore<Error = StorageError> + Send>,
 }
 
@@ -37,35 +36,21 @@ impl Engine {
 
     /// 复用宿主已经初始化的存储连接。
     pub fn from_database(database: Database) -> Self {
-        Self::with_database_worker(database, None)
-    }
-
-    fn with_database_worker(database: Database, worker_id: Option<Arc<str>>) -> Self {
-        let store: Arc<dyn TaskStore<Error = StorageError> + Send> = match database.pool() {
+        let store: Arc<dyn TaskStore<Error = StorageError> + Send> = match database.0 {
             #[cfg(feature = "pg")]
-            DatabasePool::Postgres(pool) => Arc::new(crate::backend::pgsql::PgTaskRepo::new(
-                pool.clone(),
-                worker_id,
-            )),
+            DatabasePool::Postgres(pool) => Arc::new(crate::backend::pgsql::PgTaskRepo::new(pool)),
             #[cfg(feature = "sqlite")]
-            DatabasePool::Sqlite(pool) => Arc::new(crate::backend::sqlite::SqliteTaskRepo::new(
-                pool.clone(),
-                worker_id,
-            )),
+            DatabasePool::Sqlite(pool) => {
+                Arc::new(crate::backend::sqlite::SqliteTaskRepo::new(pool))
+            }
         };
-        Self { database, store }
-    }
-
-    /// 指定后续工作流认领任务时记录的执行实例 ID。
-    pub fn with_worker(self, worker_id: &str) -> Self {
-        Self::with_database_worker(self.database, Some(Arc::from(worker_id)))
+        Self { store }
     }
 
     /// 根据图定义创建工作流实例并启动后台调度器，支持不同上下文类型的图。
     ///
     /// 返回非泛型的 Workflow 句柄，与后台调度器共享原始图对象，保留图访问能力。
-    /// 每个调度器按 workflow_id 认领任务。通过 `with_worker` 绑定身份后，
-    /// 存储会记录本次认领的实例 ID。
+    /// 每个调度器按 workflow_id 认领任务。
     /// 创建后即处理存量任务，无需先提交新运行；执行期间需保持返回的 Workflow 存活。
     ///
     /// # Panics

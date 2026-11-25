@@ -10,7 +10,7 @@ use serde_json::json;
 
 fn repository(database: &Database) -> SqliteTaskRepo {
     match database.pool() {
-        DatabasePool::Sqlite(pool) => SqliteTaskRepo::new(pool.clone(), None),
+        DatabasePool::Sqlite(pool) => SqliteTaskRepo::new(pool.clone()),
         #[cfg(feature = "pg")]
         DatabasePool::Postgres(_) => panic!("SQLite URL must select SQLite"),
     }

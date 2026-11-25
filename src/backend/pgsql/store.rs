@@ -79,11 +79,7 @@ impl TaskStore for PgTaskRepo {
         output: &'a Value,
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(async move {
-            self.succeed_and_enqueue(graph, task, output, successors)
-                .await
-                .map(|_| ())
-        })
+        Box::pin(self.succeed_and_enqueue(graph, task, output, successors))
     }
 
     /// 原子失败结算：标记终态，并入队失败后继或级联已有依赖任务。

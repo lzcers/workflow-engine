@@ -126,7 +126,7 @@ async fn memory_repo(
         .await
         .unwrap();
     migrate(&pool).await.unwrap();
-    let repo = SqliteTaskRepo::new(pool.clone(), None);
+    let repo = SqliteTaskRepo::new(pool.clone());
     (pool, repo, make_graph(workflow_id, nodes, edges))
 }
 
@@ -211,12 +211,12 @@ async fn migration_is_idempotent_and_task_values_round_trip() {
 
     let output = json!([null, {"result": "完成"}]);
     let claimed = repo.claim_many(graph, 1).await.unwrap().remove(0);
-    let settled = repo
-        .succeed_and_enqueue(graph, &claimed, &output, &[])
+    repo.succeed_and_enqueue(graph, &claimed, &output, &[])
         .await
         .unwrap();
+    let settled = get(&repo, &first).await;
     assert_eq!(settled.status, TaskStatus::Succeeded);
-    assert_eq!(get(&repo, &first).await.output, Some(output));
+    assert_eq!(settled.output, Some(output));
 
     let mut tx = pool.begin().await.unwrap();
     let rolled_back = Database::in_transaction(&mut tx)
@@ -1159,7 +1159,7 @@ async fn stale_claims_cannot_mutate_a_reclaimed_task_or_create_successors() {
 }
 
 #[tokio::test]
-async fn transactional_submit_and_claims_follow_workflow_and_worker_ownership() {
+async fn transactional_submit_and_reclaim_within_a_workflow() {
     let id = "published";
     let nodes = [
         ("analysis.entry", Normal, Some("analysis")),
@@ -1180,8 +1180,8 @@ async fn transactional_submit_and_claims_follow_workflow_and_worker_ownership() 
         .describe()
         .task("analysis.entry", json!(42))
         .unwrap();
-    let first = SqliteTaskRepo::new(pool.clone(), Some(Arc::from("worker-a")));
-    let replacement = SqliteTaskRepo::new(pool.clone(), Some(Arc::from("worker-b")));
+    let first = SqliteTaskRepo::new(pool.clone());
+    let replacement = SqliteTaskRepo::new(pool.clone());
 
     let mut tx = pool.begin().await.unwrap();
     let run = Database::in_transaction(&mut tx)
@@ -1215,22 +1215,18 @@ async fn transactional_submit_and_claims_follow_workflow_and_worker_ownership() 
     assert_eq!(root.task_id, run.run_id);
     assert!(root.scope_id.is_some());
     assert_eq!(root.input, json!(42));
-    assert!(replacement.renew_claim(&root).await.unwrap().is_none());
-    assert!(replacement.release_claim(&root).await.is_err());
-    for (worker, graph) in [(&replacement, graph), (&first, other_graph.as_ref())] {
-        assert!(
-            worker
-                .settle_success(graph, &root, &json!(1), &[])
-                .await
-                .is_err()
-        );
-        assert!(
-            worker
-                .settle_failure(graph, &root, "foreign claim", &[])
-                .await
-                .is_err()
-        );
-    }
+    assert!(
+        first
+            .settle_success(other_graph.as_ref(), &root, &json!(1), &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        first
+            .settle_failure(other_graph.as_ref(), &root, "wrong workflow", &[])
+            .await
+            .is_err()
+    );
 
     first.release_claim(&root).await.unwrap();
     let recovered = replacement
@@ -1266,13 +1262,6 @@ async fn transactional_submit_and_claims_follow_workflow_and_worker_ownership() 
     assert_eq!(child.parent_task_ids, [root.task_id]);
     assert_eq!(child.run_id, Some(run.run_id));
     assert_eq!(child.scope_id, None);
-    let owners: Vec<String> =
-        sqlx::query_scalar("SELECT worker_id FROM tasks WHERE run_id = ? ORDER BY task_id")
-            .bind(run.run_id)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-    assert_eq!(owners, ["worker-b", "worker-a"]);
 }
 
 #[tokio::test]
@@ -1382,8 +1371,8 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
         &[],
     );
     let graph = declared.as_ref();
-    let repo_a = SqliteTaskRepo::new(pool_a.clone(), None);
-    let repo_b = SqliteTaskRepo::new(pool_b.clone(), None);
+    let repo_a = SqliteTaskRepo::new(pool_a.clone());
+    let repo_b = SqliteTaskRepo::new(pool_b.clone());
     for _ in 0..20 {
         let (first, second) = tokio::join!(
             repo_a.enqueue(crate::Task::new("concurrent", "worker", json!({}))),
@@ -1490,7 +1479,7 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
 
     let reopened = file.connect().await;
     migrate(&reopened).await.unwrap();
-    let repo = SqliteTaskRepo::new(reopened.clone(), None);
+    let repo = SqliteTaskRepo::new(reopened.clone());
     let rows = repo.list_all("concurrent").await.unwrap();
     assert_eq!(rows.len(), 40);
     let saved = repo.get("concurrent", task_id).await.unwrap().unwrap();

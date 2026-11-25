@@ -173,14 +173,14 @@ advance_schedule(&mut tx, next_at).await?;
 tx.commit().await?;
 ```
 
-执行进程加载实际的图，使用登记时取得的实例 ID 启动调度器。
+执行进程加载实际的图并启动调度器。
 
 ```rust,ignore
-let engine = Engine::from_database(database).with_worker(worker_id);
+let engine = Engine::from_database(database);
 let workflow = engine.make(graph);
 ```
 
-宿主持有 `Workflow` 以维持调度器生命周期。每个调度器认领本图 `workflow_id` 下的任务，并在每次认领时记录实例 ID。工作流变化时使用新的 ID，旧 ID 的运行由旧 worker 完成。进程内的 `Workflow::submit` 通过共享的 `TaskStore::enqueue` 提交，成功后立即唤醒本地调度器。Server 直接调用 `Database::submit`，两条路径复用相同的数据库写入。
+宿主持有 `Workflow` 以维持调度器生命周期。多个进程可同时认领同一 `workflow_id` 下的任务，每次认领都会递增该任务的 `attempt`。工作流定义变化时使用新的 `workflow_id`，旧运行由加载旧图的进程完成。进程内的 `Workflow::submit` 通过共享的 `TaskStore::enqueue` 提交，成功后立即唤醒本地调度器。Server 直接调用 `Database::submit`，两条路径复用相同的数据库写入。
 
 ## 关键机制
 
@@ -209,9 +209,9 @@ let workflow = engine.make(graph);
   失败提交后才调用 `on_error`；正常业务失败沿用执行上下文，恢复处理此时才 `fork` 回调上下文，
   避免上下文准备或回调卡住最终结算。恢复过程在提交前崩溃或结算失败后可重新认领继续处理，
   不依赖原 worker 返回，也不会再次执行业务节点。
-- **并发汇合**：PostgreSQL 在同一次 run 的结算和后继入队事务前取得 advisory transaction lock，
-  获锁后再查询、创建或合并 JOIN，避免并发首次创建重复记录。锁仅覆盖数据库结算阶段，
-  节点业务执行仍可并行；不同 run 使用不同的运行锁。SQLite 使用已有的写事务锁。
+- **并发汇合**。PostgreSQL 对含 JOIN 的图先取得该 run 的事务级 advisory lock，再锁定源任务行，
+  以便并发结算时只创建一条汇合记录。无 JOIN 的图只锁定源任务行，同一 run 的独立任务可以并发结算。
+  SQLite 使用已有的写事务锁。
   数据库认领保护不提供外部副作用的 exactly-once 保证，节点调用外部系统仍需幂等。
 - **并发闸门 = 在途任务计数**（`JoinSet` 跟踪，`len <= max_concurrency`）：认领后立即
   spawn 结算并回到认领循环，快任务的后续立即被捡走，慢的 AI 任务仍在后台并发执行。

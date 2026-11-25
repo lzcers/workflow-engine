@@ -79,11 +79,7 @@ impl TaskStore for SqliteTaskRepo {
         output: &'a Value,
         successors: &'a [Successor],
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(async move {
-            self.succeed_and_enqueue(graph, task, output, successors)
-                .await
-                .map(|_| ())
-        })
+        Box::pin(self.succeed_and_enqueue(graph, task, output, successors))
     }
 
     /// 原子失败结算：有后继则入队并标记 superseded，否则标记 failed 并级联已有依赖。

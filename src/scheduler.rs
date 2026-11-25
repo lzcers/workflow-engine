@@ -321,7 +321,7 @@ where
     }
 }
 
-/// 原子提交任务状态与后继；存储再次校验 owner、attempt 和当前有效租约。
+/// 原子提交任务状态与后继，存储再次校验运行状态、attempt 和租约有效期。
 async fn settle<Ctx, S>(
     store: &S,
     graph: &dyn ErasedGraph,

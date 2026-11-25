@@ -5,8 +5,6 @@
 CREATE TABLE IF NOT EXISTS tasks (
     -- 工作流标识，用于隔离调度与查询。
     workflow_id TEXT NOT NULL,
-    -- 最近一次认领任务的执行实例。
-    worker_id TEXT,
     -- 工作流运行身份；后继继承源任务的值。
     -- 提交入口时以新任务 ID 创建运行；直接写入的 NULL 在同一工作流内按同组处理。
     run_id INTEGER,

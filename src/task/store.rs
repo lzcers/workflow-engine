@@ -17,6 +17,14 @@ use crate::{
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub const LEASE_DURATION: Duration = Duration::from_secs(300);
 
+/// 后继路由使用源任务的身份，以及结算时数据库中的运行和作用域。
+pub(crate) struct FanoutSource<'a> {
+    pub workflow_id: &'a str,
+    pub task_id: i64,
+    pub run_id: Option<i64>,
+    pub scope_id: Option<i64>,
+}
+
 pub(crate) fn check_workflow(
     graph: &dyn ErasedGraph,
     workflow_id: &str,
@@ -74,7 +82,7 @@ fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<(), Storage
 
 /// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。
 ///
-/// 同一引擎的工作流共用仓储和 worker 身份，认领和结算从调用方的图读取规则。
+/// 同一引擎的工作流共用仓储，认领和结算从调用方的图读取规则。
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
 /// 具体存储实现使用统一的 [`TaskRecord`] 快照，并将操作限制在任务所属的工作流内。
 ///

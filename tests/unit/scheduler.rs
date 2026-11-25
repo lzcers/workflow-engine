@@ -152,7 +152,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         .build()
         .unwrap(),
     );
-    let repo = SqliteTaskRepo::new(pool.clone(), None);
+    let repo = SqliteTaskRepo::new(pool.clone());
     let input = TaskSeed::new("timeout", "pending", json!(41));
     repo.seed_task(graph.as_ref(), &input).await.unwrap();
     for _ in 1..crate::task::MAX_ATTEMPTS {
@@ -241,7 +241,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
         .build()
         .unwrap(),
     );
-    let repo = SqliteTaskRepo::new(pool.clone(), None);
+    let repo = SqliteTaskRepo::new(pool.clone());
     repo.seed_task(
         graph.as_ref(),
         &TaskSeed::new("expired", "pending", json!(0)),

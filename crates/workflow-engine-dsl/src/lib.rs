@@ -236,88 +236,9 @@ impl Parse for Edge {
     }
 }
 
-impl ToTokens for Workflow {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        let Self {
-            workflow_id,
-            title,
-            context,
-            region,
-        } = self;
-        tokens.extend(
-            quote! { workflow_id: #workflow_id; title: #title; context: #context; #region },
-        );
-    }
-}
-impl ToTokens for Region {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        for item in &self.items {
-            match item {
-                RegionItem::Node(node) => tokens.extend(quote! { nodes { #node, } }),
-                RegionItem::Subgraph(subgraph) => subgraph.to_tokens(tokens),
-            }
-        }
-        let edges = &self.edges;
-        tokens.extend(quote! { edges { #(#edges,)* } });
-    }
-}
-impl ToTokens for Node {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        let Self {
-            name,
-            instance,
-            attributes,
-        } = self;
-        tokens.extend(quote! { #(#attributes)* #name => #instance });
-    }
-}
-impl ToTokens for Subgraph {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        let Self {
-            name,
-            attributes,
-            region,
-        } = self;
-        tokens.extend(quote! { #(#attributes)* subgraph #name { #region } });
-    }
-}
 impl ToTokens for NodePath {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let segments = &self.segments;
         tokens.extend(quote! { #(#segments).* });
-    }
-}
-impl ToTokens for Edge {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        let Self {
-            source,
-            target,
-            clause,
-        } = self;
-        tokens.extend(quote! { #source -> #target #clause });
-    }
-}
-impl ToTokens for EdgeClause {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        tokens.extend(match self {
-            Self::Passthrough => quote! {},
-            Self::Map(expr) => quote! { |> #expr },
-            Self::Foreach => quote! { foreach },
-            Self::OnError(expr) => quote! { on_error #expr },
-            Self::When {
-                condition,
-                transform,
-            } => {
-                let map = transform.as_ref().map(|expr| quote! { |> #expr });
-                quote! { when(#condition) #map }
-            }
-            Self::WhenError {
-                condition,
-                transform,
-            } => {
-                let map = transform.as_ref().map(|expr| quote! { |> #expr });
-                quote! { when_error(#condition) #map }
-            }
-        });
     }
 }
