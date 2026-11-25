@@ -22,7 +22,7 @@ pub struct NodeDescription {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub task_type: String,
+    pub task_type: TaskType,
     pub subgraph_id: Option<String>,
     /// Event 节点的外部触发声明；其他节点为 None。
     pub trigger: Option<Trigger>,
@@ -68,7 +68,7 @@ impl<Ctx> Graph<Ctx> {
                 id: id.to_owned(),
                 title: entry.title.clone(),
                 description: entry.description.clone(),
-                task_type: entry.node.task_type().as_str().to_owned(),
+                task_type: entry.node.task_type(),
                 trigger: entry.node.trigger(),
                 subgraph_id: entry.subgraph_id.clone(),
                 input_type: entry.node.in_type().name().to_owned(),
@@ -185,7 +185,7 @@ impl GraphDescription {
             (
                 node.id.as_str(),
                 node.subgraph_id.as_deref(),
-                node.task_type == TaskType::Join.as_str(),
+                node.task_type == TaskType::Join,
             )
         });
         let edges = self.edges.iter().map(|edge| {

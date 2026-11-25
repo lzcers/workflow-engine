@@ -1,9 +1,8 @@
 //! 图引擎：节点注册表 + 边集合，负责执行、后继规划、静态校验。
 //!
-//! 节点名字作为 [`Graph`] 的 `HashMap` key 在注册时外部绑定；边
-//! 通过 `src`/`dst` 名字引用节点。
-//!
-//! [`GraphBuilder`] 负责注册节点、追加边、组装并校验。
+//! 构图提供两种方式：
+//! - 命令式：[`Graph::builder`]（搭配 [`when`]/[`map`]/[`foreach`]/[`on_error`]/[`when_error`]），在 `build()` 时做端口类型指纹校验；
+//! - 声明式：[`crate::workflow!`] 宏，在编译期完成节点接线类型检查。
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -15,12 +14,12 @@ mod builder;
 mod description;
 mod erased;
 
+pub use builder::GraphBuilder;
 pub use crate::edge::{
     EdgeError, EdgeMode, ErrorWhenBuilder, FailureEdge, SuccessEdge, WhenBuilder, foreach, map,
     on_error, when, when_error,
 };
 pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
-pub use builder::GraphBuilder;
 pub use description::{
     EdgeDescription, EdgeKind, GraphDescription, NodeDescription, SubgraphDescription,
 };
@@ -36,8 +35,7 @@ struct GraphNode<Ctx> {
 
 /// 图引擎：节点注册表 + 成功/失败边集合，持有上下文与节点实例，负责执行、后继规划、静态校验。
 ///
-/// 成功边与失败边分置两个集合，
-/// 对应两种独立路由维度：前向主 DAG 与后向回退图。
+/// 成功边与失败边分置两个集合，对应两条独立路由维度：前向主 DAG 与后向回退图。
 pub struct Graph<Ctx> {
     workflow_id: String,
     title: String,
@@ -63,7 +61,6 @@ fn subgraph_path(group: Option<&str>) -> impl Iterator<Item = &str> {
 }
 
 impl<Ctx> Graph<Ctx> {
-    /// 构建工作流图；稳定 ID 和展示标题由图定义统一声明。
     pub fn builder(
         workflow_id: impl Into<String>,
         title: impl Into<String>,
@@ -108,21 +105,21 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 执行节点前发布任务开始事件。
-    pub async fn on_start(&self, name: &str, ctx: &mut Ctx, input: &Value) {
+    pub(crate) async fn on_start(&self, name: &str, ctx: &mut Ctx, input: &Value) {
         if let Some(node) = self.nodes.get(name) {
             node.node.on_start(ctx, input).await;
         }
     }
 
     /// 成功落库后发布任务成功事件。
-    pub async fn on_success(&self, name: &str, ctx: &mut Ctx, output: &Value) {
+    pub(crate) async fn on_success(&self, name: &str, ctx: &mut Ctx, output: &Value) {
         if let Some(node) = self.nodes.get(name) {
             node.node.on_success(ctx, output).await;
         }
     }
 
     /// 执行失败时发布任务失败事件。
-    pub async fn on_error(&self, name: &str, ctx: &mut Ctx, error: &NodeError) {
+    pub(crate) async fn on_error(&self, name: &str, ctx: &mut Ctx, error: &NodeError) {
         if let Some(node) = self.nodes.get(name) {
             node.node.on_error(ctx, error).await;
         }
@@ -208,7 +205,7 @@ impl<Ctx> Graph<Ctx> {
     }
 
     /// 存储在结算时使用这些预计算的静态规则，按作用域匹配来源并推进就绪或失败状态。
-    pub fn settlement_rules(&self) -> &SettlementRules {
+    pub(crate) fn settlement_rules(&self) -> &SettlementRules {
         &self.settlement_rules
     }
 
@@ -274,20 +271,14 @@ impl<Ctx> Graph<Ctx> {
         for e in self.success_edges.iter().filter(|e| e.dst() == dst) {
             set.insert(e.src());
         }
-        {
-            let mut names: Vec<_> = set.into_iter().map(str::to_owned).collect();
-            names.sort();
-            Some(names)
-        }
+        let mut names: Vec<_> = set.into_iter().map(str::to_owned).collect();
+        names.sort();
+        Some(names)
     }
 
-    /// 静态校验：节点名唯一、边两端节点存在、边类型接线指纹一致、success 子图无环、
-    /// failure 回边不自环，Event 触发声明一致且无入边。
-    ///
-    /// 类型接线指纹校验是命令式建图（非 DSL）的兜底：DSL 边有编译期检查，命令式边只有
-    /// 闭包自洽的类型参数，与注册节点 `In`/`Out` 的错线此前要到任务结算时才以 serde 错误
-    /// 暴露，这里在 build 期提前拒绝；`Value` 可作为任意载荷的读取或写入边界。
-    pub fn validate(&self) -> Result<(), String> {
+    /// 静态校验：元数据非空、子图归属与 foreach 边界合法、Event 触发声明一致且无入边、
+    /// success 子图无环、failure 回边不自环。
+    fn validate(&self) -> Result<(), String> {
         if self.workflow_id.trim().is_empty() {
             return Err("workflow_id must not be empty".into());
         }
@@ -306,68 +297,49 @@ impl<Ctx> Graph<Ctx> {
                 _ => {}
             }
         }
-        // 端点已通过拓扑校验，这里只检查执行语义和类型接线。
-        for e in self.success_edges.iter() {
-            let src = &self.nodes[e.src()];
-            let dst = &self.nodes[e.dst()];
-            if dst.node.task_type() == TaskType::Event {
+        // 所有边端点已在 validate_subgraphs 中校验存在；此处统一检查 Event 目标限制与端口类型指纹。
+        for (kind, src, dst, edge_src_ty, node_src_ty, src_role, edge_dst_ty) in self
+            .success_edges
+            .iter()
+            .map(|e| {
+                (
+                    "success",
+                    e.src(),
+                    e.dst(),
+                    e.src_out_type(),
+                    self.nodes[e.src()].node.out_type(),
+                    "输出",
+                    e.dst_in_type(),
+                )
+            })
+            .chain(self.failure_edges.iter().map(|e| {
+                (
+                    "failure",
+                    e.src(),
+                    e.dst(),
+                    e.src_in_type(),
+                    self.nodes[e.src()].node.in_type(),
+                    "输入",
+                    e.dst_in_type(),
+                )
+            }))
+        {
+            let dst_node = &self.nodes[dst].node;
+            if dst_node.task_type() == TaskType::Event {
+                return Err(format!("{kind} edge must not target event node {dst}"));
+            }
+            if !readable(edge_src_ty, node_src_ty) {
                 return Err(format!(
-                    "success edge must not target event node {}",
-                    e.dst()
+                    "edge {src} -> {dst}: transform 入参类型 {} 与节点 {src} {src_role}类型 {} 不匹配",
+                    edge_src_ty.name(),
+                    node_src_ty.name()
                 ));
             }
-            // 边把源节点输出反序列化为 SrcOut：要求与源节点 Out 一致（或边载荷为 Value）
-            if !readable(e.src_out_type(), src.node.out_type()) {
+            if !writable(edge_dst_ty, dst_node.in_type()) {
                 return Err(format!(
-                    "edge {} -> {}: transform 入参类型 {} 与节点 {} 输出类型 {} 不匹配",
-                    e.src(),
-                    e.dst(),
-                    e.src_out_type().name(),
-                    e.src(),
-                    src.node.out_type().name()
-                ));
-            }
-            // 目标节点把边产出反序列化为自身 In：要求与目标节点 In 一致（或节点输入为 Value）
-            if !writable(e.dst_in_type(), dst.node.in_type()) {
-                return Err(format!(
-                    "edge {} -> {}: transform 出参类型 {} 与节点 {} 输入类型 {} 不匹配",
-                    e.src(),
-                    e.dst(),
-                    e.dst_in_type().name(),
-                    e.dst(),
-                    dst.node.in_type().name()
-                ));
-            }
-        }
-        for e in self.failure_edges.iter() {
-            let src = &self.nodes[e.src()];
-            let dst = &self.nodes[e.dst()];
-            if dst.node.task_type() == TaskType::Event {
-                return Err(format!(
-                    "failure edge must not target event node {}",
-                    e.dst()
-                ));
-            }
-            // 边把失败节点输入反序列化为 SrcIn：要求与源节点 In 一致（或边载荷为 Value）
-            if !readable(e.src_in_type(), src.node.in_type()) {
-                return Err(format!(
-                    "edge {} -> {}: transform 入参类型 {} 与节点 {} 输入类型 {} 不匹配",
-                    e.src(),
-                    e.dst(),
-                    e.src_in_type().name(),
-                    e.src(),
-                    src.node.in_type().name()
-                ));
-            }
-            // 目标节点把边产出反序列化为自身 In：与成功边同一规则
-            if !writable(e.dst_in_type(), dst.node.in_type()) {
-                return Err(format!(
-                    "edge {} -> {}: transform 出参类型 {} 与节点 {} 输入类型 {} 不匹配",
-                    e.src(),
-                    e.dst(),
-                    e.dst_in_type().name(),
-                    e.dst(),
-                    dst.node.in_type().name()
+                    "edge {src} -> {dst}: transform 出参类型 {} 与节点 {dst} 输入类型 {} 不匹配",
+                    edge_dst_ty.name(),
+                    dst_node.in_type().name()
                 ));
             }
         }
@@ -419,8 +391,7 @@ impl<Ctx> Graph<Ctx> {
 /// 边「读取」节点值方向的指纹兼容判定：边把节点序列化值反序列化为 `edge_ty`。
 ///
 /// 类型一致即兼容；`edge_ty` 为 `Value` 时恒兼容（`from_value::<Value>` 必成功）。
-/// 反之节点侧为 `Value` 不构成通配——反序列化为具体类型取决于内容，运行时可能失败，
-/// 因此仍要求一致（DSL 的 JOIN 出边即按此纪律写成 `&Value` 入参）。
+/// 反之节点侧为 `Value` 不构成通配——反序列化为具体类型取决于内容，运行时可能失败。
 fn readable(edge_ty: TypeFingerprint, node_ty: TypeFingerprint) -> bool {
     edge_ty.id() == node_ty.id() || edge_ty.id() == TypeFingerprint::of::<Value>().id()
 }
@@ -428,8 +399,7 @@ fn readable(edge_ty: TypeFingerprint, node_ty: TypeFingerprint) -> bool {
 /// 边「写入」节点值方向的指纹兼容判定：节点把边产出反序列化为 `node_ty`。
 ///
 /// 类型一致即兼容；`node_ty` 为 `Value` 时恒兼容（`from_value::<Value>` 必成功）——
-/// 这是 `i32` 载荷汇入 `JoinNode`（`In = Value`）这类 JSON 边界模式的依据。反之边侧为
-/// `Value` 不构成通配：节点反序列化为具体类型取决于内容，运行时可能失败。
+/// 这是具体类型载荷汇入 `JoinNode`（`In = Value`）这类 JSON 边界模式的依据。
 fn writable(edge_ty: TypeFingerprint, node_ty: TypeFingerprint) -> bool {
     edge_ty.id() == node_ty.id() || node_ty.id() == TypeFingerprint::of::<Value>().id()
 }

@@ -18,5 +18,5 @@ mod scope;
 #[path = "../../../tests/unit/sqlite_scheduler.rs"]
 mod scheduler_tests;
 
-pub use repo::SqliteTaskRepo;
-pub use schema::migrate;
+pub(crate) use repo::SqliteTaskRepo;
+pub(crate) use schema::migrate;

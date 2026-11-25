@@ -161,7 +161,7 @@ fn event_nodes_are_discovered_and_described_through_existing_dsl() {
     let description = graph.describe();
     assert_eq!(description.nodes[0].id, "a_payment");
     assert_eq!(description.nodes[0].title, "支付回调");
-    assert_eq!(description.nodes[0].task_type, "event");
+    assert_eq!(description.nodes[0].task_type, TaskType::Event);
     assert_eq!(description.nodes[0].trigger.as_ref(), Some(&triggers[0].1));
     assert_eq!(description.nodes[1].id, "process");
     assert!(description.nodes[1].trigger.is_none());

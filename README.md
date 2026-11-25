@@ -265,9 +265,9 @@ workflow-engine = { path = "../workflow-engine", default-features = false, featu
 回调失败或随 Workflow 释放被取消不会回滚已提交状态与后继。引擎不为节点或回调设置运行超时。
 `Graph::execute` 单独调用时不触发事件钩子。
 
-`graph.describe()` 从同一个执行图导出可序列化的 `GraphDescription { workflow_id, title, nodes, edges }`，
+`graph.describe()` 从同一个执行图导出可序列化的 `GraphDescription { workflow_id, title, nodes, edges, subgraphs }`，
 适合供应用注册表和前端画布读取。描述不执行节点、条件或转换闭包，也不包含上下文和任务载荷。
-节点按注册名排序，`id` 与任务的 `name` 对应；`task_type` 为 `normal`、`join` 或 `event`，
+节点按注册名排序，`id` 与任务的 `name` 对应；`task_type` 为 `TaskType` 枚举（序列化为 `"normal"`、`"join"` 或 `"event"`），
 `trigger` 为 Event 节点的外部注册声明，其他节点为 `null`。
 `input_type` / `output_type` 是 Rust 类型名，不是字段级 JSON Schema。
 
@@ -301,7 +301,7 @@ let graph = Graph::builder("stock_indicators", "股票指标", context)
 let description = graph.describe();
 ```
 
-节点可通过 `.node(...)`、`.node_with_key(...)` 或 DSL 注册；重复节点名在 `build()` 时返回错误。
+节点可通过 `.node(...)`、`.node_with_description(...)`、`.node_in_subgraph_with_key(...)` 或 DSL 注册；重复节点名在 `build()` 时返回错误。
 成功边和失败边分别以 `kind: "success"` / `"failure"` 标识，平行边独立保留。
 每条边通过 `mode` 枚举标记路由模式：`passthrough`（透传，含带条件的透传边）、`map`（显式转换）或 `foreach`（逐项进入独立子图作用域，仅成功边）。
 边 ID 为 `success:0`、`failure:0` 等当前图内编号；注册顺序变化后不保证跨版本稳定。

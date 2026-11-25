@@ -3,8 +3,8 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use serde_json::json;
 use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 
-use super::{ROW_COLS, SqliteTaskRepo, TaskRow, advance_joins, scope};
-use crate::backend::sqlite::migrate;
+use super::{SqliteTaskRepo, TaskRow, advance_joins, scope};
+use crate::backend::{ROW_COLS, sqlite::migrate};
 use sqlx::types::Json;
 #[path = "graph_fixture.rs"]
 mod graph_fixture;

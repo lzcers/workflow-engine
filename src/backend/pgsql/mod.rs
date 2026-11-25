@@ -12,5 +12,5 @@ mod scope;
 #[path = "../../../tests/unit/pgsql_support.rs"]
 mod test_support;
 
-pub use repo::PgTaskRepo;
-pub use schema::migrate;
+pub(crate) use repo::PgTaskRepo;
+pub(crate) use schema::migrate;

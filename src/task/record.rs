@@ -38,15 +38,23 @@ impl std::fmt::Display for TaskStatus {
 }
 
 impl std::str::FromStr for TaskStatus {
-    type Err = serde::de::value::Error;
+    type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::deserialize(serde::de::value::StrDeserializer::new(value))
+        match value {
+            "pending" => Ok(Self::Pending),
+            "collecting" => Ok(Self::Collecting),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(format!("unknown task status: {value}")),
+        }
     }
 }
 
 impl TryFrom<String> for TaskStatus {
-    type Error = serde::de::value::Error;
+    type Error = String;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         value.parse()

@@ -7,6 +7,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use super::{rows::TaskRow, scope};
+use crate::backend::ROW_COLS;
 use crate::error::StorageError;
 use crate::task::{
     Dispatch, JoinRule, MAX_ATTEMPTS, SettlementRules, Successor, TaskStore,
@@ -19,10 +20,6 @@ use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
 /// 最终失败恢复认领保存的原因，重复恢复时保留第一次记录。
 const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted";
 const LEASE_EXPIRED_ERR: &str = "task lease expired; retry budget exhausted";
-
-pub(crate) const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, parent_task_ids, name, status, \
-     lease_until, attempt, \
-     input_json, output_json, error, created_at, updated_at";
 
 impl Database<&mut sqlx::Transaction<'_, sqlx::Postgres>> {
     /// 在宿主事务内创建独立运行，同时建立入口所属的子图作用域。
@@ -325,12 +322,12 @@ async fn advance_joins(
 
 /// 共享连接池上的任务仓储。
 #[derive(Clone)]
-pub struct PgTaskRepo {
+pub(crate) struct PgTaskRepo {
     pub(super) pool: PgPool,
 }
 
 impl PgTaskRepo {
-    pub fn new(pool: PgPool) -> Self {
+    pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
@@ -377,189 +374,6 @@ impl PgTaskRepo {
         }
         Ok(())
     }
-
-    async fn settle_success_impl(
-        &self,
-        task: &TaskRecord,
-        output: &Value,
-        fanouts: &[Successor],
-        rules: &SettlementRules,
-    ) -> Result<(), StorageError> {
-        // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
-            .await?;
-        Self::lock_settlement(&mut tx, task, rules).await?;
-        let settled =
-            settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
-        enqueue_fanouts_in_tx(&mut tx, &settled, fanouts, rules).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn settle_failure_impl(
-        &self,
-        task: &TaskRecord,
-        error: &str,
-        fanouts: &[Successor],
-        rules: &SettlementRules,
-    ) -> Result<(), StorageError> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
-            .await?;
-        Self::lock_settlement(&mut tx, task, rules).await?;
-        let status = if fanouts.iter().all(|plan| plan.inputs.is_empty()) {
-            TaskStatus::Failed
-        } else {
-            TaskStatus::Superseded
-        };
-        let settled = settle_in_tx(&mut tx, task, status, None, Some(error)).await?;
-        enqueue_fanouts_in_tx(&mut tx, &settled, fanouts, rules).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn schedule_retry_impl(
-        &self,
-        task: &TaskRecord,
-        error: &str,
-        delay: Duration,
-    ) -> Result<(), StorageError> {
-        let mut tx = self.pool.begin().await?;
-        Self::lock_task(&mut tx, task).await?;
-        let result = sqlx::query(&format!(
-            r#"
-            UPDATE tasks
-            SET status = 'pending', error = $4, lease_until = NULL,
-                available_at = clock_timestamp() + make_interval(secs => $5),
-                updated_at = clock_timestamp()
-            WHERE workflow_id = $1 AND task_id = $2
-              AND attempt = $3
-              AND status = 'running' AND attempt < {MAX_ATTEMPTS}
-              AND lease_until > clock_timestamp()
-            "#
-        ))
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(task.attempt)
-        .bind(error)
-        .bind(delay.as_secs_f64())
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(claim_lost(task));
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn renew_claim_impl(
-        &self,
-        task: &TaskRecord,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
-        let mut tx = self.pool.begin().await?;
-        match Self::lock_task(&mut tx, task).await {
-            Ok(_) => {}
-            Err(StorageError::ClaimLost { .. }) => return Ok(None),
-            Err(error) => return Err(error),
-        }
-        let lease_until = sqlx::query_scalar(
-            r#"
-            UPDATE tasks
-            SET lease_until = clock_timestamp() + make_interval(secs => $4),
-                updated_at = clock_timestamp()
-            WHERE workflow_id = $1 AND task_id = $2
-              AND attempt = $3
-              AND status = 'running' AND lease_until > clock_timestamp()
-            RETURNING lease_until
-            "#,
-        )
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(task.attempt)
-        .bind(LEASE_DURATION.as_secs() as f64)
-        .fetch_optional(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(lease_until)
-    }
-
-    async fn release_claim_impl(&self, task: &TaskRecord) -> Result<(), StorageError> {
-        let mut tx = self.pool.begin().await?;
-        Self::lock_task(&mut tx, task).await?;
-        let result = sqlx::query(
-            r#"
-            UPDATE tasks SET lease_until = NULL, updated_at = clock_timestamp()
-            WHERE workflow_id = $1 AND task_id = $2
-              AND attempt = $3
-              AND status = 'running' AND lease_until > clock_timestamp()
-            "#,
-        )
-        .bind(&task.workflow_id)
-        .bind(task.task_id)
-        .bind(task.attempt)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(claim_lost(task));
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn claim_many_impl(
-        &self,
-        workflow_id: &str,
-        limit: usize,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let mut tx = self.pool.begin().await?;
-
-        let sql = format!(
-            r#"
-            WITH candidate AS (
-                SELECT wt.task_id
-                FROM tasks wt
-                WHERE wt.workflow_id = $1
-                  AND (wt.lease_until IS NULL OR wt.lease_until <= clock_timestamp())
-                  AND (wt.available_at IS NULL OR wt.available_at <= clock_timestamp())
-                  AND wt.status IN ('pending', 'running')
-                ORDER BY wt.task_id
-                LIMIT $3
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE tasks
-            SET status = 'running',
-                error = CASE WHEN attempt >= {MAX_ATTEMPTS} THEN
-                    COALESCE(error, CASE WHEN lease_until IS NOT NULL THEN $4 ELSE $5 END)
-                    ELSE NULL END,
-                available_at = NULL,
-                lease_until = clock_timestamp() + make_interval(secs => $2),
-                attempt = attempt + 1,
-                updated_at = clock_timestamp()
-            WHERE workflow_id = $1
-              AND task_id IN (SELECT task_id FROM candidate)
-            RETURNING {ROW_COLS}
-            "#
-        );
-        let mut rows = sqlx::query_as::<_, TaskRow>(&sql)
-            .bind(workflow_id)
-            .bind(LEASE_DURATION.as_secs() as f64)
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .bind(LEASE_EXPIRED_ERR)
-            .bind(BUDGET_EXHAUSTED_ERR)
-            .fetch_all(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-        rows.sort_unstable_by_key(|row| row.task_id);
-        Ok(rows.into_iter().map(TaskRecord::from).collect())
-    }
 }
 
 impl TaskStore for PgTaskRepo {
@@ -574,14 +388,85 @@ impl TaskStore for PgTaskRepo {
         workflow_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(self.claim_many_impl(workflow_id, limit))
+        Box::pin(async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let mut tx = self.pool.begin().await?;
+
+            let sql = format!(
+                r#"
+                WITH candidate AS (
+                    SELECT wt.task_id
+                    FROM tasks wt
+                    WHERE wt.workflow_id = $1
+                      AND (wt.lease_until IS NULL OR wt.lease_until <= clock_timestamp())
+                      AND (wt.available_at IS NULL OR wt.available_at <= clock_timestamp())
+                      AND wt.status IN ('pending', 'running')
+                    ORDER BY wt.task_id
+                    LIMIT $3
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE tasks
+                SET status = 'running',
+                    error = CASE WHEN attempt >= {MAX_ATTEMPTS} THEN
+                        COALESCE(error, CASE WHEN lease_until IS NOT NULL THEN $4 ELSE $5 END)
+                        ELSE NULL END,
+                    available_at = NULL,
+                    lease_until = clock_timestamp() + make_interval(secs => $2),
+                    attempt = attempt + 1,
+                    updated_at = clock_timestamp()
+                WHERE workflow_id = $1
+                  AND task_id IN (SELECT task_id FROM candidate)
+                RETURNING {ROW_COLS}
+                "#
+            );
+            let mut rows = sqlx::query_as::<_, TaskRow>(&sql)
+                .bind(workflow_id)
+                .bind(LEASE_DURATION.as_secs() as f64)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .bind(LEASE_EXPIRED_ERR)
+                .bind(BUDGET_EXHAUSTED_ERR)
+                .fetch_all(&mut *tx)
+                .await?;
+
+            tx.commit().await?;
+            rows.sort_unstable_by_key(|row| row.task_id);
+            Ok(rows.into_iter().map(TaskRecord::from).collect())
+        })
     }
 
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
-        Box::pin(self.renew_claim_impl(task))
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await?;
+            match Self::lock_task(&mut tx, task).await {
+                Ok(_) => {}
+                Err(StorageError::ClaimLost { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let lease_until = sqlx::query_scalar(
+                r#"
+                UPDATE tasks
+                SET lease_until = clock_timestamp() + make_interval(secs => $4),
+                    updated_at = clock_timestamp()
+                WHERE workflow_id = $1 AND task_id = $2
+                  AND attempt = $3
+                  AND status = 'running' AND lease_until > clock_timestamp()
+                RETURNING lease_until
+                "#,
+            )
+            .bind(&task.workflow_id)
+            .bind(task.task_id)
+            .bind(task.attempt)
+            .bind(LEASE_DURATION.as_secs() as f64)
+            .fetch_optional(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(lease_until)
+        })
     }
 
     fn settle_success<'a>(
@@ -591,7 +476,19 @@ impl TaskStore for PgTaskRepo {
         successors: &'a [Successor],
         rules: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.settle_success_impl(task, output, successors, rules))
+        Box::pin(async move {
+            // 汇合锁之后的查询必须取得新快照，不继承连接的默认隔离级别。
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+                .await?;
+            Self::lock_settlement(&mut tx, task, rules).await?;
+            let settled =
+                settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
+            enqueue_fanouts_in_tx(&mut tx, &settled, successors, rules).await?;
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     fn settle_failure<'a>(
@@ -601,7 +498,22 @@ impl TaskStore for PgTaskRepo {
         successors: &'a [Successor],
         rules: &'a SettlementRules,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.settle_failure_impl(task, message, successors, rules))
+        Box::pin(async move {
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+                .await?;
+            Self::lock_settlement(&mut tx, task, rules).await?;
+            let status = if successors.iter().all(|plan| plan.inputs.is_empty()) {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Superseded
+            };
+            let settled = settle_in_tx(&mut tx, task, status, None, Some(message)).await?;
+            enqueue_fanouts_in_tx(&mut tx, &settled, successors, rules).await?;
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     fn schedule_retry<'a>(
@@ -610,14 +522,63 @@ impl TaskStore for PgTaskRepo {
         message: &'a str,
         delay: Duration,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.schedule_retry_impl(task, message, delay))
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await?;
+            Self::lock_task(&mut tx, task).await?;
+            let result = sqlx::query(&format!(
+                r#"
+                UPDATE tasks
+                SET status = 'pending', error = $4, lease_until = NULL,
+                    available_at = clock_timestamp() + make_interval(secs => $5),
+                    updated_at = clock_timestamp()
+                WHERE workflow_id = $1 AND task_id = $2
+                  AND attempt = $3
+                  AND status = 'running' AND attempt < {MAX_ATTEMPTS}
+                  AND lease_until > clock_timestamp()
+                "#
+            ))
+            .bind(&task.workflow_id)
+            .bind(task.task_id)
+            .bind(task.attempt)
+            .bind(message)
+            .bind(delay.as_secs_f64())
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(claim_lost(task));
+            }
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     fn release_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
-        Box::pin(self.release_claim_impl(task))
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await?;
+            Self::lock_task(&mut tx, task).await?;
+            let result = sqlx::query(
+                r#"
+                UPDATE tasks SET lease_until = NULL, updated_at = clock_timestamp()
+                WHERE workflow_id = $1 AND task_id = $2
+                  AND attempt = $3
+                  AND status = 'running' AND lease_until > clock_timestamp()
+                "#,
+            )
+            .bind(&task.workflow_id)
+            .bind(task.task_id)
+            .bind(task.attempt)
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(claim_lost(task));
+            }
+
+            tx.commit().await?;
+            Ok(())
+        })
     }
 }
 

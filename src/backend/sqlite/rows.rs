@@ -7,7 +7,7 @@ use sqlx::FromRow;
 use crate::{TaskRecord, TaskStatus};
 
 #[derive(Debug, Clone, FromRow)]
-pub struct TaskRow {
+pub(crate) struct TaskRow {
     pub workflow_id: String,
     pub task_id: i64,
     pub run_id: i64,

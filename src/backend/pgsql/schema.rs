@@ -10,10 +10,10 @@ use crate::error::StorageError;
 
 /// 引擎 schema DDL（幂等，每次启动执行：`CREATE ... IF NOT EXISTS` 建表及索引，
 /// `COMMENT ON` 同步表和字段说明）。
-pub const SCHEMA_DDL: &str = include_str!("../../../migrations/pgsql/0001_workflow_tasks.sql");
+const SCHEMA_DDL: &str = include_str!("../../../migrations/pgsql/0001_workflow_tasks.sql");
 
 /// 执行引擎 schema 迁移（幂等，可每次启动执行）。
-pub async fn migrate(pool: &PgPool) -> Result<(), StorageError> {
+pub(crate) async fn migrate(pool: &PgPool) -> Result<(), StorageError> {
     let mut tx = pool.begin().await?;
     // IF NOT EXISTS alone races on catalog rows when several processes start together.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || '.workflow_engine_ddl', 0))")

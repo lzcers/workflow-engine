@@ -1,20 +1,16 @@
 //! 节点抽象：强类型输入/输出 + 类型擦除。
 //!
 //! [`Node`] 是业务节点实现的接口，`In`/`Out` 支持序列化以便落库（对应 DB `task.input`/`task.output`）。
-//! 节点**不携带名字**（无 `PHASE` 常量），阶段名由 [`crate::graph::Graph`]
-//! 作为 `HashMap` 的 key 在注册实例时外部绑定。
+//! 节点**不携带名字**，节点名由 [`crate::graph::Graph`] 在注册实例时外部绑定。
 //!
 //! 节点错误统一为 [`NodeError`]：区分「可重试」与「永久失败」，供工作流的失败边选择后继。
 //!
 //! 子模块划分：
 //! - [`join`]：显式 JOIN 汇聚节点（[`JoinNode`]），引擎通用能力，把多前驱输入合并透传。
 
-use futures::future::BoxFuture;
-use std::any::TypeId;
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
+use std::{any::TypeId, future::Future, marker::PhantomData};
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -35,10 +31,6 @@ pub struct Trigger {
 
 /// `Node` 的上下文类型参数：`Ctx` 业务侧实例化为 `NodeContext`。
 /// 错误统一为 [`NodeError`]。
-///
-/// `In`/`Out` 的 `'static` 边界（不含非静态借用，非「永生」）由 build 期接线指纹校验
-/// 要求：`TypeId::of` 只对 `'static` 类型可用。节点载荷经
-/// `Value` 落库，本就不含借用，此约束不构成实际限制。
 pub trait Node<Ctx>: Send + Sync {
     /// 任务输入类型，对应 DB `task.input`。
     type In: Serialize + DeserializeOwned + 'static;
@@ -65,20 +57,16 @@ pub trait Node<Ctx>: Send + Sync {
         input: Self::In,
     ) -> impl Future<Output = Result<Self::Out, NodeError>> + Send;
 
-    // ---- 任务生命周期钩子（可选覆盖，不依赖节点实例） ----
-    //
-    // 钩子通过当前任务上下文发布事件。
-
     /// 任务开始回调（当前任务已注入 `ctx`），先于节点执行。
-    ///
-    /// 节点可在此自声明媒体类型并发布事件，`input` 为任务的原始输入。
     fn on_start(_ctx: &mut Ctx, _input: &Value) -> impl Future<Output = ()> + Send {
         async {}
     }
-    /// 执行成功且落库后回调。`out` 为该节点序列化输出（`Value`）
+
+    /// 执行成功且落库后回调。`out` 为该节点序列化输出（`Value`）。
     fn on_success(_ctx: &mut Ctx, _out: &Value) -> impl Future<Output = ()> + Send {
         async {}
     }
+
     /// 失败结算提交后回调。`err` 为节点错误或尝试预算耗尽原因。
     /// 回调不阻塞后继认领，也不保证必达；进程退出或 Workflow 释放时可能被取消。
     /// 回调期间不再续租，引擎不限制回调时长。
@@ -88,7 +76,7 @@ pub trait Node<Ctx>: Send + Sync {
 }
 
 /// 节点注册时返回的类型化标识，携带名字与由实例推导的节点、上下文类型。
-/// DSL 用它接线，编译器据此校验转换函数与节点的输入输出是否一致。
+/// 供 `workflow!` 宏和类型检查版建边函数在编译期校验边两端的输入输出类型。
 pub struct NodeKey<Ctx, N> {
     name: &'static str,
     marker: PhantomData<fn(Ctx) -> N>,
@@ -114,43 +102,33 @@ impl<Ctx, N> NodeKey<Ctx, N> {
     }
 }
 
-/// 类型指纹：`TypeId`（判等依据）+ 类型名（报错展示）。
-///
-/// 命令式建图路径（非 DSL）没有编译期接线检查，[`crate::graph::Graph::validate`] 在
-/// build 期用本指纹把「边声明的载荷类型」与「节点注册的 `In`/`Out` 类型」对齐，把类型
-/// 错线提前暴露为确定性装配错误（此前要到任务结算时才以 serde 错误暴露）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TypeFingerprint {
-    /// `TypeId`：判等依据。
+/// 节点/边端口的编译期类型指纹：`TypeId` 做等值比对，`type_name` 用于错误信息与图描述。
+/// 用于 `Graph::build` 期间静态校验命令式边的端口类型接线，把错线从运行时提前到建图期。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypeFingerprint {
     id: TypeId,
-    /// `std::any::type_name`：报错展示。
     name: &'static str,
 }
 
 impl TypeFingerprint {
-    /// 取 `T` 的类型指纹。
-    pub fn of<T: 'static>() -> Self {
+    pub(crate) fn of<T: 'static>() -> Self {
         Self {
             id: TypeId::of::<T>(),
             name: std::any::type_name::<T>(),
         }
     }
 
-    /// `TypeId`，供兼容判定。
-    pub fn id(&self) -> TypeId {
+    pub(crate) fn id(self) -> TypeId {
         self.id
     }
 
-    /// 类型名，供报错展示。
-    pub fn name(&self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         self.name
     }
 }
 
 /// 擦除后的节点接口：对 `Value` 执行，隐藏具体 `In`/`Out`。
-///
-/// 图直接持有构造完成的节点实例。
-pub trait AnyNode<Ctx>: Send + Sync {
+pub(crate) trait AnyNode<Ctx>: Send + Sync {
     fn task_type(&self) -> TaskType;
     fn trigger(&self) -> Option<Trigger>;
     fn in_type(&self) -> TypeFingerprint;
@@ -165,7 +143,7 @@ pub trait AnyNode<Ctx>: Send + Sync {
         name: &'a str,
         ctx: &'a mut Ctx,
         input: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, NodeError>> + Send + 'a>>;
+    ) -> BoxFuture<'a, Result<Value, NodeError>>;
 }
 
 /// 调度器对节点上下文的最小契约：调度器只依赖此接口驱动节点，不感知具体上下文类型。
@@ -211,7 +189,7 @@ where
         name: &'a str,
         ctx: &'a mut Ctx,
         input: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, NodeError>> + Send + 'a>> {
+    ) -> BoxFuture<'a, Result<Value, NodeError>> {
         Box::pin(async move {
             let input: N::In = serde_json::from_value(input)
                 .map_err(|e| NodeError::permanent(format!("bad {} input: {e}", name)))?;
@@ -265,7 +243,8 @@ impl From<String> for NodeError {
 /// Event 入队后的认领与执行沿用普通任务规则；事件监听和注册由宿主负责。
 ///
 /// 由节点经 [`Node::TASK_TYPE`] 声明。调度和图描述都从图定义读取类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskType {
     /// 普通节点：无需等齐前驱，fan-in 任一前驱成功即触发。
     Normal,
@@ -273,15 +252,4 @@ pub enum TaskType {
     Event,
     /// JOIN 汇聚门：按前驱名称和作用域等待来源成功及上游生产结束。
     Join,
-}
-
-impl TaskType {
-    /// 图描述中使用的节点类型名称。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            TaskType::Normal => "normal",
-            TaskType::Event => "event",
-            TaskType::Join => "join",
-        }
-    }
 }

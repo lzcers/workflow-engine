@@ -11,7 +11,7 @@ use super::{Task, TaskRecord};
 use crate::{RunHandle, error::StorageError};
 
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
-pub const LEASE_DURATION: Duration = Duration::from_secs(300);
+pub(crate) const LEASE_DURATION: Duration = Duration::from_secs(300);
 
 /// 后继任务在结算事务内的落库与作用域分发方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,27 +36,28 @@ pub struct Successor {
 
 /// JOIN 的直接前驱与仍可能创建输入的全部上游，在图构建后固定。
 #[derive(Debug, Clone)]
-pub struct JoinRule {
+pub(crate) struct JoinRule {
     pub predecessors: Vec<JoinPredecessor>,
     pub upstreams: Vec<String>,
 }
 
 /// 外部前驱只对应触发当前子图实例的入口任务。深度从最外层子图的 0 开始。
 #[derive(Debug, Clone)]
-pub struct JoinPredecessor {
+pub(crate) struct JoinPredecessor {
     pub name: String,
     pub entry_depth: Option<usize>,
 }
 
 /// 图构建时预计算的静态结算规则，由存储层在结算事务内消费。
 #[derive(Debug, Default, Clone)]
-pub struct SettlementRules {
+pub(crate) struct SettlementRules {
     pub join_rules: HashMap<String, JoinRule>,
 }
 
+#[cfg(feature = "pg")]
 impl SettlementRules {
     /// 是否包含需要运行级串行锁的跨任务规则。
-    pub fn needs_run_lock(&self) -> bool {
+    pub(crate) fn needs_run_lock(&self) -> bool {
         !self.join_rules.is_empty()
     }
 }

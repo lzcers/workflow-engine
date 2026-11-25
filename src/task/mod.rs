@@ -10,5 +10,5 @@ pub const MAX_ATTEMPTS: i32 = 3;
 
 pub use record::{Task, TaskRecord, TaskStatus};
 pub use scope::ScopeRecord;
-pub use store::{Dispatch, JoinPredecessor, JoinRule, SettlementRules, Successor};
-pub(crate) use store::TaskStore;
+pub use store::{Dispatch, Successor};
+pub(crate) use store::{JoinPredecessor, JoinRule, SettlementRules, TaskStore};

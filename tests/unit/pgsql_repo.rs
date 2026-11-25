@@ -4,7 +4,8 @@ use serde_json::json;
 
 use super::super::test_support::connect_test;
 use super::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR};
-use super::{PgTaskRepo, ROW_COLS, TaskRow, advance_joins, scope};
+use super::{PgTaskRepo, TaskRow, advance_joins, scope};
+use crate::backend::ROW_COLS;
 use crate::backend::task_fixture::{TaskSeed, join_plan, plan, scoped_plan};
 use crate::error::StorageError;
 use crate::graph::{
