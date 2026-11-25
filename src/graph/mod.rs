@@ -228,7 +228,7 @@ impl<Ctx> Graph<Ctx> {
         Ok(plans)
     }
 
-    /// 存储在认领和传播失败时使用这些规则，并按当前任务的作用域匹配来源。
+    /// 存储在结算时使用这些规则，按 JOIN 的作用域匹配来源并推进就绪或失败状态。
     pub fn join_rules(&self) -> &HashMap<String, JoinRule> {
         &self.join_rules
     }

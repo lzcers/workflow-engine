@@ -9,7 +9,7 @@ use serde_json::Value;
 pub enum TaskStatus {
     /// 输入已确定，等待认领。
     Pending,
-    /// JOIN 正在收集输入，等待前驱就绪后认领。
+    /// JOIN 正在收集输入，结算事务确认就绪后转为 Pending。
     Collecting,
     Running,
     Succeeded,

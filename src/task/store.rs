@@ -82,12 +82,13 @@ fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<(), Storage
 
 /// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。
 ///
-/// 同一引擎的工作流共用仓储，认领和结算从调用方的图读取规则。
+/// 同一引擎的工作流共用仓储，按 workflow_id 认领任务，结算时从图读取路由和 JOIN 规则。
 /// 调度器把图规划结果（成功后继 / 失败后继）统一交给本存储落库，自身不触碰任何业务字段；
 /// 具体存储实现使用统一的 [`TaskRecord`] 快照，并将操作限制在任务所属的工作流内。
 ///
 /// 认领资格与结算语义由本契约统一规定，后端负责事务实现；结算必须原子提交任务状态
-/// 与全部后继，失败则整体回滚。
+/// 与全部后继。成功和失败结算均在写完后继后推进本次运行内的 collecting JOIN，
+/// 即使本次没有后继也要检查。收齐输入的 JOIN 转为 pending，依赖永久失败的 JOIN 转为 failed。
 pub(crate) trait TaskStore: Sync {
     /// 存储层错误类型：允许不同存储实现定义各自的错误，同时保证引擎层可统一传播
     /// （`Send + Sync` 供调度器在协程间传播与打日志）。
@@ -99,11 +100,7 @@ pub(crate) trait TaskStore: Sync {
     /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
     /// 时返回少于 `limit` 甚至空列表，按任务 ID 排序。`limit` 为 0 时直接返回空列表。
     ///
-    /// 认领仅处理无有效租约的任务：
-    /// - pending 输入已确定，可直接执行，包括独立运行入口和失败路由创建的 JOIN。
-    /// - collecting 等待当前作用域的有效前驱成功，并等待可能继续产生输入的上游结束。
-    ///   祖先或兄弟入口绑定精确触发任务，子图输出按父实例收集。
-    /// - running 沿用首次认领时冻结的输入恢复执行。
+    /// 认领无有效租约的 pending 或 running 任务，两者的输入均已确定。
     ///
     /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
     /// 每次认领递增 attempt 并写入 300 秒租约。
@@ -112,7 +109,7 @@ pub(crate) trait TaskStore: Sync {
     /// 后续认领保留该原因，使最终失败处理在崩溃或结算失败后仍可恢复。
     fn claim_many<'a>(
         &'a self,
-        graph: &'a dyn ErasedGraph,
+        workflow_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>>;
 

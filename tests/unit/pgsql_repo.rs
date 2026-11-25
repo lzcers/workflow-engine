@@ -4,7 +4,7 @@ use serde_json::json;
 
 use super::super::test_support::connect_test;
 use super::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR};
-use super::{PgTaskRepo, ROW_COLS, TaskRow, fail_blocked_joins, scope};
+use super::{PgTaskRepo, ROW_COLS, TaskRow, advance_joins, scope};
 use crate::backend::task_fixture::{TaskSeed, join_plan, plan};
 use crate::error::StorageError;
 use crate::graph::{
@@ -68,7 +68,7 @@ impl PgTaskRepo {
             .execute(&mut *tx)
             .await?;
         if collecting {
-            fail_blocked_joins(&mut tx, &task.workflow_id, run_id, graph.join_rules()).await?;
+            advance_joins(&mut tx, &task.workflow_id, run_id, graph.join_rules()).await?;
         }
         tx.commit().await?;
         Ok(self.get(&task.workflow_id, task_id).await?.unwrap())
@@ -151,14 +151,9 @@ async fn submitted_tasks_follow_workflow_and_claim_attempt() {
     let other_graph = build_graph(other_id, &[("analysis.entry", Normal, None)], &[]);
     let repo = PgTaskRepo::new(pool.clone());
     let replacement = PgTaskRepo::new(pool.clone());
-    assert!(
-        repo.claim_many(other_graph.as_ref(), 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(repo.claim_many(other_id, 1).await.unwrap().is_empty());
     let root = repo
-        .claim_many(graph.as_ref(), 1)
+        .claim_many(workflow_id, 1)
         .await
         .unwrap()
         .pop()
@@ -167,7 +162,7 @@ async fn submitted_tasks_follow_workflow_and_claim_attempt() {
     assert!(root.scope_id.is_some());
     assert!(
         replacement
-            .claim_many(graph.as_ref(), 1)
+            .claim_many(workflow_id, 1)
             .await
             .unwrap()
             .is_empty()
@@ -179,7 +174,7 @@ async fn submitted_tasks_follow_workflow_and_claim_attempt() {
     );
     repo.release_claim(&root).await.unwrap();
     let recovered = replacement
-        .claim_many(graph.as_ref(), 1)
+        .claim_many(workflow_id, 1)
         .await
         .unwrap()
         .pop()
@@ -201,14 +196,9 @@ async fn submitted_tasks_follow_workflow_and_claim_attempt() {
         )
         .await
         .unwrap();
-    assert!(
-        repo.claim_many(other_graph.as_ref(), 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(repo.claim_many(other_id, 1).await.unwrap().is_empty());
     let child = repo
-        .claim_many(graph.as_ref(), 1)
+        .claim_many(workflow_id, 1)
         .await
         .unwrap()
         .pop()
@@ -244,7 +234,7 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     )
     .await
     .unwrap();
-    let source = repo.claim_many(graph.as_ref(), 5).await.unwrap().remove(0);
+    let source = repo.claim_many(workflow_id, 5).await.unwrap().remove(0);
 
     repo.succeed_and_enqueue(
         graph.as_ref(),
@@ -332,7 +322,7 @@ async fn normal_fanout_creates_each_input_independently() {
                 )
                 .await
                 .unwrap();
-            let claims = repo.claim_many(graph.as_ref(), 20).await.unwrap();
+            let claims = repo.claim_many(&workflow_id, 20).await.unwrap();
             let source = claims
                 .iter()
                 .find(|task| task.task_id == root.task_id)
@@ -393,7 +383,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
     .execute(database.pool())
     .await
     .unwrap();
-    let sources = repo.claim_many(graph.as_ref(), 2).await.unwrap();
+    let sources = repo.claim_many(workflow_id, 2).await.unwrap();
     assert_eq!(sources.len(), 2);
     for (index, source) in sources.iter().enumerate() {
         let contribution = json!({"source": source.task_id});
@@ -409,7 +399,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
         .await
         .unwrap();
         if index == 0 {
-            assert!(repo.claim_many(graph.as_ref(), 1).await.unwrap().is_empty());
+            assert!(repo.claim_many(workflow_id, 1).await.unwrap().is_empty());
         }
     }
     let rows = repo.list_all(workflow_id).await.unwrap();
@@ -420,7 +410,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
         "different parents must contribute to the same JOIN"
     );
     let join = joins[0];
-    assert_eq!(join.status, TaskStatus::Collecting);
+    assert_eq!(join.status, TaskStatus::Pending);
     assert_eq!(
         join.parent_task_ids,
         [sources[0].task_id, sources[1].task_id]
@@ -432,7 +422,7 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
             "extra": [sources[0].task_id, sources[1].task_id],
         })
     );
-    let claims = repo.claim_many(graph.as_ref(), 10).await.unwrap();
+    let claims = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].task_id, join.task_id);
 }
@@ -468,7 +458,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
     )
     .await
     .unwrap();
-    let retried = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let retried = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     repo.fail_and_enqueue(
         graph.as_ref(),
         &retried,
@@ -502,7 +492,7 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         .await
         .unwrap();
     let failed = repo
-        .claim_many(graph.as_ref(), 10)
+        .claim_many(workflow_id, 10)
         .await
         .unwrap()
         .into_iter()
@@ -589,12 +579,8 @@ async fn releasing_a_claim_stays_in_its_workflow() {
     let other_graph = build_graph("release_other", &[("narration", Normal, None)], &[]);
     let ours = seed(&repo, graph.as_ref(), "narration", None).await;
     let other = seed(&repo, other_graph.as_ref(), "narration", None).await;
-    let our_claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
-    let other_claim = repo
-        .claim_many(other_graph.as_ref(), 1)
-        .await
-        .unwrap()
-        .remove(0);
+    let our_claim = repo.claim_many("release_ours", 1).await.unwrap().remove(0);
+    let other_claim = repo.claim_many("release_other", 1).await.unwrap().remove(0);
     assert!(matches!(
         repo.succeed_and_enqueue(graph.as_ref(), &other_claim, &json!("wrong graph"), &[])
             .await,
@@ -607,14 +593,14 @@ async fn releasing_a_claim_stays_in_its_workflow() {
     ));
 
     repo.release_claim(&our_claim).await.unwrap();
-    let reclaimed = repo.claim_many(graph.as_ref(), 5).await.unwrap();
+    let reclaimed = repo.claim_many("release_ours", 5).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].task_id, ours.task_id);
     assert_eq!(reclaimed[0].attempt, 2, "重认领照常递增 attempt");
 
     // 其它工作流不受影响：它的任务租约还在（认领不到，状态仍是在跑）。
     assert!(
-        repo.claim_many(other_graph.as_ref(), 5)
+        repo.claim_many("release_other", 5)
             .await
             .unwrap()
             .is_empty()
@@ -648,15 +634,15 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     let input = TaskSeed::new(workflow_id, "source", json!({}));
     let root = repo.seed_task(graph.as_ref(), &input).await.unwrap();
     for _ in 1..MAX_ATTEMPTS {
-        let previous = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+        let previous = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
         repo.release_claim(&previous).await.unwrap();
     }
-    let old = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let old = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     assert_eq!(old.attempt, MAX_ATTEMPTS);
-    assert!(repo.claim_many(graph.as_ref(), 1).await.unwrap().is_empty());
+    assert!(repo.claim_many(workflow_id, 1).await.unwrap().is_empty());
     sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1")
         .bind(workflow_id).execute(database.pool()).await.unwrap();
-    let recovery = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let recovery = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     assert_eq!(recovery.task_id, root.task_id);
     assert_eq!(recovery.attempt, MAX_ATTEMPTS + 1);
     assert_eq!(recovery.status, TaskStatus::Running);
@@ -699,7 +685,7 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
 
     // 失败结算自身也允许重新认领，首次保存的超时原因不能被释放租约覆盖。
     repo.release_claim(&recovery).await.unwrap();
-    let next = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let next = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     assert_eq!(next.attempt, MAX_ATTEMPTS + 2);
     assert_eq!(next.error.as_deref(), Some(LEASE_EXPIRED_ERR));
     reject_stale_writes(&repo, graph.as_ref(), &recovery).await;
@@ -727,10 +713,10 @@ async fn exhausted_claims_recover_through_atomic_failure_settlement() {
     child.run_id = zero.run_id;
     let child = repo.seed_task(graph.as_ref(), &child).await.unwrap();
     for _ in 0..MAX_ATTEMPTS {
-        let previous = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+        let previous = repo.claim_many("zero-budget", 1).await.unwrap().remove(0);
         repo.release_claim(&previous).await.unwrap();
     }
-    let claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let claim = repo.claim_many("zero-budget", 1).await.unwrap().remove(0);
     assert_eq!(claim.attempt, MAX_ATTEMPTS + 1);
     assert_eq!(claim.error.as_deref(), Some(BUDGET_EXHAUSTED_ERR));
     repo.fail_and_enqueue(graph.as_ref(), &claim, BUDGET_EXHAUSTED_ERR, &[])
@@ -799,11 +785,11 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
 
         let pending = repo.seed_task(graph.as_ref(), &task).await.unwrap();
         for _ in 0..previous_attempts {
-            let previous = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+            let previous = repo.claim_many(&workflow_id, 1).await.unwrap().remove(0);
             repo.release_claim(&previous).await.unwrap();
         }
         assert!(repo.renew_claim(&pending).await.unwrap().is_none());
-        let claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+        let claim = repo.claim_many(&workflow_id, 1).await.unwrap().remove(0);
         let shortened: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
             "UPDATE tasks SET lease_until = clock_timestamp() + interval '10 seconds' WHERE workflow_id = $1 RETURNING lease_until"
         ).bind(&workflow_id).fetch_one(database.pool()).await.unwrap();
@@ -817,7 +803,7 @@ async fn renewal_extends_the_live_claim_without_changing_its_generation() {
         assert_eq!(current.lease_until, Some(renewed));
         assert_eq!(current.attempt, claim.attempt);
         assert_eq!(current.error, claim.error);
-        assert!(repo.claim_many(graph.as_ref(), 1).await.unwrap().is_empty());
+        assert!(repo.claim_many(&workflow_id, 1).await.unwrap().is_empty());
         let mut wrong_workflow = claim.clone();
         wrong_workflow.workflow_id = "missing".into();
         assert!(repo.renew_claim(&wrong_workflow).await.unwrap().is_none());
@@ -854,7 +840,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     );
     let repo = PgTaskRepo::new(database.pool().clone());
     seed(&repo, graph.as_ref(), "root", Some(7)).await;
-    let old = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let old = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     let mut dependent = TaskSeed {
         run_id: Some(7),
         ..TaskSeed::new(workflow_id, "dependent", json!({}))
@@ -863,7 +849,7 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() - interval '1 second' WHERE workflow_id = $1 AND task_id = $2")
         .bind(workflow_id).bind(old.task_id).execute(database.pool()).await.unwrap();
     reject_stale_writes(&repo, graph.as_ref(), &old).await;
-    let current = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let current = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     assert_eq!(current.attempt, old.attempt + 1);
     reject_stale_writes(&repo, graph.as_ref(), &old).await;
     let rows = repo.list_all(workflow_id).await.unwrap();
@@ -893,8 +879,8 @@ async fn expired_and_replaced_claims_cannot_write_or_release_a_new_owner() {
     // Releasing one task leaves the other claim valid.
     dependent.task.name = "another".into();
     repo.seed_task(graph.as_ref(), &dependent).await.unwrap();
-    let a = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
-    let b = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let a = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+    let b = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     repo.release_claim(&a).await.unwrap();
     assert!(matches!(
         repo.release_claim(&a).await,
@@ -931,7 +917,7 @@ async fn tasks_without_joins_can_settle_independently_in_the_same_run() {
     let repo = PgTaskRepo::new(database.pool().clone());
     let first = seed(&repo, graph.as_ref(), "work", None).await;
     seed(&repo, graph.as_ref(), "work", first.run_id).await;
-    let claims = repo.claim_many(graph.as_ref(), 2).await.unwrap();
+    let claims = repo.claim_many(workflow_id, 2).await.unwrap();
     assert_eq!(claims.len(), 2);
 
     let mut blocker = database.pool().begin().await.unwrap();
@@ -1017,8 +1003,8 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
     );
     seed(&repo, graph.as_ref(), "left", Some(42)).await;
     seed(&repo, graph.as_ref(), "right", Some(42)).await;
-    let left = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
-    let right = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let left = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
+    let right = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     // Hold the source rows until both settlements are waiting to create the first JOIN.
     let mut blocker = database.pool().begin().await.unwrap();
     sqlx::query("SELECT task_id FROM tasks WHERE workflow_id = $1 FOR UPDATE")
@@ -1060,6 +1046,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
         .iter()
         .filter(|task| matches!(task.name.as_str(), "join-a" | "join-b"))
     {
+        assert_eq!(join.status, TaskStatus::Pending);
         assert_eq!(
             join.input,
             json!({"left": left.task_id, "right": right.task_id})
@@ -1068,7 +1055,7 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
         parents.sort_unstable();
         assert_eq!(parents, [left.task_id, right.task_id]);
     }
-    assert_eq!(repo.claim_many(graph.as_ref(), 10).await.unwrap().len(), 2);
+    assert_eq!(repo.claim_many(workflow_id, 10).await.unwrap().len(), 2);
     alternate_pool.close().await;
 }
 
@@ -1082,7 +1069,7 @@ async fn a_lease_that_expires_while_waiting_for_a_row_lock_cannot_be_used() {
         let graph = build_graph(&workflow_id, &[("root", Normal, None)], &[]);
         let repo = PgTaskRepo::new(database.pool().clone());
         seed(&repo, graph.as_ref(), "root", None).await;
-        let claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+        let claim = repo.claim_many(&workflow_id, 1).await.unwrap().remove(0);
         sqlx::query("UPDATE tasks SET lease_until = clock_timestamp() + interval '300 milliseconds' WHERE workflow_id = $1")
             .bind(&workflow_id).execute(database.pool()).await.unwrap();
         let mut blocker = database.pool().begin().await.unwrap();
@@ -1148,7 +1135,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     );
     let repo = PgTaskRepo::new(database.pool().clone());
     seed(&repo, graph.as_ref(), "root", Some(42)).await;
-    let root = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let root = repo.claim_many(workflow_id, 1).await.unwrap().remove(0);
     repo.succeed_and_enqueue(
         graph.as_ref(),
         &root,
@@ -1160,7 +1147,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     )
     .await
     .unwrap();
-    let scopes = repo.claim_many(graph.as_ref(), 3).await.unwrap();
+    let scopes = repo.claim_many(workflow_id, 3).await.unwrap();
     for scope in &scopes {
         let fanouts =
             ["analysis.left", "analysis.right"].map(|dst| plan(dst, vec![scope.input.clone()]));
@@ -1168,7 +1155,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
             .await
             .unwrap();
     }
-    let branches = repo.claim_many(graph.as_ref(), 6).await.unwrap();
+    let branches = repo.claim_many(workflow_id, 6).await.unwrap();
     assert_eq!(branches.len(), 6);
     assert!(branches.iter().all(|task| task.run_id == Some(42)));
     for scope in &scopes {
@@ -1198,17 +1185,12 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
             .await
             .unwrap();
     }
-    assert!(
-        repo.claim_many(graph.as_ref(), 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(repo.claim_many(workflow_id, 10).await.unwrap().is_empty());
 
     // Reclaiming the same task must retain its branch, including after a restart.
     let right_a = branch("a", "analysis.right");
     repo.release_claim(right_a).await.unwrap();
-    let reclaimed = repo.claim_many(graph.as_ref(), 10).await.unwrap();
+    let reclaimed = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(reclaimed.len(), 1);
     let right_a = &reclaimed[0];
     assert_eq!(right_a.task_id, branch("a", "analysis.right").task_id);
@@ -1221,7 +1203,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
     )
     .await
     .unwrap();
-    let ready = repo.claim_many(graph.as_ref(), 10).await.unwrap();
+    let ready = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(
         ready.len(),
         1,
@@ -1278,7 +1260,7 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
         .unwrap();
     assert_eq!(report.scope_id, scopes[0].scope_id);
     assert_eq!(report.input, json!({"left": "a", "right": "a"}));
-    let ready = repo.claim_many(graph.as_ref(), 10).await.unwrap();
+    let ready = repo.claim_many(workflow_id, 10).await.unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].task_id, report.task_id);
 }

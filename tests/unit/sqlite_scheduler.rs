@@ -227,7 +227,12 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .find(|task| task.name == "total")
         .unwrap();
     assert_eq!(other_total.output, Some(json!(316)));
-    assert!(repo.claim_many(graph.as_ref(), 1).await.unwrap().is_empty());
+    assert!(
+        repo.claim_many(graph.workflow_id(), 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     database.close().await;
 }
 

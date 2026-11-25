@@ -58,10 +58,10 @@ impl TaskStore for SqliteTaskRepo {
 
     fn claim_many<'a>(
         &'a self,
-        graph: &'a dyn ErasedGraph,
+        workflow_id: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(SqliteTaskRepo::claim_many(self, graph, limit))
+        Box::pin(SqliteTaskRepo::claim_many(self, workflow_id, limit))
     }
 
     fn renew_claim<'a>(

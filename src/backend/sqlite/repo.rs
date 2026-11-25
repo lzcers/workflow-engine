@@ -99,7 +99,7 @@ async fn enqueue_fanouts_in_tx(
             }
         }
     }
-    fail_blocked_joins(tx, source.workflow_id, source.run_id, graph.join_rules()).await
+    advance_joins(tx, source.workflow_id, source.run_id, graph.join_rules()).await
 }
 
 async fn collect_join(
@@ -165,8 +165,8 @@ async fn insert_task(
     Ok(())
 }
 
-/// 包括晚创建的 JOIN 和间接等待者；不把其他实例的失败传播过来。
-async fn fail_blocked_joins(
+/// 全部后继写入后，在本次运行内传播失败并冻结已收齐的 JOIN 输入。
+async fn advance_joins(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workflow_id: &str,
     run_id: Option<i64>,
@@ -175,14 +175,35 @@ async fn fail_blocked_joins(
     if rules.is_empty() {
         return Ok(());
     }
+    let collecting = "wt.workflow_id = ?1 AND wt.run_id IS ?2 AND wt.status = 'collecting'";
+    let fail = format!(
+        "UPDATE tasks AS wt SET status = 'failed', error = 'upstream dependency failed',
+            lease_until = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE {collecting} AND ({})",
+        join::failed("?3")
+    );
     loop {
-        let changed = sqlx::query(&format!(
-            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE wt.workflow_id=?1 AND wt.run_id IS ?2 AND wt.status='collecting' AND ({})", join::failed("?3")
-        )).bind(workflow_id).bind(run_id).bind(Json(rules)).execute(&mut **tx).await?.rows_affected();
+        let changed = sqlx::query(&fail)
+            .bind(workflow_id)
+            .bind(run_id)
+            .bind(Json(rules))
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
         if changed == 0 {
             break;
         }
     }
+    sqlx::query(&format!(
+        "UPDATE tasks AS wt SET status = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE {collecting} AND ({})",
+        join::ready("?3")
+    ))
+    .bind(workflow_id)
+    .bind(run_id)
+    .bind(Json(rules))
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -333,13 +354,12 @@ impl SqliteTaskRepo {
     /// they never execute the node again. The write transaction serializes competing workers.
     pub async fn claim_many(
         &self,
-        graph: &dyn ErasedGraph,
+        workflow_id: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let join_ready = join::ready("?4");
         let mut tx = self.pool.begin().await?;
         let mut rows = sqlx::query_as::<_, TaskRow>(&format!(
             r#"
@@ -347,7 +367,7 @@ impl SqliteTaskRepo {
                 SELECT wt.task_id FROM tasks wt
                 WHERE wt.workflow_id = ?1
                   AND (wt.lease_until IS NULL OR julianday(wt.lease_until) <= julianday('now'))
-                  AND (wt.status IN ('pending', 'running') OR (wt.status = 'collecting' AND ({join_ready})))
+                  AND wt.status IN ('pending', 'running')
                 ORDER BY wt.task_id LIMIT ?3
             )
             UPDATE tasks
@@ -364,10 +384,9 @@ impl SqliteTaskRepo {
             RETURNING {ROW_COLS}
             "#
         ))
-        .bind(graph.workflow_id())
+        .bind(workflow_id)
         .bind(LEASE_DURATION.as_secs() as i64)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .bind(Json(graph.join_rules()))
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;

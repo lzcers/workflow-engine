@@ -156,10 +156,18 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     let input = TaskSeed::new("timeout", "pending", json!(41));
     repo.seed_task(graph.as_ref(), &input).await.unwrap();
     for _ in 1..crate::task::MAX_ATTEMPTS {
-        let previous = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+        let previous = repo
+            .claim_many(graph.workflow_id(), 1)
+            .await
+            .unwrap()
+            .remove(0);
         repo.release_claim(&previous).await.unwrap();
     }
-    let claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let claim = repo
+        .claim_many(graph.workflow_id(), 1)
+        .await
+        .unwrap()
+        .remove(0);
     let claim = set_deadline(
         &pool,
         &repo,
@@ -248,7 +256,11 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
     )
     .await
     .unwrap();
-    let claim = repo.claim_many(graph.as_ref(), 1).await.unwrap().remove(0);
+    let claim = repo
+        .claim_many(graph.workflow_id(), 1)
+        .await
+        .unwrap()
+        .remove(0);
     let claim = set_deadline(
         &pool,
         &repo,
@@ -314,7 +326,7 @@ impl TaskStore for Store {
 
     fn claim_many<'a>(
         &'a self,
-        _: &'a dyn ErasedGraph,
+        _: &'a str,
         _: usize,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>> {
         Box::pin(async { unreachable!("run_task receives an existing claim") })

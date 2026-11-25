@@ -25,7 +25,7 @@ const DEFAULT_MAX_CONCURRENCY: usize = 8;
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(LEASE_DURATION.as_secs() / 3);
 const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 当前图的调度器，负责认领、并发执行与结算，依赖关系由存储过滤。
+/// 当前图的调度器，负责认领、并发执行与结算，JOIN 就绪状态由存储在结算时更新。
 pub struct Scheduler<Ctx, Store>
 where
     Ctx: NodeContext + Sync + 'static,
@@ -114,7 +114,7 @@ where
     async fn claim_and_spawn(&self, in_flight: &mut JoinSet<()>, limit: usize) -> usize {
         // 从请求发出时计时，比数据库真正写入租约更早，不受应用与数据库时钟偏差影响。
         let lease_deadline = Instant::now() + LEASE_DURATION;
-        match self.store.claim_many(self.graph.as_ref(), limit).await {
+        match self.store.claim_many(self.graph.workflow_id(), limit).await {
             Ok(tasks) => {
                 let count = tasks.len();
                 if count > 0 {

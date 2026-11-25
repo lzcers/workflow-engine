@@ -1,4 +1,4 @@
-//! JOIN 条件从执行图和当前调用的作用域推导，认领与失败传播共用来源选择。
+//! JOIN 条件从执行图和当前调用的作用域推导，结算时据此传播失败并判断输入是否收齐。
 
 fn matches_rule(rules: &str, condition: &str) -> String {
     format!(

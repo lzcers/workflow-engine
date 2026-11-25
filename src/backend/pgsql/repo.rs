@@ -156,7 +156,7 @@ async fn enqueue_fanouts_in_tx(
             }
         }
     }
-    fail_blocked_joins(tx, source.workflow_id, source.run_id, graph.join_rules()).await
+    advance_joins(tx, source.workflow_id, source.run_id, graph.join_rules()).await
 }
 
 async fn collect_join(
@@ -222,8 +222,8 @@ async fn insert_task(
     Ok(())
 }
 
-/// 包括晚创建的 JOIN 和间接等待者；不把其他实例的失败传播过来。
-async fn fail_blocked_joins(
+/// 写完本次所有后继后传播依赖失败，再将收齐输入的 JOIN 推进为可认领状态。
+async fn advance_joins(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
     run_id: Option<i64>,
@@ -232,14 +232,36 @@ async fn fail_blocked_joins(
     if rules.is_empty() {
         return Ok(());
     }
+    let collecting =
+        "wt.workflow_id = $1 AND wt.run_id IS NOT DISTINCT FROM $2 AND wt.status = 'collecting'";
+    let fail = format!(
+        "UPDATE tasks AS wt
+         SET status = 'failed', error = 'upstream dependency failed', lease_until = NULL, updated_at = clock_timestamp()
+         WHERE {collecting} AND ({})",
+        join::failed("$3")
+    );
     loop {
-        let changed = sqlx::query(&format!(
-            "UPDATE tasks AS wt SET status='failed', error='upstream dependency failed', lease_until=NULL, updated_at=clock_timestamp() WHERE wt.workflow_id=$1 AND wt.run_id IS NOT DISTINCT FROM $2 AND wt.status='collecting' AND ({})", join::failed("$3")
-        )).bind(workflow_id).bind(run_id).bind(Json(rules)).execute(&mut **tx).await?.rows_affected();
+        let changed = sqlx::query(&fail)
+            .bind(workflow_id)
+            .bind(run_id)
+            .bind(Json(rules))
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
         if changed == 0 {
             break;
         }
     }
+    sqlx::query(&format!(
+        "UPDATE tasks AS wt SET status = 'pending', updated_at = clock_timestamp()
+         WHERE {collecting} AND ({})",
+        join::ready("$3")
+    ))
+    .bind(workflow_id)
+    .bind(run_id)
+    .bind(Json(rules))
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -410,7 +432,7 @@ impl PgTaskRepo {
     /// 恢复认领保存首次失败原因，允许恢复结算本身在崩溃或事务失败后重试。
     pub async fn claim_many(
         &self,
-        graph: &dyn ErasedGraph,
+        workflow_id: &str,
         limit: usize,
     ) -> Result<Vec<TaskRecord>, StorageError> {
         if limit == 0 {
@@ -425,7 +447,7 @@ impl PgTaskRepo {
                 FROM tasks wt
                 WHERE wt.workflow_id = $1
                   AND (wt.lease_until IS NULL OR wt.lease_until <= NOW())
-                  AND (wt.status IN ('pending', 'running') OR (wt.status = 'collecting' AND ({join_ready})))
+                  AND wt.status IN ('pending', 'running')
                 ORDER BY wt.task_id
                 LIMIT $3
                 FOR UPDATE SKIP LOCKED
@@ -441,16 +463,14 @@ impl PgTaskRepo {
             WHERE workflow_id = $1
               AND task_id IN (SELECT task_id FROM candidate)
             RETURNING {ROW_COLS}
-            "#,
-            join_ready = join::ready("$6"),
+            "#
         );
         let mut rows = sqlx::query_as::<_, TaskRow>(&sql)
-            .bind(graph.workflow_id())
+            .bind(workflow_id)
             .bind(LEASE_DURATION.as_secs() as f64)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(LEASE_EXPIRED_ERR)
             .bind(BUDGET_EXHAUSTED_ERR)
-            .bind(Json(graph.join_rules()))
             .fetch_all(&mut *tx)
             .await?;
 
