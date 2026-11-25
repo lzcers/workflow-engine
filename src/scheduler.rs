@@ -136,7 +136,12 @@ where
             Ok(tasks) => {
                 let count = tasks.len();
                 if count > 0 {
-                    info!(count, "claim tasks");
+                    info!(
+                        count,
+                        workflow_id = self.graph.workflow_id(),
+                        node_names = ?tasks.iter().map(|task| task.name.as_str()).collect::<Vec<_>>(),
+                        "claim tasks"
+                    );
                 }
                 for task in tasks {
                     in_flight.spawn(run_task(
