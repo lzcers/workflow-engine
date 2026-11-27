@@ -18,7 +18,7 @@ pub(crate) const LEASE_DURATION: Duration = Duration::from_secs(300);
 pub enum Dispatch {
     /// 在共享作用域内为每条输入创建独立的 `pending` 任务。
     Shared,
-    /// 为每条输入建立独立子图作用域并创建 `pending` 任务（foreach）。
+    /// 为 `->+` 的每条输入建立独立子图作用域并创建 `pending` 任务。
     PerInputScope,
     /// 在共享作用域内合并至状态为 `collecting` 的 JOIN 任务。
     Join,
@@ -161,7 +161,7 @@ pub(crate) trait TaskStore: Sync {
     ///
     /// 必须校验当前有效认领且 attempt <= MAX_ATTEMPTS；旧执行者和仅用于最终失败的认领不能提交成功。
     /// 成功后继继承运行身份，作用域按子图边界进入、继承或退出。
-    /// 同一次结算的普通跨入边共享实例；foreach 按边及元素建立独立实例。
+    /// 同一次结算的普通跨入边共享实例，`->+` 按边及元素建立独立实例。
     /// scope 创建、任务结算、JOIN 输入合并与后继创建在同一事务提交。
     /// 普通任务逐项创建；JOIN 按 workflow、run、scope 和节点名累积。
     /// 依赖永久失败会令已有及晚创建的 JOIN 失败，不影响其他实例。

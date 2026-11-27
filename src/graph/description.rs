@@ -54,8 +54,10 @@ pub struct EdgeDescription {
     pub source: String,
     pub target: String,
     pub kind: EdgeKind,
-    /// 边的路由模式：`passthrough`、`map` 或 `foreach`（失败边只为前两者）。
+    /// 箭头的分发方式，对应 `->`、`->*` 或 `->+`。
     pub mode: EdgeMode,
+    /// 是否在分发前通过 `|>` 转换载荷。
+    pub has_transform: bool,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -87,6 +89,7 @@ impl<Ctx> Graph<Ctx> {
                 target: edge.dst().to_owned(),
                 kind: EdgeKind::Success,
                 mode: edge.mode(),
+                has_transform: edge.has_transform(),
             })
             .chain(
                 self.failure_edges
@@ -98,6 +101,7 @@ impl<Ctx> Graph<Ctx> {
                         target: edge.dst().to_owned(),
                         kind: EdgeKind::Failure,
                         mode: edge.mode(),
+                        has_transform: edge.has_transform(),
                     }),
             )
             .collect();
@@ -179,7 +183,7 @@ impl GraphDescription {
         Ok(path)
     }
 
-    /// 校验静态归属以及 foreach 的边界。允许普通边直接连接子图内部节点。
+    /// 校验静态归属以及独立展开的子图边界。
     pub fn validate_subgraphs(&self) -> Result<(), String> {
         let nodes = self.nodes.iter().map(|node| {
             (
@@ -188,13 +192,10 @@ impl GraphDescription {
                 node.task_type == TaskType::Join,
             )
         });
-        let edges = self.edges.iter().map(|edge| {
-            (
-                edge.source.as_str(),
-                edge.target.as_str(),
-                edge.mode == EdgeMode::Foreach,
-            )
-        });
+        let edges = self
+            .edges
+            .iter()
+            .map(|edge| (edge.source.as_str(), edge.target.as_str(), edge.mode));
         validate_subgraphs(nodes, self.subgraphs.iter(), edges)
     }
 }
@@ -220,8 +221,11 @@ impl<Ctx> Graph<Ctx> {
         let success = self
             .success_edges
             .iter()
-            .map(|e| (e.src(), e.dst(), e.mode() == EdgeMode::Foreach));
-        let failure = self.failure_edges.iter().map(|e| (e.src(), e.dst(), false));
+            .map(|e| (e.src(), e.dst(), e.mode()));
+        let failure = self
+            .failure_edges
+            .iter()
+            .map(|e| (e.src(), e.dst(), e.mode()));
         validate_subgraphs(
             nodes.iter().copied(),
             groups.iter().copied(),
@@ -233,7 +237,7 @@ impl<Ctx> Graph<Ctx> {
 fn validate_subgraphs<'a>(
     nodes: impl Iterator<Item = (&'a str, Option<&'a str>, bool)> + Clone,
     subgraphs: impl Iterator<Item = &'a SubgraphDescription> + Clone,
-    edges: impl Iterator<Item = (&'a str, &'a str, bool)>,
+    edges: impl Iterator<Item = (&'a str, &'a str, EdgeMode)>,
 ) -> Result<(), String> {
     let mut owners = HashMap::new();
     for (id, owner, is_join) in nodes.clone() {
@@ -265,23 +269,21 @@ fn validate_subgraphs<'a>(
             return Err(format!("node {id}: subgraph {group} not registered"));
         }
     }
-    for (src, dst, foreach) in edges {
+    for (src, dst, mode) in edges {
         let &(source_group, _) = owners
             .get(src)
             .ok_or_else(|| format!("edge src={src} not registered"))?;
         let &(destination_group, is_join) = owners
             .get(dst)
             .ok_or_else(|| format!("edge dst={dst} not registered"))?;
-        if foreach {
+        if mode == EdgeMode::IsolatedExpand {
             if is_join {
-                return Err(format!("foreach edge must not target join node {dst}"));
+                return Err(format!("->+ edge must not target join node {dst}"));
             }
             if destination_group
                 .is_none_or(|target| subgraph_path(source_group).any(|id| id == target))
             {
-                return Err(format!(
-                    "foreach edge {src} -> {dst} must enter a new subgraph"
-                ));
+                return Err(format!("edge {src} ->+ {dst} must enter a new subgraph"));
             }
         }
     }

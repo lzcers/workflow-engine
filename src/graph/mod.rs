@@ -1,7 +1,7 @@
 //! 图引擎：节点注册表 + 边集合，负责执行、后继规划、静态校验。
 //!
 //! 构图提供两种方式：
-//! - 命令式：[`Graph::builder`]（搭配 [`passthrough`]/[`when`]/[`map`]/[`foreach`]/[`on_error`]/[`when_error`]），在 `build()` 时做端口类型指纹校验；
+//! - 命令式：[`Graph::builder`] 通过 [`success`]、[`failure`] 及带转换的构造函数注册边，在 `build()` 时校验端口类型；
 //! - 声明式：[`crate::workflow!`] 宏，在编译期完成节点接线类型检查。
 
 use serde_json::Value;
@@ -14,12 +14,12 @@ mod builder;
 mod description;
 mod erased;
 
-pub use builder::GraphBuilder;
 pub use crate::edge::{
-    EdgeError, EdgeMode, ErrorWhenBuilder, FailureEdge, SuccessEdge, WhenBuilder, foreach, map,
-    on_error, passthrough, when, when_error,
+    Arrow, EdgeError, EdgeMode, FailureEdge, SuccessEdge, direct, failure, failure_transform,
+    isolated_expand, shared_expand, success, success_transform,
 };
 pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
+pub use builder::GraphBuilder;
 pub use description::{
     EdgeDescription, EdgeKind, GraphDescription, NodeDescription, SubgraphDescription,
 };
@@ -143,7 +143,7 @@ impl<Ctx> Graph<Ctx> {
         Some(subgraph_path(group).map(str::to_owned).collect())
     }
 
-    /// 所有成功边分别规划；不同 foreach 边不合并，也不按下标隐式配对。
+    /// 每条成功边独立规划，`->+` 的每份输入各自进入一个子图实例。
     pub fn plan_success(&self, name: &str, out: &Value) -> Result<Vec<Successor>, EdgeError> {
         let mut plans = Vec::new();
         for edge in self.success_edges.iter().filter(|edge| edge.src() == name) {
@@ -162,10 +162,8 @@ impl<Ctx> Graph<Ctx> {
                     });
                 }
                 Dispatch::Join
-            } else if edge.mode() == EdgeMode::Foreach {
-                Dispatch::PerInputScope
             } else {
-                Dispatch::Shared
+                edge.mode().task_dispatch()
             };
             plans.push(Successor {
                 dst: edge.dst(),
@@ -198,7 +196,7 @@ impl<Ctx> Graph<Ctx> {
                     .subgraph_path(edge.dst())
                     .expect("validated edge destination"),
                 inputs,
-                dispatch: Dispatch::Shared,
+                dispatch: edge.mode().task_dispatch(),
             });
         }
         Ok(plans)
@@ -276,7 +274,7 @@ impl<Ctx> Graph<Ctx> {
         Some(names)
     }
 
-    /// 静态校验：元数据非空、子图归属与 foreach 边界合法、Event 触发声明一致且无入边、
+    /// 静态校验：元数据非空、子图归属与 `->+` 边界合法、Event 触发声明一致且无入边、
     /// success 子图无环、failure 回边不自环。
     fn validate(&self) -> Result<(), String> {
         if self.workflow_id.trim().is_empty() {
@@ -385,6 +383,15 @@ impl<Ctx> Graph<Ctx> {
             }
         }
         Ok(())
+    }
+}
+
+impl EdgeMode {
+    fn task_dispatch(self) -> Dispatch {
+        match self {
+            Self::Direct | Self::SharedExpand => Dispatch::Shared,
+            Self::IsolatedExpand => Dispatch::PerInputScope,
+        }
     }
 }
 

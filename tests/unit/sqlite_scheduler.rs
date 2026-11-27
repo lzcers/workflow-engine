@@ -98,14 +98,12 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
             total => Sum,
         }
         edges {
-            start -> worker |> |output| vec![*output, *output + 10],
+            start ->* worker |> |output| vec![*output, *output + 10],
             start -> summary,
-            worker -> collect |> |output| vec![json!({"worker": output})],
-            summary -> collect |> |output| vec![json!({"summary": output})],
-            collect -> total |> |output: &Value| vec![
-                serde_json::from_value::<Collected>(output.clone())
-                    .expect("JOIN contains both worker outputs and the summary"),
-            ],
+            worker -> collect |> |output| json!({"worker": output}),
+            summary -> collect |> |output| json!({"summary": output}),
+            collect -> total |> |output: &Value| serde_json::from_value::<Collected>(output.clone())
+                .expect("JOIN contains both worker outputs and the summary"),
         }
     }
     .unwrap();
@@ -257,8 +255,8 @@ async fn nested_fanout_preserves_each_parent_and_single_input_successor() {
             c => AddOne,
         }
         edges {
-            start -> a |> |output| vec![*output, *output + 10],
-            a -> b |> |output| vec![*output, *output + 100],
+            start ->* a |> |output| vec![*output, *output + 10],
+            a ->* b |> |output| vec![*output, *output + 100],
             b -> c,
         }
     }
@@ -364,7 +362,7 @@ impl Node<Context> for Item {
 
 #[tokio::test]
 async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
-    for use_foreach in [false, true] {
+    for isolated in [false, true] {
         let database = Database::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
         let pool = match database.pool() {
@@ -375,7 +373,7 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
         let starts: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         let releases: Vec<_> = (0..3).map(|_| Arc::new(Notify::new())).collect();
         macro_rules! report_graph {
-            ($item_node:expr; $($clause:tt)*) => {
+            ($($arrow:tt)+) => {
                 dsl::workflow! {
                     workflow_id: "scoped-reports";
                     title: "独立作用域复用计算与报表";
@@ -388,33 +386,31 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                     }
                     subgraph analysis {
                         nodes {
-                        per_item => $item_node,
-                        worker => AddOne,
-                        collect => JoinNode,
-                        report => Sum,
+                            per_item => Item,
+                            worker => AddOne,
+                            collect => JoinNode,
+                            report => Sum,
                         }
                     }
                     edges {
                         start -> source_a,
-                        start -> source_b |> |output| vec![*output + 10],
-                        start -> source_c |> |output| vec![*output + 20],
-                        source_a -> analysis.per_item $($clause)*,
-                        source_b -> analysis.per_item $($clause)*,
-                        source_c -> analysis.per_item $($clause)*,
+                        start -> source_b |> |output| *output + 10,
+                        start -> source_c |> |output| *output + 20,
+                        source_a $($arrow)+ analysis.per_item,
+                        source_b $($arrow)+ analysis.per_item,
+                        source_c $($arrow)+ analysis.per_item,
                         analysis.per_item -> analysis.worker,
-                        analysis.per_item -> analysis.collect |> |output| vec![json!({"summary": output})],
-                        analysis.worker -> analysis.collect |> |output| vec![json!({"worker": [output]})],
-                        analysis.collect -> analysis.report |> |output: &Value| vec![
-                            serde_json::from_value::<Collected>(output.clone()).unwrap(),
-                        ],
+                        analysis.per_item -> analysis.collect |> |output| json!({"summary": output}),
+                        analysis.worker -> analysis.collect |> |output| json!({"worker": [output]}),
+                        analysis.collect -> analysis.report |> |output: &Value| serde_json::from_value::<Collected>(output.clone()).unwrap(),
                     }
                 }
             };
         }
-        let graph = if use_foreach {
-            report_graph!(Item; foreach)
+        let graph = if isolated {
+            report_graph!(->+)
         } else {
-            report_graph!(Item; |> |output| output.clone())
+            report_graph!(->*)
         }
         .unwrap();
         let graph = Arc::new(graph);
@@ -550,20 +546,20 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
             subgraph analysis {
                 nodes { worker => AddOne, collect => JoinNode, report => Sum }
                 edges {
-                    worker -> collect |> |output| vec![json!({"worker": [output]})],
-                    collect -> report |> |output: &Value| vec![serde_json::from_value::<Collected>(output.clone()).unwrap()],
+                    worker -> collect |> |output| json!({"worker": [output]}),
+                    collect -> report |> |output: &Value| serde_json::from_value::<Collected>(output.clone()).unwrap(),
                 }
             }
             edges {
-                start -> source_a |> move |output| vec![if fail_source_a { -*output } else { *output }],
-                start -> source_b |> |output| vec![*output + 10],
-                start -> source_c |> |output| vec![*output + 20],
-                source_a -> analysis.collect |> |output| vec![json!({"summary": output[0]})],
-                source_a -> analysis.worker |> |output| output.clone(),
-                source_b -> analysis.worker |> |output| output.clone(),
-                source_b -> analysis.collect |> |output| vec![json!({"summary": output[0]})],
-                source_c -> analysis.collect |> |output| vec![json!({"summary": output[0]})],
-                source_c -> analysis.worker |> |output| output.clone(),
+                start -> source_a |> move |output| if fail_source_a { -*output } else { *output },
+                start -> source_b |> |output| *output + 10,
+                start -> source_c |> |output| *output + 20,
+                source_a -> analysis.collect |> |output| json!({"summary": output[0]}),
+                source_a ->* analysis.worker,
+                source_b ->* analysis.worker,
+                source_b -> analysis.collect |> |output| json!({"summary": output[0]}),
+                source_c -> analysis.collect |> |output| json!({"summary": output[0]}),
+                source_c ->* analysis.worker,
             }
         }
         .unwrap();

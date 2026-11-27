@@ -25,7 +25,7 @@ use crate::backend::task_fixture::TaskSeed;
 use crate::{
     Graph, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, migrate},
-    edge::on_error,
+    edge::{direct, failure_transform},
     task::{SettlementRules, Successor, TaskStore, store::LEASE_DURATION},
 };
 
@@ -144,10 +144,16 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         )
         .node("pending", PendingNode)
         .node("recovery", SuccessNode)
-        .error_edge(on_error("pending", "recovery", |input: &i32, error| {
-            assert!(error.to_string().contains("lease expired"));
-            vec![*input]
-        }))
+        .error_edge(failure_transform(
+            "pending",
+            "recovery",
+            direct(),
+            |_, _| true,
+            |input: &i32, error| {
+                assert!(error.to_string().contains("lease expired"));
+                *input
+            },
+        ))
         .build()
         .unwrap(),
     );

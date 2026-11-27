@@ -26,7 +26,7 @@ let _ = workflow!(
     edges { a -> b, }
 );
 ```
-转换闭包的返回值也必须匹配目标节点输入：
+直接边的目标输入为数字时，转换闭包返回数字列表会编译失败：
 ```compile_fail
 use workflow_engine::{Node, NodeError, workflow};
 struct Number;
@@ -45,7 +45,7 @@ let _ = workflow!(
         #[title = "目标"]
         b => Number,
     }
-    edges { a -> b |> |_| vec![String::from("wrong type")], }
+    edges { a -> b |> |_| vec![1_i32], }
 );
 ```
 同一属性不能重复声明：

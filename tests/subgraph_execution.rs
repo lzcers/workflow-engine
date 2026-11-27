@@ -47,21 +47,21 @@ fn nested_graph(context: Context) -> Graph<Context> {
             subgraph indicators {
                 nodes { left => pass::<i32>(), right => pass::<i32>(), joined => JoinNode }
                 edges {
-                    left -> joined |> |value| vec![json!({"left": value})],
-                    right -> joined |> |value| vec![json!({"right": value})],
+                    left -> joined |> |value| json!({"left": value}),
+                    right -> joined |> |value| json!({"right": value}),
                 }
             }
             edges {
                 daily -> indicators.left,
                 daily -> indicators.right,
-                daily -> joined |> |value| vec![json!({"daily": value})],
-                indicators.joined -> joined |> |value| vec![json!({"indicators": value})],
+                daily -> joined |> |value| json!({"daily": value}),
+                indicators.joined -> joined |> |value| json!({"indicators": value}),
                 joined -> report,
             }
         }
         edges {
-            start -> analysis.daily foreach,
-            analysis.report -> collect |> |value| vec![json!({"reports": value})],
+            start ->+ analysis.daily,
+            analysis.report -> collect |> |value| json!({"reports": value}),
             collect -> finish,
         }
     }
@@ -238,7 +238,7 @@ async fn nested(url: &str) {
         Some(direct_scopes[0].scope_id)
     );
 }
-async fn entry_and_foreach(url: &str) {
+async fn entry_and_isolated_expansion(url: &str) {
     let engine = Engine::new(url).await.unwrap();
     let (results, mut receiver) = mpsc::unbounded_channel();
     let graph = workflow! {
@@ -250,16 +250,16 @@ async fn entry_and_foreach(url: &str) {
             nodes {daily=>pass::<i32>()}
             subgraph signals {
                 nodes {mfi=>pass::<i32>(),joined=>JoinNode,report=>pass::<Value>()}
-                edges {mfi->joined |> |value|vec![json!({"mfi":value})], joined->report,}
+                edges {mfi->joined |> |value|json!({"mfi":value}), joined->report,}
             }
             edges {
                 daily->signals.mfi,
-                daily->signals.joined |> |value|vec![json!({"daily":value})],
+                daily->signals.joined |> |value|json!({"daily":value}),
             }
         }
         edges {
-            start->batch.daily foreach,
-            start->batch.daily foreach,
+            start ->+ batch.daily,
+            start ->+ batch.daily,
             batch.signals.report->outside,
         }
     }
@@ -277,7 +277,7 @@ async fn entry_and_foreach(url: &str) {
         outputs
     })
     .await
-    .expect("parallel foreach edges must create independent invocations");
+    .expect("parallel ->+ edges must create independent invocations");
     for (task, value) in outputs {
         assert_eq!(task.scope_id, None);
         assert_eq!(value["daily"], value["mfi"]);
@@ -320,9 +320,9 @@ async fn waits_for_later_upstream_tasks(url: &str) {
             edges { prepare -> worker, }
         }
         edges {
-            start -> batch.worker |> |_| vec![1],
-            start -> batch.prepare |> |_| vec![2],
-            batch.worker -> joined |> |value| vec![json!({"values": value})],
+            start -> batch.worker |> |_| 1,
+            start -> batch.prepare |> |_| 2,
+            batch.worker -> joined |> |value| json!({"values": value}),
             joined -> finish,
         }
     }
@@ -342,7 +342,7 @@ async fn waits_for_later_upstream_tasks(url: &str) {
         edges {
             start -> batch.worker,
             start -> batch.prepare,
-            batch.worker -> joined |> |value| vec![json!({"values": value})],
+            batch.worker -> joined |> |value| json!({"values": value}),
             joined -> finish,
         }
     }
@@ -415,15 +415,18 @@ async fn shared_store_uses_each_graphs_join_rules(url: &str) {
             .node(entry, pass::<Vec<i32>>())
             .node("joined", JoinNode)
             .node("finish", pass::<Value>())
-            .edge(workflow_engine::graph::map(
+            .edge(workflow_engine::graph::success_transform(
                 entry,
                 "joined",
+                workflow_engine::graph::shared_expand(),
+                |_| true,
                 |values: &Vec<i32>| values.iter().map(|v| json!({"value": v})).collect(),
             ))
-            .edge(workflow_engine::graph::map(
+            .edge(workflow_engine::graph::success(
                 "joined",
                 "finish",
-                |value: &Value| vec![value.clone()],
+                workflow_engine::graph::direct::<Value>(),
+                |_| true,
             ))
             .build()
             .unwrap();
@@ -461,7 +464,7 @@ async fn sqlite_nested_scopes_and_entry_correlation() {
     let path = std::env::temp_dir().join(format!("subgraph-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}", path.display());
     nested(&url).await;
-    entry_and_foreach(&url).await;
+    entry_and_isolated_expansion(&url).await;
     recover_nested(&url).await;
     waits_for_later_upstream_tasks(&url).await;
     retry_and_recovery_join(&url).await;
@@ -475,7 +478,7 @@ async fn postgres_nested_scopes_and_entry_correlation() {
         return;
     };
     nested(&url).await;
-    entry_and_foreach(&url).await;
+    entry_and_isolated_expansion(&url).await;
     recover_nested(&url).await;
     waits_for_later_upstream_tasks(&url).await;
     retry_and_recovery_join(&url).await;
@@ -531,9 +534,9 @@ async fn retry_and_recovery_join(url: &str) {
         }
         edges {
             prepare -> work,
-            work -> prepare on_error |_, _| vec![1],
-            work -> joined on_error |_, _| vec![json!({"recovery": true})],
-            work -> joined |> |value| vec![json!({"work": value})],
+            work -> prepare on_error |> |_, _| 1,
+            work -> joined on_error |> |_, _| json!({"recovery": true}),
+            work -> joined |> |value| json!({"work": value}),
             joined -> finish,
         }
     }

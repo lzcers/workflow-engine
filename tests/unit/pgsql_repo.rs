@@ -271,7 +271,7 @@ async fn succeed_and_enqueue_settles_and_fans_out_atomically() {
     assert!(settled.lease_until.is_none());
     reject_stale_writes(&repo, rules, &source).await;
 
-    // 同一目标的普通跨入 map 共享实例，foreach 的元素建立独立实例。
+    // 同一目标的共享展开复用实例，独立展开为每个元素创建实例。
     assert_eq!(rows.len(), 5);
     assert_eq!(source.run_id, source.task_id);
     assert!(rows.iter().all(|task| task.run_id == source.run_id));
@@ -300,7 +300,7 @@ async fn normal_fanout_creates_each_input_independently() {
     let Some(database) = connect_test().await else {
         return;
     };
-    for (case, (foreach, count)) in [(false, 2), (true, 0), (true, 1), (true, 3)]
+    for (case, (isolated, count)) in [(false, 2), (true, 0), (true, 1), (true, 3)]
         .into_iter()
         .enumerate()
     {
@@ -333,12 +333,12 @@ async fn normal_fanout_creates_each_input_independently() {
                 .find(|task| task.task_id == root.task_id)
                 .unwrap();
             let inputs: Vec<_> = (0..count).map(|item| json!({"item": item})).collect();
-            let mut fanout = if foreach {
+            let mut fanout = if isolated {
                 scoped_plan("images.image_generate", &["images"], inputs.clone())
             } else {
                 plan("image_generate", inputs.clone())
             };
-            if foreach {
+            if isolated {
                 fanout.dispatch = Dispatch::PerInputScope;
             }
             repo.settle_success(source, &json!({}), &[fanout], graph.settlement_rules())
@@ -353,10 +353,10 @@ async fn normal_fanout_creates_each_input_independently() {
             for (task, input) in generated.iter().zip(&inputs) {
                 assert_eq!(&task.input, input);
                 assert_eq!(task.run_id, root.run_id);
-                assert_eq!(task.scope_id.is_some(), foreach);
+                assert_eq!(task.scope_id.is_some(), isolated);
                 assert!(!previous.contains(&task.task_id));
             }
-            if foreach {
+            if isolated {
                 let scopes: std::collections::HashSet<_> =
                     generated.iter().map(|task| task.scope_id).collect();
                 assert_eq!(scopes.len(), count);

@@ -14,7 +14,6 @@ mod keyword {
     syn::custom_keyword!(nodes);
     syn::custom_keyword!(edges);
     syn::custom_keyword!(subgraph);
-    syn::custom_keyword!(foreach);
     syn::custom_keyword!(on_error);
     syn::custom_keyword!(when);
     syn::custom_keyword!(when_error);
@@ -67,23 +66,21 @@ impl NodePath {
 
 pub struct Edge {
     pub source: NodePath,
+    pub arrow: Arrow,
     pub target: NodePath,
-    pub clause: EdgeClause,
+    pub route: Route,
+    pub transform: Option<Expr>,
 }
 
-pub enum EdgeClause {
-    Passthrough,
-    Map(Expr),
-    Foreach,
-    OnError(Expr),
-    When {
-        condition: Expr,
-        transform: Option<Expr>,
-    },
-    WhenError {
-        condition: Expr,
-        transform: Option<Expr>,
-    },
+pub enum Arrow {
+    Direct,
+    SharedExpand,
+    IsolatedExpand,
+}
+
+pub enum Route {
+    Success(Option<Expr>),
+    Failure(Option<Expr>),
 }
 
 impl Parse for Workflow {
@@ -180,51 +177,48 @@ fn transform(input: ParseStream) -> Result<Option<Expr>> {
     Ok(Some(input.parse()?))
 }
 
+fn condition(input: ParseStream) -> Result<Expr> {
+    let body;
+    parenthesized!(body in input);
+    let expr = body.parse()?;
+    if !body.is_empty() {
+        return Err(body.error("expected one condition expression"));
+    }
+    Ok(expr)
+}
+
 impl Parse for Edge {
     fn parse(input: ParseStream) -> Result<Self> {
         let source = input.parse()?;
         input.parse::<Token![->]>()?;
-        let target = input.parse()?;
-        let clause = if input.peek(keyword::foreach) {
-            input.parse::<keyword::foreach>()?;
-            EdgeClause::Foreach
-        } else if input.peek(keyword::on_error) {
-            input.parse::<keyword::on_error>()?;
-            EdgeClause::OnError(input.parse()?)
-        } else if input.peek(keyword::when) || input.peek(keyword::when_error) {
-            let is_error = input.peek(keyword::when_error);
-            if is_error {
-                input.parse::<keyword::when_error>()?;
-            } else {
-                input.parse::<keyword::when>()?;
-            }
-            let body;
-            parenthesized!(body in input);
-            let condition = body.parse()?;
-            if !body.is_empty() {
-                return Err(body.error("expected one condition expression"));
-            }
-            let transform = transform(input)?;
-            if is_error {
-                EdgeClause::WhenError {
-                    condition,
-                    transform,
-                }
-            } else {
-                EdgeClause::When {
-                    condition,
-                    transform,
-                }
-            }
-        } else if let Some(expr) = transform(input)? {
-            EdgeClause::Map(expr)
+        let arrow = if input.peek(Token![*]) {
+            input.parse::<Token![*]>()?;
+            Arrow::SharedExpand
+        } else if input.peek(Token![+]) {
+            input.parse::<Token![+]>()?;
+            Arrow::IsolatedExpand
         } else {
-            EdgeClause::Passthrough
+            Arrow::Direct
+        };
+        let target = input.parse()?;
+        let route = if input.peek(keyword::on_error) {
+            input.parse::<keyword::on_error>()?;
+            Route::Failure(None)
+        } else if input.peek(keyword::when_error) {
+            input.parse::<keyword::when_error>()?;
+            Route::Failure(Some(condition(input)?))
+        } else if input.peek(keyword::when) {
+            input.parse::<keyword::when>()?;
+            Route::Success(Some(condition(input)?))
+        } else {
+            Route::Success(None)
         };
         Ok(Self {
             source,
+            arrow,
             target,
-            clause,
+            route,
+            transform: transform(input)?,
         })
     }
 }

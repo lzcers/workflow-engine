@@ -54,12 +54,12 @@ subgraph analysis {
     nodes { daily => DailyNode, signal => SignalNode, report_join => JoinNode, report => ReportNode }
     edges {
         daily -> signal,
-        daily -> report_join |> |bars| vec![json!({ "bars": bars })],
-        signal -> report_join |> |signals| vec![json!({ "signals": signals })],
+        daily -> report_join |> |bars| json!({ "bars": bars }),
+        signal -> report_join |> |signals| json!({ "signals": signals }),
         report_join -> report,
     }
 }
-edges { etfs -> analysis.daily foreach }
+edges { etfs ->+ analysis.daily }
 ```
 
 跨边界边直接引用真实节点的完整点路径。子图可以嵌套；例如内层 `analysis.detail` 的
@@ -70,10 +70,19 @@ edges { etfs -> analysis.daily foreach }
 入口任务。根作用域为 NULL。进入子图创建实例，内部继承实例，退出时恢复目标层的父实例；
 输出立即触发普通后继，不等待整个子图完成。重试及进程恢复沿用已有实例。
 
-同一来源任务一次结算中的普通跨入边共享目标子图实例，不同来源任务不会自动合并。
-`foreach` 将源输出 `Vec<T>` 逐项传给目标，要求跨入显式子图，每个元素建立独立实例；
-不同 foreach 边不按下标隐式配对。`map` 只转换或扇出数据，不为每条输入单独分组。
-空数组不创建任务，`foreach` 不直接指向 JOIN。
+| 箭头 | 分发给目标的输入 | 收到空列表时 |
+| --- | --- | --- |
+| `->` | 整份传递一个值，包括列表 | 传递一份 `[]` |
+| `->*` | 展开 `Vec<T>`，每项作为共享目标作用域内的一份输入 | 零份输入 |
+| `->+` | 展开 `Vec<T>`，每项进入一个独立的子图实例 | 零份输入 |
+
+三种箭头都可以在目标后写 `|> f`。引擎先判断条件，再对整份值调用一次 `f`，最后按箭头分发结果。
+成功边读取源节点的输出，可加 `when(pred)`。失败边用 `on_error` 或 `when_error(pred)` 选择，
+条件和转换闭包接收源节点的原始输入与错误。例如 `fetch ->+ recovery.retry on_error |> retry_items`
+为 `retry_items` 返回的每一项启动一个恢复子图实例。
+
+同一来源任务一次结算中的 `->` 和 `->*` 跨入同一子图时共享实例。`->+` 的目标必须位于新进入的显式子图内，
+且不能直接指向 JOIN。上例中，每只 ETF 的行情与信号在自己的 `analysis` 实例内汇合。
 
 JOIN 在同一实例内聚合来源，结算时按作用域入口筛选本次调用的有效前驱。边界路由、scope 创建、
 源任务结算和后继入队在同一事务中完成。子图定义通过 `GraphDescription.subgraphs` 输出，
@@ -189,8 +198,8 @@ let workflow = engine.make(graph);
 
 - **节点不携带名字**：节点名作为 `Graph` 的 `HashMap` key 在注册实例时外部绑定，同一节点
   实现可复用、可在不同名字下注册。
-- **编译期类型接线**：DSL 边经类型检查版构造函数装配，由 trait solver 强制「转换函数入参 ==
-  上游节点 `Out`、出参 == 下游节点 `In`」，类型错线在编译期即报错，而非运行时 serde 错误。
+- **编译期类型接线**。目标输入为 `T` 时，`->` 要求分发的值为 `T`，`->*` 与 `->+` 要求 `Vec<T>`。
+  使用 `|>` 时校验转换的返回类型，省略时直接校验成功输出或失败输入的类型。
 - **at-least-once 结算**：成功/失败结算与后继入队在同一事务原子提交；事务失败整体回滚并
   释放租约，任务下一轮被重认领（重执行一次的代价即引擎既有的 at-least-once 语义），杜绝
   「已成功但后继从未入队」的静默停摆。
@@ -255,7 +264,7 @@ workflow-engine = { path = "../workflow-engine", default-features = false, featu
 
 构建一张图有两种方式（见 [`graph`](src/graph) 和 [`dsl`](src/dsl.rs)）：
 
-1. 命令式 `Graph::<Ctx>::builder(workflow_id, title, ctx).node(..).edge(..)…build()`（搭配 `graph::{passthrough, when, map, foreach, on_error, when_error}`）；
+1. 命令式 `Graph::<Ctx>::builder(workflow_id, title, ctx).node(..).edge(..)…build()`。用 `success`、`failure` 或对应的 `success_transform`、`failure_transform` 建边，通过 `direct()`、`shared_expand()`、`isolated_expand()` 选择箭头。
 2. 声明式 `dsl::workflow!(workflow_id: id; title: title; context: ctx; nodes { … } edges { … })`。
 
 图直接持有工作流身份、标题、上下文与构造完成的节点。
@@ -306,7 +315,7 @@ let description = graph.describe();
 
 节点可通过 `.node(...)`、`.node_with_description(...)`、`.node_in_subgraph_with_key(...)` 或 DSL 注册；重复节点名在 `build()` 时返回错误。
 成功边和失败边分别以 `kind: "success"` / `"failure"` 标识，平行边独立保留。
-每条边通过 `mode` 枚举标记路由模式：`passthrough`（透传，含带条件的透传边）、`map`（显式转换）或 `foreach`（逐项进入独立子图作用域，仅成功边）。
+每条边的 `mode` 按箭头分别为 `direct`、`shared_expand` 或 `isolated_expand`，`has_transform` 标记是否带有 `|>`。
 边 ID 为 `success:0`、`failure:0` 等当前图内编号；注册顺序变化后不保证跨版本稳定。
 工作流身份和标题只在图中定义；应用注册表直接索引完整的图描述，不重复指定身份和名称。
 运行状态仍由任务存储管理，无需另外维护一份画布拓扑。

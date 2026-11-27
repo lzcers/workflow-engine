@@ -32,72 +32,101 @@ impl Node<Ctx> for Values {
 }
 
 #[test]
-fn foreach_preserves_scope_strategy_when_target_matches_a_normal_map() {
+fn arrows_route_collections_as_one_input_or_as_individual_items() {
+    use serde_json::json;
     let graph = workflow! {
-        workflow_id: "foreach";
-        title: "Foreach";
+        workflow_id: "collection-routes";
+        title: "Collection routes";
         context: Ctx;
-        nodes {
-            source => Values,
-        }
-        subgraph analysis {
-            nodes { destination => PassThrough }
-        }
+        nodes { source => Values, batch => Values }
+        subgraph analysis { nodes { item => PassThrough } }
         edges {
-            source -> analysis.destination |> |items| items.clone(),
-            source -> analysis.destination foreach,
-            analysis.destination -> source on_error |input, _| vec![vec![input.clone()]],
+            source -> batch,
+            source ->* analysis.item,
+            source ->+ analysis.item,
+            source ->+ analysis.item when(|items| items.len() > 1) |>
+                |items| items.iter().rev().cloned().collect(),
+            source ->* analysis.item on_error,
+            source ->+ analysis.item when_error(|_, err| err.is_retryable()) |>
+                |items, _| items.iter().rev().cloned().collect(),
         }
     }
     .unwrap();
 
     let description = graph.describe();
-    assert_eq!(description.edges[0].mode, EdgeMode::Map);
-    assert_eq!(description.edges[1].mode, EdgeMode::Foreach);
-    assert_eq!(description.edges[2].mode, EdgeMode::Map);
+    assert!(!description.edges[2].has_transform);
+    assert!(description.edges[3].has_transform);
+    let modes: Vec<_> = description.edges.iter().map(|edge| edge.mode).collect();
     assert_eq!(
-        serde_json::to_value(description).unwrap()["edges"][1]["mode"],
-        "foreach"
+        modes,
+        [
+            EdgeMode::Direct,
+            EdgeMode::SharedExpand,
+            EdgeMode::IsolatedExpand,
+            EdgeMode::IsolatedExpand,
+            EdgeMode::SharedExpand,
+            EdgeMode::IsolatedExpand,
+        ]
     );
-    for input in [serde_json::json!([1]), serde_json::json!([1, 2, 3])] {
-        let plans = graph.plan_success("source", &input).unwrap();
-        assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].dispatch, Dispatch::Shared);
-        assert_eq!(plans[1].dispatch, Dispatch::PerInputScope);
-        for plan in plans {
-            assert_eq!(plan.dst, "analysis.destination");
-            assert_eq!(graph.task_type_of(plan.dst), Some(TaskType::Normal));
-            assert_eq!(&plan.inputs, input.as_array().unwrap());
-        }
+    assert_eq!(
+        serde_json::to_value(modes).unwrap(),
+        json!([
+            "direct",
+            "shared_expand",
+            "isolated_expand",
+            "isolated_expand",
+            "shared_expand",
+            "isolated_expand"
+        ])
+    );
+    let plans = graph.plan_success("source", &json!([1, 2])).unwrap();
+    assert_eq!(plans.len(), 4);
+    assert_eq!(plans[0].inputs, [json!([1, 2])]);
+    assert_eq!(plans[0].dst, "batch");
+    for plan in &plans[1..] {
+        assert_eq!(plan.dst, "analysis.item");
     }
-    assert!(
-        graph
-            .plan_success("source", &serde_json::json!([]))
-            .unwrap()
-            .is_empty()
-    );
-    let failure = graph
-        .plan_failure(
-            "analysis.destination",
-            &serde_json::json!(1),
-            &NodeError::retryable("retry"),
-        )
+    assert_eq!(plans[1].dispatch, Dispatch::Shared);
+    assert_eq!(plans[1].inputs, [json!(1), json!(2)]);
+    assert_eq!(plans[2].dispatch, Dispatch::PerInputScope);
+    assert_eq!(plans[2].inputs, plans[1].inputs);
+    assert_eq!(plans[3].dispatch, Dispatch::PerInputScope);
+    assert_eq!(plans[3].inputs, [json!(2), json!(1)]);
+
+    let empty = graph.plan_success("source", &json!([])).unwrap();
+    assert_eq!(empty.len(), 1);
+    assert_eq!(empty[0].inputs, [json!([])]);
+    let singleton = graph.plan_success("source", &json!([1])).unwrap();
+    assert_eq!(singleton.len(), 3);
+
+    let retry = graph
+        .plan_failure("source", &json!([1, 2]), &NodeError::retryable("retry"))
         .unwrap();
-    assert_eq!(failure[0].dispatch, Dispatch::Shared);
+    assert_eq!(retry.len(), 2);
+    assert_eq!(retry[0].dispatch, Dispatch::Shared);
+    assert_eq!(retry[0].inputs, [json!(1), json!(2)]);
+    assert_eq!(retry[1].dispatch, Dispatch::PerInputScope);
+    assert_eq!(retry[1].inputs, [json!(2), json!(1)]);
+    let permanent = graph
+        .plan_failure("source", &json!([1, 2]), &NodeError::permanent("stop"))
+        .unwrap();
+    assert_eq!(permanent.len(), 1);
+    assert_eq!(permanent[0].dispatch, Dispatch::Shared);
 }
 
 #[test]
-fn foreach_rejects_join_targets() {
-    let graph = Graph::builder("foreach-join", "Foreach JOIN", Ctx)
-        .node("source", Values)
-        .node("join", workflow_engine::JoinNode)
-        .edge(workflow_engine::graph::foreach::<serde_json::Value>(
-            "source", "join",
-        ))
-        .build();
+fn isolated_expansion_rejects_join_targets() {
+    let graph = workflow! {
+        workflow_id: "isolated-join";
+        title: "Isolated JOIN";
+        context: Ctx;
+        nodes { source => Values }
+        subgraph analysis { nodes { join => workflow_engine::JoinNode } }
+        edges { source ->+ analysis.join }
+    };
     assert_eq!(
         graph.err().as_deref(),
-        Some("foreach edge must not target join node join")
+        Some("->+ edge must not target join node analysis.join")
     );
 }
 
@@ -229,13 +258,13 @@ fn event_nodes_reject_incoming_success_and_failure_edges() {
             event => EventNode(Some(cron_trigger())),
         }
         edges {
-            source -> event on_error |input, _| vec![input.clone()],
+            source -> event on_error,
         }
     };
     assert!(failure.is_err());
 }
 
-/// `on_error fn`（无条件）/ `when_error(cond) |> fn`（条件）失败边 DSL 语法：都能展开并规划。
+/// `on_error |> fn`（无条件）/ `when_error(cond) |> fn`（条件）失败边 DSL 语法：都能展开并规划。
 /// 节点名与边端点均为标识符（类型级 key），经 checked 构造函数做编译期类型接线校验。
 #[test]
 fn failure_edge_dsl_syntax() {
@@ -251,10 +280,10 @@ fn failure_edge_dsl_syntax() {
             c => PassThrough,
         }
         edges {
-            a -> b |> |_: &serde_json::Value| vec![serde_json::json!(1)],
-            b -> a on_error |_: &serde_json::Value, _: &NodeError| vec![serde_json::json!(2)],
+            a -> b |> |_: &serde_json::Value| serde_json::json!(1),
+            b -> a on_error |> |_: &serde_json::Value, _: &NodeError| serde_json::json!(2),
             b -> c when_error(|_: &serde_json::Value, err: &NodeError| err.is_retryable()) |>
-                |input: &serde_json::Value, _: &NodeError| vec![input.clone()],
+                |input: &serde_json::Value, _: &NodeError| input.clone(),
         }
     )
     .unwrap();
@@ -312,7 +341,7 @@ async fn infers_instance_and_context_types_and_evaluates_each_expression_once() 
             destination => destination,
         }
         edges {
-            source -> destination when(|output| *output > 0) |> |output| vec![*output + 1],
+            source -> destination when(|output| *output > 0) |> |output| *output + 1,
             destination -> source when_error(|input, error| *input > 0 && error.is_retryable()),
         }
     )
@@ -476,13 +505,13 @@ fn interleaved_subgraph_declarations_preserve_construction_order() {
 }
 
 #[test]
-fn foreach_requires_an_explicit_subgraph_boundary() {
+fn isolated_expansion_requires_an_explicit_subgraph_boundary() {
     let result = workflow! {
         workflow_id: "unbounded";
         title: "Unbounded";
         context: Ctx;
         nodes { source => Values, target => PassThrough }
-        edges { source -> target foreach }
+        edges { source ->+ target }
     };
     assert!(result.err().unwrap().contains("must enter a new subgraph"));
 }

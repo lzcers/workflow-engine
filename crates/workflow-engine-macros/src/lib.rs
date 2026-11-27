@@ -4,14 +4,14 @@ mod parse;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use std::collections::HashMap;
 use syn::{
     Attribute, Expr, Ident, Meta, Path, Result, Token,
     parse::{Parse, ParseStream},
 };
 
-use parse::{EdgeClause, NodePath, Region, RegionItem, Workflow};
+use parse::{Arrow, NodePath, Region, RegionItem, Route, Workflow};
 
 struct Input {
     engine: Path,
@@ -168,57 +168,41 @@ fn wire(
     for edge in &region.edges {
         let source = resolve(&edge.source, parent, keys)?;
         let target = resolve(&edge.target, parent, keys)?;
-        let (failure, constructor) = match &edge.clause {
-            EdgeClause::Passthrough => (
-                false,
-                quote! { #engine::dsl::passthrough_checked(#source, #target) },
-            ),
-            EdgeClause::Map(transform) => (
-                false,
-                quote! { #engine::dsl::map_checked(#source, #target, #transform) },
-            ),
-            EdgeClause::Foreach => (
-                false,
-                quote! { #engine::dsl::foreach_checked(#source, #target) },
-            ),
-            EdgeClause::OnError(transform) => (
-                true,
-                quote! { #engine::dsl::on_error_checked(#source, #target, #transform) },
-            ),
-            EdgeClause::When {
-                condition,
-                transform,
-            } => (
-                false,
-                match transform {
-                    Some(transform) => {
-                        quote! { #engine::dsl::when_map_checked(#source, #target, #condition, #transform) }
-                    }
-                    None => quote! { #engine::dsl::when_checked(#source, #target, #condition) },
+        let arrow = match edge.arrow {
+            Arrow::Direct => quote! { #engine::dsl::direct() },
+            Arrow::SharedExpand => quote! { #engine::dsl::shared_expand() },
+            Arrow::IsolatedExpand => quote! { #engine::dsl::isolated_expand() },
+        };
+        let (method, constructor, condition) = match &edge.route {
+            Route::Success(condition) => (
+                quote! { edge },
+                if edge.transform.is_some() {
+                    quote! { success_transform_checked }
+                } else {
+                    quote! { success_checked }
                 },
+                condition
+                    .as_ref()
+                    .map_or_else(|| quote! { |_| true }, ToTokens::to_token_stream),
             ),
-            EdgeClause::WhenError {
-                condition,
-                transform,
-            } => (
-                true,
-                match transform {
-                    Some(transform) => {
-                        quote! { #engine::dsl::when_error_map_checked(#source, #target, #condition, #transform) }
-                    }
-                    None => {
-                        quote! { #engine::dsl::when_error_checked(#source, #target, #condition) }
-                    }
+            Route::Failure(condition) => (
+                quote! { error_edge },
+                if edge.transform.is_some() {
+                    quote! { failure_transform_checked }
+                } else {
+                    quote! { failure_checked }
                 },
+                condition
+                    .as_ref()
+                    .map_or_else(|| quote! { |_, _| true }, ToTokens::to_token_stream),
             ),
         };
-        let method = if failure {
-            format_ident!("error_edge")
-        } else {
-            format_ident!("edge")
-        };
-        statements
-            .extend(quote! { let __workflow_builder = __workflow_builder.#method(#constructor); });
+        let transform = &edge.transform;
+        statements.extend(quote! {
+            let __workflow_builder = __workflow_builder.#method(
+                #engine::dsl::#constructor(#source, #target, #arrow, #condition, #transform)
+            );
+        });
     }
     Ok(())
 }
