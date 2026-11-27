@@ -8,7 +8,7 @@ use crate::backend::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, ROW_COLS};
 use crate::backend::task_fixture::{TaskSeed, join_plan, plan, scoped_plan};
 use crate::error::StorageError;
 use crate::graph::{
-    Graph,
+    Graph, MergeMode,
     TaskType::{Event, Join, Normal},
 };
 use crate::task::{Dispatch, MAX_ATTEMPTS, SettlementRules, Successor, TaskStore};
@@ -380,10 +380,10 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
     let repo = PgTaskRepo::new(database.pool().clone());
     seed(&repo, graph.as_ref(), "source", Some(42)).await;
     seed(&repo, graph.as_ref(), "source", Some(42)).await;
-    // Both keys arrive in one plan. A per-input INSERT or UPDATE exposes a partial contribution.
+    // Multiple inputs in one plan must merge in a single INSERT/UPDATE.
     sqlx::query(
         "ALTER TABLE tasks ADD CHECK (
-            name <> 'collect' OR (input_json->'source') IS NOT DISTINCT FROM (input_json->'extra')
+            name <> 'collect' OR (jsonb_array_length(input_json->'source') % 2 = 0)
         )",
     )
     .execute(database.pool())
@@ -393,13 +393,15 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
     assert_eq!(sources.len(), 2);
     let rules = graph.settlement_rules();
     for (index, source) in sources.iter().enumerate() {
-        let contribution = json!({"source": source.task_id});
+        let contribution = json!(source.task_id);
         repo.settle_success(
             source,
             &contribution,
             &[join_plan(
                 "collect",
-                vec![contribution.clone(), json!({"extra": source.task_id})],
+                "source",
+                MergeMode::Append,
+                vec![contribution.clone(), json!(source.task_id + 100)],
             )],
             rules,
         )
@@ -425,8 +427,12 @@ async fn join_merges_different_parents_and_waits_for_all_tasks() {
     assert_eq!(
         join.input,
         json!({
-            "source": [sources[0].task_id, sources[1].task_id],
-            "extra": [sources[0].task_id, sources[1].task_id],
+            "source": [
+                sources[0].task_id,
+                sources[0].task_id + 100,
+                sources[1].task_id,
+                sources[1].task_id + 100,
+            ],
         })
     );
     let claims = repo.claim_many(workflow_id, 10).await.unwrap();
@@ -506,6 +512,16 @@ async fn fail_and_enqueue_marks_superseded_or_failed_atomically() {
         .into_iter()
         .find(|task| task.task_id == failed.task_id)
         .unwrap();
+    // Seed an active audio_generate in retried.run_id so other_run legitimately stays collecting.
+    repo.seed_task(
+        graph.as_ref(),
+        &TaskSeed {
+            run_id: Some(retried.run_id),
+            ..TaskSeed::new(workflow_id, "audio_generate", json!({}))
+        },
+    )
+    .await
+    .unwrap();
     let mut dependents = Vec::new();
     for (name, run_id, is_join) in [
         ("audio_dependent", Some(failed.run_id), false),
@@ -1020,10 +1036,11 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
         .await
         .unwrap();
     let mut workers = tokio::task::JoinSet::new();
-    for (source, targets, repo) in [
-        (left.clone(), ["join-a", "join-b"], repo.clone()),
+    for (source, key, targets, repo) in [
+        (left.clone(), "left", ["join-a", "join-b"], repo.clone()),
         (
             right.clone(),
+            "right",
             ["join-b", "join-a"],
             PgTaskRepo::new(alternate_pool.clone()),
         ),
@@ -1032,7 +1049,9 @@ async fn concurrent_first_fanins_merge_once_even_with_opposite_successor_order()
         workers.spawn(async move {
             let fanouts: Vec<_> = targets
                 .into_iter()
-                .map(|name| join_plan(name, vec![json!({ source.name.clone(): source.task_id })]))
+                .map(|name| {
+                    join_plan(name, key, MergeMode::Set, vec![json!(source.task_id)])
+                })
                 .collect();
             repo.settle_success(&source, &json!(source.task_id), &fanouts, &rules)
                 .await
@@ -1186,13 +1205,19 @@ async fn scoped_fanout_joins_and_failures_stay_within_their_branch() {
             .find(|task| task.input == json!(item) && task.name == name)
             .unwrap()
     };
-    let contribution = |task: &TaskRecord| Successor {
-        dispatch: Dispatch::Join,
-        ..scoped_plan(
-            "analysis.join",
-            &["analysis"],
-            vec![json!({task.name.rsplit('.').next().unwrap(): task.input})],
-        )
+    let contribution = |task: &TaskRecord| {
+        let key = if task.name == "analysis.left" {
+            "left"
+        } else {
+            "right"
+        };
+        Successor {
+            dispatch: Dispatch::Join {
+                key,
+                merge: MergeMode::Set,
+            },
+            ..scoped_plan("analysis.join", &["analysis"], vec![task.input.clone()])
+        }
     };
     for item in ["a", "b"] {
         let left = branch(item, "analysis.left");

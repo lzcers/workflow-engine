@@ -7,10 +7,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use super::{rows::TaskRow, scope};
-use crate::backend::{
-    BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, ROW_COLS, UPSTREAM_FAILED_ERR, claim_lost,
-};
+use crate::backend::{BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, ROW_COLS, claim_lost};
 use crate::error::StorageError;
+use crate::node::MergeMode;
 use crate::task::{
     Dispatch, JoinRule, MAX_ATTEMPTS, SettlementRules, Successor, TaskStore,
     join::{self, RunScope, RunTask},
@@ -18,6 +17,28 @@ use crate::task::{
     store::{FanoutSource, LEASE_DURATION, merge_join_inputs},
 };
 use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
+
+#[derive(sqlx::FromRow)]
+struct RunTaskRow {
+    task_id: i64,
+    name: String,
+    #[sqlx(try_from = "String")]
+    status: TaskStatus,
+    scope_id: Option<i64>,
+    parent_task_ids: Vec<i64>,
+}
+
+impl From<RunTaskRow> for RunTask {
+    fn from(row: RunTaskRow) -> Self {
+        Self {
+            task_id: row.task_id,
+            name: row.name,
+            status: row.status,
+            scope_id: row.scope_id,
+            parent_task_ids: row.parent_task_ids,
+        }
+    }
+}
 
 impl Database<&mut sqlx::Transaction<'_, sqlx::Postgres>> {
     /// 在宿主事务内创建独立运行，同时建立入口所属的子图作用域。
@@ -164,7 +185,7 @@ async fn enqueue_fanouts_in_tx(
                             .await?;
                     }
                 }
-                Dispatch::Join => {
+                Dispatch::Join { key, merge } => {
                     let scope_id = scope::enter(
                         tx,
                         source.workflow_id,
@@ -175,7 +196,12 @@ async fn enqueue_fanouts_in_tx(
                         Some(&mut entries),
                     )
                     .await?;
-                    collect_join(tx, source, plan, scope_id).await?;
+                    let append_keys = rules
+                        .join_rules
+                        .get(plan.dst)
+                        .map(|rule| rule.append_keys.as_slice())
+                        .unwrap_or(&[]);
+                    collect_join(tx, source, plan, scope_id, append_keys, key, merge).await?;
                 }
             }
         }
@@ -188,6 +214,9 @@ async fn collect_join(
     source: &FanoutSource<'_>,
     plan: &Successor,
     scope_id: Option<i64>,
+    append_keys: &[String],
+    key: &str,
+    merge: MergeMode,
 ) -> Result<(), StorageError> {
     let existing = sqlx::query_as::<_, (i64, Vec<i64>, Value)>(
         "SELECT task_id, parent_task_ids, input_json FROM tasks
@@ -205,7 +234,7 @@ async fn collect_join(
         if !parents.contains(&source.task_id) {
             parents.push(source.task_id);
         }
-        let merged = merge_join_inputs(Some(input), &plan.inputs)?;
+        let merged = merge_join_inputs(Some(input), append_keys, key, merge, &plan.inputs)?;
         sqlx::query(
             "UPDATE tasks SET parent_task_ids=$3, input_json=$4, updated_at=clock_timestamp()
              WHERE workflow_id=$1 AND task_id=$2",
@@ -217,7 +246,7 @@ async fn collect_join(
         .execute(&mut **tx)
         .await?;
     } else {
-        let merged = merge_join_inputs(None, &plan.inputs)?;
+        let merged = merge_join_inputs(None, append_keys, key, merge, &plan.inputs)?;
         insert_task(
             tx,
             source,
@@ -265,13 +294,17 @@ async fn advance_joins(
     if rules.is_empty() {
         return Ok(());
     }
-    let tasks = sqlx::query_as::<_, RunTask>(
-        "SELECT task_id, name, status, scope_id FROM tasks WHERE workflow_id = $1 AND run_id = $2",
+    let tasks: Vec<RunTask> = sqlx::query_as::<_, RunTaskRow>(
+        "SELECT task_id, name, status, scope_id, parent_task_ids FROM tasks
+         WHERE workflow_id = $1 AND run_id = $2",
     )
     .bind(workflow_id)
     .bind(run_id)
     .fetch_all(&mut **tx)
-    .await?;
+    .await?
+    .into_iter()
+    .map(RunTask::from)
+    .collect();
     if !tasks.iter().any(|task| task.status == TaskStatus::Collecting) {
         return Ok(());
     }
@@ -286,17 +319,23 @@ async fn advance_joins(
 
     let transitions = join::advance_joins(&tasks, &scopes, rules);
     if !transitions.failed.is_empty() {
-        sqlx::query(
-            "UPDATE tasks
-             SET status = 'failed', error = $3,
-                 lease_until = NULL, updated_at = clock_timestamp()
-             WHERE workflow_id = $1 AND task_id = ANY($2)",
-        )
-        .bind(workflow_id)
-        .bind(&transitions.failed)
-        .bind(UPSTREAM_FAILED_ERR)
-        .execute(&mut **tx)
-        .await?;
+        let mut by_reason: HashMap<&str, Vec<i64>> = HashMap::new();
+        for (task_id, reason) in transitions.failed {
+            by_reason.entry(reason).or_default().push(task_id);
+        }
+        for (reason, ids) in by_reason {
+            sqlx::query(
+                "UPDATE tasks
+                 SET status = 'failed', error = $3,
+                     lease_until = NULL, updated_at = clock_timestamp()
+                 WHERE workflow_id = $1 AND task_id = ANY($2)",
+            )
+            .bind(workflow_id)
+            .bind(&ids)
+            .bind(reason)
+            .execute(&mut **tx)
+            .await?;
+        }
     }
     if !transitions.ready.is_empty() {
         sqlx::query(

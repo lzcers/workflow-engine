@@ -11,7 +11,7 @@ mod graph_fixture;
 use crate::Database;
 use crate::backend::task_fixture::{TaskSeed, join_plan, plan, scoped_plan};
 use crate::error::StorageError;
-use crate::graph::{Graph, TaskType};
+use crate::graph::{Graph, MergeMode, TaskType};
 use crate::task::{Dispatch, MAX_ATTEMPTS, Successor, TaskStore};
 use crate::{TaskRecord, TaskStatus};
 use TaskType::{Join, Normal};
@@ -310,11 +310,11 @@ async fn settlement_promotes_a_waiting_join_when_the_last_source_emits_no_succes
     assert!(repo.claim_many("deps", 10).await.unwrap().is_empty());
 
     let rules = graph.settlement_rules();
-    let input = json!({"first": 1});
+    let input = json!(1);
     repo.settle_success(
         &claimed[0],
         &input,
-        &[join_plan("child", vec![input.clone()])],
+        &[join_plan("child", "root", MergeMode::Set, vec![input.clone()])],
         rules,
     )
     .await
@@ -336,13 +336,14 @@ async fn settlement_promotes_a_waiting_join_when_the_last_source_emits_no_succes
     let ready = get(&repo, &child).await;
     assert_eq!(ready.status, TaskStatus::Pending);
     assert_eq!(ready.attempt, 0);
-    assert_eq!(ready.input, input);
+    assert_eq!(ready.input, json!({"root": 1}));
     assert_eq!(ready.parent_task_ids, [root.task_id]);
     let claimed = repo.claim_many("deps", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, child.task_id);
     assert_eq!(claimed[0].status, TaskStatus::Running);
-    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Collecting);
+    // `absent` was never created and no upstream is active -> zombie collecting fails cleanly.
+    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Failed);
 
     // A direct JOIN entry starts its own run with the supplied input.
     let entry = repo
@@ -353,7 +354,7 @@ async fn settlement_promotes_a_waiting_join_when_the_last_source_emits_no_succes
     let claimed = repo.claim_many("deps", 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].task_id, entry.task_id);
-    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Collecting);
+    assert_eq!(get(&repo, &missing).await.status, TaskStatus::Failed);
 }
 
 #[tokio::test]
@@ -488,10 +489,20 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         images.push(repo.seed_task(graph, &image).await.unwrap());
     }
 
+    let mut text = new_task("join", "text");
+    text.run_id = Some(1);
+    let text = repo.seed_task(graph, &text).await.unwrap();
+
     let mut wrong_run = new_task("join", "text");
     wrong_run.run_id = Some(2);
     let wrong_run = repo.seed_task(graph, &wrong_run).await.unwrap();
     let mut claimed = repo.claim_many("join", 10).await.unwrap();
+    let text_claim = claimed.remove(
+        claimed
+            .iter()
+            .position(|task| task.task_id == text.task_id)
+            .unwrap(),
+    );
     let wrong_claim = claimed.remove(
         claimed
             .iter()
@@ -513,11 +524,10 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         images.iter().map(|task| task.task_id).collect::<Vec<_>>()
     );
 
-    let contribution = |input| join_plan("collect", vec![input]);
     repo.settle_success(
         &claimed[0],
         &json!("a"),
-        &[contribution(json!({"image": "a"}))],
+        &[join_plan("collect", "image", MergeMode::Append, vec![json!("a")])],
         rules,
     )
     .await
@@ -533,13 +543,13 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
     repo.settle_success(
         &claimed[1],
         &json!("b"),
-        &[contribution(json!({"image": "b"}))],
+        &[join_plan("collect", "image", MergeMode::Append, vec![json!("b")])],
         rules,
     )
     .await
     .unwrap();
     let merged = get(&repo, &join).await;
-    assert_eq!(merged.input, json!({"image": ["a", "b"]}));
+    assert_eq!(merged.input, json!({"image": ["a", "b"], "text": []}));
     assert_eq!(
         merged.parent_task_ids,
         [claimed[0].task_id, claimed[1].task_id]
@@ -549,15 +559,11 @@ async fn join_merges_across_parents_and_waits_for_all_predecessors() {
         "another run cannot satisfy a missing predecessor"
     );
 
-    let mut text = new_task("join", "text");
-    text.run_id = Some(1);
-    let text = repo.seed_task(graph, &text).await.unwrap();
-    let text_claim = repo.claim_many("join", 10).await.unwrap().remove(0);
     assert_eq!(text_claim.task_id, text.task_id);
     repo.settle_success(
         &text_claim,
         &json!("text"),
-        &[contribution(json!({"text": "text"}))],
+        &[join_plan("collect", "text", MergeMode::Set, vec![json!("text")])],
         rules,
     )
     .await
@@ -602,10 +608,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
     .await
     .unwrap();
     for run_id in [Some(1), Some(2), Some(0)] {
-        for input in [
-            json!({"image": "first"}),
-            json!({"image": ["second", "third"]}),
-        ] {
+        for input in [json!("first"), json!("second")] {
             let mut source = new_task("fanin", "image");
             source.run_id = run_id;
             source.task.input = input;
@@ -617,7 +620,9 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
     for source in &sources {
         let contribution = join_plan(
             "collect",
-            vec![source.input.clone(), json!({"image": "tail"})],
+            "image",
+            MergeMode::Append,
+            vec![source.input.clone(), json!("tail")],
         );
         repo.settle_success(source, &source.input, &[contribution], rules)
             .await
@@ -632,7 +637,7 @@ async fn fanin_accumulates_join_inputs_and_isolates_numbered_runs() {
     for join in joins {
         assert_eq!(
             join.input,
-            json!({"image": ["first", "tail", "second", "third", "tail"]})
+            json!({"image": ["first", "tail", "second", "tail"]})
         );
         assert_eq!(join.parent_task_ids.len(), 2);
     }
@@ -922,6 +927,9 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         )
         .await
         .unwrap();
+    let mut other_root = new_task("cascade", "root");
+    other_root.run_id = Some(0);
+    repo.seed_task(graph, &other_root).await.unwrap();
     let other_run = repo
         .seed_task(
             graph,
@@ -998,8 +1006,8 @@ async fn failed_predecessors_cascade_and_late_joins_are_failed_immediately() {
         .unwrap();
     assert_eq!(late.status, TaskStatus::Failed);
     let claims = repo.claim_many("cascade", 10).await.unwrap();
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].task_id, child.task_id);
+    assert_eq!(claims.len(), 2);
+    assert!(claims.iter().any(|task| task.task_id == child.task_id));
 }
 
 #[tokio::test]
@@ -1024,6 +1032,11 @@ async fn cascade_matches_runs_only_for_join_predecessors() {
         let mut targets = Vec::new();
 
         for run_id in runs {
+            if run_id != source_run {
+                let mut other_root = new_task("cascade_runs", "root");
+                other_root.run_id = Some(run_id);
+                repo.seed_task(graph, &other_root).await.unwrap();
+            }
             let mut child = new_task("cascade_runs", "child");
             child.run_id = Some(run_id);
             child.parent_task_ids = vec![root.task_id];
@@ -1472,7 +1485,12 @@ async fn separate_pools_claim_without_duplicates_and_persist_after_reopening() {
             repo.settle_success(
                 source,
                 &source.input,
-                &[join_plan("collect", vec![json!({"worker": source.input})])],
+                &[join_plan(
+                    "collect",
+                    "worker",
+                    MergeMode::Append,
+                    vec![source.input.clone()],
+                )],
                 rules,
             )
             .await

@@ -36,11 +36,11 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 `parent_task_ids` 按贡献顺序记录实际来源，入口为空。普通后继每条输入对应一个新任务。
 任务终态与后继创建在同一事务提交，认领代次阻止重复结算。
 
-成功边向 JOIN 提交 JSON 对象，按对象键合并，同名键的多次贡献累积为数组。
+成功边与 `on_error` 失败边指向 JOIN 时都必须声明强类型槽位（`src -> join::field`），按目标结构体 `#[derive(JoinInput)]` 的槽位模式（单值 `Set` 或 `#[join(collect)]` 数组 `Append`）合入输入对象。
 引擎按 `workflow_id + run_id + scope_id + name` 查找状态为 `collecting` 的 JOIN，合并输入并去重记录来源 ID。
-每次上游结算写完后继后，存储按作用域检查此次运行中仍在收集的 JOIN。前驱就绪时转为 `pending` 并固定输入。租约过期时使用同一输入重试，晚到的成功贡献开启下一次汇合。
-直接提交到 JOIN 的独立运行入口，以及失败边指向 JOIN 时产生的每条后继，均以 `pending` 入队，使用各自的输入执行。
-即使本次没有产生后继，上游结算也可能使 JOIN 就绪。
+每次上游结算写完后继后，存储按作用域检查此次运行中仍在收集的 JOIN：存在失败上游立即级联失败；所有上游终结后，必需前驱均已有有效贡献（`succeeded` 或通过 `on_error` 贡献到本 JOIN 的 `superseded`）时转为 `pending` 并固定输入，若存在未满足的必需前驱则立即转为 `failed`（不遗留僵尸 `collecting`）。租约过期时使用同一输入重试，晚到的成功贡献开启下一次汇合。
+直接提交到 JOIN 的独立运行入口以 `pending` 入队，使用提供的输入执行。
+即使本次没有产生后继，上游结算也可能使 JOIN 就绪或终态失败。
 
 同一 Engine 创建的工作流共享任务存储和连接池。调度器按 workflow_id 认领任务，结算时传入当前图预计算的结算规则与后继列表。
 
@@ -49,13 +49,15 @@ PostgreSQL 和 SQLite 共用 `TaskRecord`、`Task`、`TaskStatus`。业务上下
 子图是 DSL 的静态嵌套结构，包含节点和边，不是一个执行节点：
 
 ```rust,ignore
+#[derive(Serialize, Deserialize, JoinInput)]
+struct ReportInput { bars: Bars, signals: Signals }
 nodes { etfs => EtfCodesNode }
 subgraph analysis {
-    nodes { daily => DailyNode, signal => SignalNode, report_join => JoinNode, report => ReportNode }
+    nodes { daily => DailyNode, signal => SignalNode, report_join => JoinNode::<ReportInput>::new(), report => ReportNode }
     edges {
         daily -> signal,
-        daily -> report_join |> |bars| json!({ "bars": bars }),
-        signal -> report_join |> |signals| json!({ "signals": signals }),
+        daily -> report_join::bars,
+        signal -> report_join::signals,
         report_join -> report,
     }
 }
@@ -92,8 +94,7 @@ JOIN 在同一实例内聚合来源，结算时按作用域入口筛选本次调
 查询所属作用域及其后代中的同名任务，并等待仍可能创建这些任务的上游结束；跨子图进入时，
 通过作用域的 `trigger_task_id` 识别本次调用的外部来源，避免混入其他调用。
 
-组内 JOIN 等待每个必需的前驱名至少有一次成功，忽略已由失败后继接管的历史任务。
-条件分支如果使必需前驱从未创建，JOIN 会持续等待。
+组内 JOIN 等待每个必需前驱在所有上游终结后至少贡献一次（正常 `succeeded` 或经 `on_error` 降级贡献的 `superseded`）；标为 `optional` 的成功边（指向 `Option<T>` 或 `#[join(collect)]` 槽位）在被 `when` / 空扇出跳过时不阻塞 JOIN，未标 `optional` 的缺失必需前驱会在上游全部终结后将 JOIN 标为 `failed`。
 外部入口贡献绑定创建该实例的具体任务，不自动关联不同入口事件。
 多个外部入口是不同子图调用的备选来源，当前实例只等待真实入口对应的贡献；组内必需前驱仍须全部完成。
 父层 JOIN 可收集其子图实例的输出，并等待相关上游生产结束；普通跨出边仍立即继续。
@@ -227,8 +228,7 @@ let workflow = engine.make(graph);
   数据库认领保护不提供外部副作用的 exactly-once 保证，节点调用外部系统仍需幂等。
 - **并发闸门 = 在途任务计数**（`JoinSet` 跟踪，`len <= max_concurrency`）：认领后立即
   spawn 结算并回到认领循环，快任务的后续立即被捡走，慢的 AI 任务仍在后台并发执行。
-- **JOIN 不是语法糖**：多源 AND 汇合是业务节点，在 `nodes` 块显式注册 `JoinNode`，再经
-  普通边把各源汇入；JOIN 输出类型为 `Value`，接下游的转换函数在内部反序列化为强类型视图。
+- **强类型字段槽位 JOIN**：多源汇合通过 `#[derive(JoinInput)]` 定义强类型输入结构体，普通字段为单值 `Set`、`Option<T>` 允许 `optional` 跳过、`#[join(collect)] Vec<T>` 为数组 `Append`；边上以 `src -> join::field` 做编译期槽位类型检查，建图期校验必填槽位覆盖，`JoinNode::<T>::new()` 原样向下游输出强类型 `T`。
 
 ## 数据库配置
 

@@ -19,6 +19,7 @@ pub(crate) const ROW_COLS: &str = "workflow_id, task_id, run_id, scope_id, paren
 pub(crate) const BUDGET_EXHAUSTED_ERR: &str = "task retry budget exhausted";
 pub(crate) const LEASE_EXPIRED_ERR: &str = "task lease expired; retry budget exhausted";
 pub(crate) const UPSTREAM_FAILED_ERR: &str = "upstream dependency failed";
+pub(crate) const UPSTREAM_UNSATISFIED_ERR: &str = "upstream dependency did not contribute";
 
 pub(crate) fn claim_lost(task: &TaskRecord) -> StorageError {
     StorageError::ClaimLost {

@@ -17,6 +17,7 @@ mod keyword {
     syn::custom_keyword!(on_error);
     syn::custom_keyword!(when);
     syn::custom_keyword!(when_error);
+    syn::custom_keyword!(optional);
 }
 
 pub struct Workflow {
@@ -68,7 +69,9 @@ pub struct Edge {
     pub source: NodePath,
     pub arrow: Arrow,
     pub target: NodePath,
+    pub slot: Option<Ident>,
     pub route: Route,
+    pub optional: bool,
     pub transform: Option<Expr>,
 }
 
@@ -201,11 +204,35 @@ impl Parse for Edge {
             Arrow::Direct
         };
         let target = input.parse()?;
+        let slot = if input.peek(Token![::]) {
+            input.parse::<Token![::]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+
+        let mut optional = false;
+        if input.peek(keyword::optional) {
+            input.parse::<keyword::optional>()?;
+            optional = true;
+        }
         let route = if input.peek(keyword::on_error) {
-            input.parse::<keyword::on_error>()?;
+            let kw = input.parse::<keyword::on_error>()?;
+            if optional {
+                return Err(syn::Error::new_spanned(
+                    kw,
+                    "optional is only valid on success edges",
+                ));
+            }
             Route::Failure(None)
         } else if input.peek(keyword::when_error) {
-            input.parse::<keyword::when_error>()?;
+            let kw = input.parse::<keyword::when_error>()?;
+            if optional {
+                return Err(syn::Error::new_spanned(
+                    kw,
+                    "optional is only valid on success edges",
+                ));
+            }
             Route::Failure(Some(condition(input)?))
         } else if input.peek(keyword::when) {
             input.parse::<keyword::when>()?;
@@ -213,11 +240,32 @@ impl Parse for Edge {
         } else {
             Route::Success(None)
         };
+        if input.peek(keyword::optional) {
+            let kw = input.parse::<keyword::optional>()?;
+            if matches!(route, Route::Failure(_)) {
+                return Err(syn::Error::new_spanned(
+                    kw,
+                    "optional is only valid on success edges",
+                ));
+            }
+            if optional {
+                return Err(syn::Error::new_spanned(kw, "duplicate optional modifier"));
+            }
+            optional = true;
+        }
+        if optional && slot.is_none() {
+            return Err(syn::Error::new_spanned(
+                &target,
+                "optional edges must target a JOIN slot (node::field)",
+            ));
+        }
         Ok(Self {
             source,
             arrow,
             target,
+            slot,
             route,
+            optional,
             transform: transform(input)?,
         })
     }

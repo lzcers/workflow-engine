@@ -8,10 +8,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use failure::{
-    FailureEdge, failure, failure_checked, failure_transform, failure_transform_checked,
+    FailureEdge, failure, failure_checked, failure_join, failure_join_checked,
+    failure_join_transform, failure_join_transform_checked, failure_transform,
+    failure_transform_checked,
 };
 pub use success::{
-    SuccessEdge, success, success_checked, success_transform, success_transform_checked,
+    SuccessEdge, success, success_checked, success_join, success_join_checked,
+    success_join_transform, success_join_transform_checked, success_transform,
+    success_transform_checked,
 };
 
 /// 边的路由与分发模式。

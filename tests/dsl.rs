@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use workflow_engine::{
-    Graph, Node, NodeError, Trigger,
-    graph::{EdgeMode, TaskType},
+    Graph, JoinInput, JoinNode, Node, NodeError, Trigger,
+    graph::{EdgeMode, MergeMode, TaskType},
     task::Dispatch,
     workflow,
 };
@@ -114,6 +115,12 @@ fn arrows_route_collections_as_one_input_or_as_individual_items() {
     assert_eq!(permanent[0].dispatch, Dispatch::Shared);
 }
 
+#[derive(Serialize, Deserialize, JoinInput)]
+struct SingleValueJoin {
+    #[join(collect)]
+    items: Vec<serde_json::Value>,
+}
+
 #[test]
 fn isolated_expansion_rejects_join_targets() {
     let graph = workflow! {
@@ -121,8 +128,8 @@ fn isolated_expansion_rejects_join_targets() {
         title: "Isolated JOIN";
         context: Ctx;
         nodes { source => Values }
-        subgraph analysis { nodes { join => workflow_engine::JoinNode } }
-        edges { source ->+ analysis.join }
+        subgraph analysis { nodes { join => JoinNode::<SingleValueJoin>::new() } }
+        edges { source ->+ analysis.join::items }
     };
     assert_eq!(
         graph.err().as_deref(),
@@ -374,6 +381,13 @@ async fn infers_instance_and_context_types_and_evaluates_each_expression_once() 
     assert_eq!(failure[0].inputs, vec![output]);
 }
 
+#[derive(Serialize, Deserialize, JoinInput)]
+struct NestedJoin {
+    signal: serde_json::Value,
+    fetch: serde_json::Value,
+    optional_extra: Option<serde_json::Value>,
+}
+
 #[test]
 fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
     let graph = workflow! {
@@ -385,13 +399,13 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
             nodes { fetch => PassThrough }
             #[title = "信号分析"]
             subgraph analysis {
-                nodes { signal => PassThrough, join => workflow_engine::JoinNode }
-                edges { signal -> join }
+                nodes { signal => PassThrough, join => JoinNode::<NestedJoin>::new() }
+                edges { signal -> join::signal }
             }
-            edges { fetch -> analysis.signal, fetch -> analysis.join }
+            edges { fetch -> analysis.signal, fetch -> analysis.join::fetch }
         }
         nodes { output => PassThrough }
-        edges { source -> batch.fetch, batch.analysis.join -> output }
+        edges { source -> batch.fetch, batch.analysis.join -> output |> |joined| serde_json::to_value(joined).unwrap() }
     }
     .unwrap();
     let description = graph.describe();
@@ -402,16 +416,8 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
         graph.subgraph_path("batch.analysis.signal").unwrap(),
         ["batch", "batch.analysis"]
     );
-    let error = graph
-        .plan_success("batch.fetch", &serde_json::json!(1))
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("JOIN batch.analysis.join requires a JSON object")
-    );
     let plans = graph
-        .plan_success("batch.fetch", &serde_json::json!({}))
+        .plan_success("batch.fetch", &serde_json::json!(1))
         .unwrap();
     assert_eq!(plans.len(), 2);
     assert_eq!(
@@ -420,6 +426,14 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
     );
     let join = &plans[1];
     assert_eq!(
+        join.dispatch,
+        Dispatch::Join {
+            key: "fetch",
+            merge: MergeMode::Set
+        }
+    );
+    assert_eq!(join.inputs, [serde_json::json!(1)]);
+    assert_eq!(
         graph.predecessors_of(join.dst).unwrap(),
         ["batch.analysis.signal", "batch.fetch"]
     );
@@ -427,7 +441,10 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
     assert!(graph.subgraph_path("missing").is_none());
     assert!(graph.predecessors_of("missing").is_none());
     let exit = graph
-        .plan_success("batch.analysis.join", &serde_json::json!({}))
+        .plan_success(
+            "batch.analysis.join",
+            &serde_json::json!({"signal": 1, "fetch": 2, "optional_extra": null}),
+        )
         .unwrap();
     assert!(graph.subgraph_path(exit[0].dst).unwrap().is_empty());
 }

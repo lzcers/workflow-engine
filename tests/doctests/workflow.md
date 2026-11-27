@@ -50,7 +50,10 @@ let _ = workflow!(
 ```
 同一属性不能重复声明：
 ```compile_fail
-use workflow_engine::{JoinNode, workflow};
+use serde::{Deserialize, Serialize};
+use workflow_engine::{JoinInput, JoinNode, workflow};
+#[derive(Serialize, Deserialize, JoinInput)]
+struct Empty {}
 let _ = workflow!(
     workflow_id: "example";
     title: "示例工作流";
@@ -58,21 +61,24 @@ let _ = workflow!(
     nodes {
         #[title = "第一个标题"]
         #[title = "第二个标题"]
-        join => JoinNode,
+        join => JoinNode::<Empty>::new(),
     }
     edges {}
 );
 ```
 未知属性会在编译期报错，不会被静默忽略：
 ```compile_fail
-use workflow_engine::{JoinNode, workflow};
+use serde::{Deserialize, Serialize};
+use workflow_engine::{JoinInput, JoinNode, workflow};
+#[derive(Serialize, Deserialize, JoinInput)]
+struct Empty {}
 let _ = workflow!(
     workflow_id: "example";
     title: "示例工作流";
     context: ();
     nodes {
         #[titel = "拼错的标题属性"]
-        join => JoinNode,
+        join => JoinNode::<Empty>::new(),
     }
     edges {}
 );

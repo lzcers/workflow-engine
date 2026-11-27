@@ -11,6 +11,9 @@
 //!
 //! 节点不携带名字：节点名在注册实例时外部绑定，同一节点实现可在不同名字下复用。
 
+#[cfg(test)]
+extern crate self as workflow_engine;
+
 #[cfg(not(any(feature = "pg", feature = "sqlite")))]
 compile_error!("workflow-engine requires at least one database backend: enable `pg` or `sqlite`");
 
@@ -29,6 +32,7 @@ pub mod workflow;
 
 pub use database::{Database, DatabasePool};
 pub use engine::{Engine, EngineError};
-pub use graph::{Graph, JoinNode, Node, NodeContext, NodeError, Trigger};
+pub use graph::{Graph, JoinInput, JoinNode, Node, NodeContext, NodeError, Trigger};
 pub use task::{Task, TaskRecord, TaskStatus};
 pub use workflow::{RunHandle, WorkerOptions, Workflow};
+pub use workflow_engine_macros::JoinInput;

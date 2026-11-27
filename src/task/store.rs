@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::{Task, TaskRecord};
-use crate::{RunHandle, error::StorageError};
+use crate::{RunHandle, error::StorageError, node::MergeMode};
 
 /// 认领和每次续租的存活期限，不限制节点的总执行时长。
 pub(crate) const LEASE_DURATION: Duration = Duration::from_secs(300);
@@ -20,8 +20,11 @@ pub enum Dispatch {
     Shared,
     /// 为 `->+` 的每条输入建立独立子图作用域并创建 `pending` 任务。
     PerInputScope,
-    /// 在共享作用域内合并至状态为 `collecting` 的 JOIN 任务。
-    Join,
+    /// 在共享作用域内合并至状态为 `collecting` 的 JOIN 任务的指定槽位。
+    Join {
+        key: &'static str,
+        merge: MergeMode,
+    },
 }
 
 /// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
@@ -34,11 +37,13 @@ pub struct Successor {
     pub dispatch: Dispatch,
 }
 
-/// JOIN 的直接前驱与仍可能创建输入的全部上游，在图构建后固定。
+/// JOIN 的直接前驱、仍可能创建输入的全部上游与聚合槽位名，在图构建后固定。
 #[derive(Debug, Clone)]
 pub(crate) struct JoinRule {
     pub predecessors: Vec<JoinPredecessor>,
     pub upstreams: Vec<String>,
+    /// 需要预置为空数组的 `MergeMode::Append` 槽位键。
+    pub append_keys: Vec<String>,
 }
 
 /// 外部前驱只对应触发当前子图实例的入口任务。深度从最外层子图的 0 开始。
@@ -46,6 +51,7 @@ pub(crate) struct JoinRule {
 pub(crate) struct JoinPredecessor {
     pub name: String,
     pub entry_depth: Option<usize>,
+    pub optional: bool,
 }
 
 /// 图构建时预计算的静态结算规则，由存储层在结算事务内消费。
@@ -70,44 +76,45 @@ pub(crate) struct FanoutSource<'a> {
     pub scope_id: Option<i64>,
 }
 
-/// 在已有 JOIN 输入上按边的输出顺序合并整批贡献。
+/// 按槽位合并模式把整批贡献合入 JOIN 输入对象；新建累加器时预置聚合槽位为空数组。
 pub(crate) fn merge_join_inputs(
     existing: Option<Value>,
+    append_keys: &[String],
+    key: &str,
+    merge: MergeMode,
     inputs: &[Value],
 ) -> Result<Value, StorageError> {
-    let mut acc = existing.unwrap_or_else(|| Value::Object(Default::default()));
-    for input in inputs {
-        merge_join_input(&mut acc, input)?;
-    }
-    Ok(acc)
-}
-
-/// 同名 key 合为数组，已有数组及新贡献数组按元素追加。
-fn merge_join_input(acc: &mut Value, contribution: &Value) -> Result<(), StorageError> {
-    let (Value::Object(acc_map), Value::Object(obj)) = (acc, contribution) else {
+    let mut acc = existing.unwrap_or_else(|| {
+        let mut map = serde_json::Map::with_capacity(append_keys.len() + 1);
+        for append_key in append_keys {
+            map.insert(append_key.clone(), Value::Array(Vec::new()));
+        }
+        Value::Object(map)
+    });
+    let Value::Object(map) = &mut acc else {
         return Err(StorageError::InvalidFanout {
-            detail: "JOIN contributions must be JSON objects".into(),
+            detail: "JOIN accumulator must be a JSON object".into(),
         });
     };
-    for (key, value) in obj {
-        match acc_map.get_mut(key) {
-            None => {
-                acc_map.insert(key.clone(), value.clone());
-            }
-            Some(existing) => {
-                let mut values = match existing.take() {
-                    Value::Array(values) => values,
-                    value => vec![value],
-                };
-                match value {
-                    Value::Array(items) => values.extend(items.clone()),
-                    value => values.push(value.clone()),
-                }
-                *existing = Value::Array(values);
+    match merge {
+        MergeMode::Set => {
+            if let Some(value) = inputs.last() {
+                map.insert(key.to_owned(), value.clone());
             }
         }
+        MergeMode::Append => {
+            let entry = map
+                .entry(key.to_owned())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(items) = entry else {
+                return Err(StorageError::InvalidFanout {
+                    detail: format!("JOIN append slot `{key}` is not a JSON array"),
+                });
+            };
+            items.extend(inputs.iter().cloned());
+        }
     }
-    Ok(())
+    Ok(acc)
 }
 
 /// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。

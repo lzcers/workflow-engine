@@ -9,6 +9,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::backend::task_fixture::TaskSeed;
 use crate::{
+    JoinInput,
     backend::sqlite::{SqliteTaskRepo, migrate},
     database::{Database, DatabasePool},
     dsl,
@@ -57,8 +58,9 @@ impl Node<Context> for AddOne {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JoinInput)]
 struct Collected {
+    #[join(collect)]
     worker: Vec<i32>,
     summary: i32,
 }
@@ -94,16 +96,15 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
             start => AddOne,
             worker => AddOne,
             summary => AddOne,
-            collect => JoinNode,
+            collect => JoinNode::<Collected>::new(),
             total => Sum,
         }
         edges {
             start ->* worker |> |output| vec![*output, *output + 10],
             start -> summary,
-            worker -> collect |> |output| json!({"worker": output}),
-            summary -> collect |> |output| json!({"summary": output}),
-            collect -> total |> |output: &Value| serde_json::from_value::<Collected>(output.clone())
-                .expect("JOIN contains both worker outputs and the summary"),
+            worker -> collect::worker,
+            summary -> collect::summary,
+            collect -> total,
         }
     }
     .unwrap();
@@ -388,7 +389,7 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                         nodes {
                             per_item => Item,
                             worker => AddOne,
-                            collect => JoinNode,
+                            collect => JoinNode::<Collected>::new(),
                             report => Sum,
                         }
                     }
@@ -400,9 +401,9 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                         source_b $($arrow)+ analysis.per_item,
                         source_c $($arrow)+ analysis.per_item,
                         analysis.per_item -> analysis.worker,
-                        analysis.per_item -> analysis.collect |> |output| json!({"summary": output}),
-                        analysis.worker -> analysis.collect |> |output| json!({"worker": [output]}),
-                        analysis.collect -> analysis.report |> |output: &Value| serde_json::from_value::<Collected>(output.clone()).unwrap(),
+                        analysis.per_item -> analysis.collect::summary,
+                        analysis.worker -> analysis.collect::worker,
+                        analysis.collect -> analysis.report,
                     }
                 }
             };
@@ -544,21 +545,21 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
                 source_c => SignalNode { started: starts[2].clone(), release: Some(releases[2].clone()) },
             }
             subgraph analysis {
-                nodes { worker => AddOne, collect => JoinNode, report => Sum }
+                nodes { worker => AddOne, collect => JoinNode::<Collected>::new(), report => Sum }
                 edges {
-                    worker -> collect |> |output| json!({"worker": [output]}),
-                    collect -> report |> |output: &Value| serde_json::from_value::<Collected>(output.clone()).unwrap(),
+                    worker -> collect::worker,
+                    collect -> report,
                 }
             }
             edges {
                 start -> source_a |> move |output| if fail_source_a { -*output } else { *output },
                 start -> source_b |> |output| *output + 10,
                 start -> source_c |> |output| *output + 20,
-                source_a -> analysis.collect |> |output| json!({"summary": output[0]}),
+                source_a -> analysis.collect::summary |> |output| output[0],
                 source_a ->* analysis.worker,
                 source_b ->* analysis.worker,
-                source_b -> analysis.collect |> |output| json!({"summary": output[0]}),
-                source_c -> analysis.collect |> |output| json!({"summary": output[0]}),
+                source_b -> analysis.collect::summary |> |output| output[0],
+                source_c -> analysis.collect::summary |> |output| output[0],
                 source_c ->* analysis.worker,
             }
         }

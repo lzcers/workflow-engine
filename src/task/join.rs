@@ -1,20 +1,26 @@
-//! 纯 Rust 的 JOIN 状态推进：在结算事务内依据当前 run 的任务与作用域快照判定失败传播与就绪。
+//! 纯 Rust 的 JOIN 状态推进：在结算事务内依据当前 run 的任务、贡献者与作用域快照判定失败传播与就绪。
 //!
-//! 所有数据库后端共用本模块，只需查询当前 run 的轻量任务/作用域行并批量回写状态，
-//! 不再在各数据库方言中维护重复的递归 CTE SQL。
+//! 规则：
+//! 1. 任一入口前驱或本作用域内上游失败（`failed`）→ 立刻级联失败。
+//! 2. 仍有任一上游处于活跃态（`pending`/`collecting`/`running`，排除自身）→ 继续等待。
+//! 3. 所有上游终结后逐个验收前驱：
+//!    - `succeeded` 或已通过 `on_error` 直接向本 JOIN 贡献的 `superseded`（位于 `parent_task_ids`）均计为有效贡献；
+//!    - `required`（非 `optional`）前驱若无任何有效贡献，立即标 `failed`，杜绝僵尸 `collecting`；
+//!    - 所有必需前驱均满足时转 `pending`。
 
 use std::collections::{HashMap, HashSet};
 
 use super::{JoinRule, TaskStatus};
+use crate::backend::{UPSTREAM_FAILED_ERR, UPSTREAM_UNSATISFIED_ERR};
 
 /// 当前运行中参与 JOIN 判定的最小任务快照。
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub(crate) struct RunTask {
     pub task_id: i64,
     pub name: String,
-    #[sqlx(try_from = "String")]
     pub status: TaskStatus,
     pub scope_id: Option<i64>,
+    pub parent_task_ids: Vec<i64>,
 }
 
 /// 当前运行中参与 JOIN 作用域匹配的子图实例快照。
@@ -28,13 +34,19 @@ pub(crate) struct RunScope {
 /// 本次结算需要写回数据库的 JOIN 状态变更。
 #[derive(Debug, Default)]
 pub(crate) struct JoinTransitions {
-    pub failed: Vec<i64>,
+    pub failed: Vec<(i64, &'static str)>,
     pub ready: Vec<i64>,
 }
 
-enum RequiredSource<'a> {
-    Local(&'a str),
-    Entry { task_id: i64 },
+enum SourceCheck<'a> {
+    Local { name: &'a str, optional: bool },
+    Entry { task_id: i64, optional: bool },
+}
+
+enum Verdict {
+    Waiting,
+    Ready,
+    Failed(&'static str),
 }
 
 struct RunIndex<'a> {
@@ -110,12 +122,15 @@ impl<'a> RunIndex<'a> {
         scope_id: Option<i64>,
         rule: &'r JoinRule,
         tasks: &[RunTask],
-    ) -> Vec<RequiredSource<'r>> {
+    ) -> Vec<SourceCheck<'r>> {
         let entries = self.entry_triggers(scope_id);
-        let mut required = Vec::with_capacity(rule.predecessors.len());
+        let mut sources = Vec::with_capacity(rule.predecessors.len());
         for predecessor in &rule.predecessors {
             match predecessor.entry_depth {
-                None => required.push(RequiredSource::Local(predecessor.name.as_str())),
+                None => sources.push(SourceCheck::Local {
+                    name: predecessor.name.as_str(),
+                    optional: predecessor.optional,
+                }),
                 Some(depth) => {
                     let Some(&trigger_task_id) = entries.get(depth) else {
                         continue;
@@ -124,117 +139,123 @@ impl<'a> RunIndex<'a> {
                         continue;
                     };
                     if tasks[idx].name == predecessor.name {
-                        required.push(RequiredSource::Entry {
+                        sources.push(SourceCheck::Entry {
                             task_id: trigger_task_id,
+                            optional: predecessor.optional,
                         });
                     }
                 }
             }
         }
-        required
+        sources
     }
 
-    fn is_failed(
+    fn evaluate(
         &self,
-        scope_id: Option<i64>,
+        join_idx: usize,
         rule: &JoinRule,
         tasks: &[RunTask],
         statuses: &[TaskStatus],
-    ) -> bool {
-        let required = self.required_sources(scope_id, rule, tasks);
-        if required.is_empty() {
-            return false;
-        }
-        if required.iter().any(|req| match *req {
-            RequiredSource::Entry { task_id } => self
+    ) -> Verdict {
+        let join_task = &tasks[join_idx];
+        let sources = self.required_sources(join_task.scope_id, rule, tasks);
+        let local_scopes = self.local_scopes(join_task.scope_id);
+
+        // 1) 实时失败传播：外部入口或本地作用域上游失败则立即失败。
+        if sources.iter().any(|src| match *src {
+            SourceCheck::Entry { task_id, .. } => self
                 .task_by_id
                 .get(&task_id)
                 .is_some_and(|&idx| statuses[idx] == TaskStatus::Failed),
-            RequiredSource::Local(_) => false,
+            SourceCheck::Local { .. } => false,
         }) {
-            return true;
+            return Verdict::Failed(UPSTREAM_FAILED_ERR);
         }
-        let local_scopes = self.local_scopes(scope_id);
-
-        rule.upstreams.iter().any(|upstream| {
+        if rule.upstreams.iter().any(|upstream| {
             self.tasks_by_name
                 .get(upstream.as_str())
                 .is_some_and(|indices| {
                     indices.iter().any(|&idx| {
-                        statuses[idx] == TaskStatus::Failed
+                        idx != join_idx
+                            && statuses[idx] == TaskStatus::Failed
                             && local_scopes.contains(&tasks[idx].scope_id)
                     })
                 })
-        })
-    }
-
-    fn is_ready(
-        &self,
-        scope_id: Option<i64>,
-        rule: &JoinRule,
-        tasks: &[RunTask],
-        statuses: &[TaskStatus],
-    ) -> bool {
-        let required = self.required_sources(scope_id, rule, tasks);
-        if required.is_empty() {
-            return true;
+        }) {
+            return Verdict::Failed(UPSTREAM_FAILED_ERR);
         }
-        let local_scopes = self.local_scopes(scope_id);
 
-        let upstream_active = rule.upstreams.iter().any(|upstream| {
+        // 2) 上游活跃检查：仍有任务在途（pending/collecting/running）则继续等待。
+        if sources.iter().any(|src| match *src {
+            SourceCheck::Entry { task_id, .. } => self.task_by_id.get(&task_id).is_some_and(|&idx| {
+                matches!(
+                    statuses[idx],
+                    TaskStatus::Pending | TaskStatus::Collecting | TaskStatus::Running
+                )
+            }),
+            SourceCheck::Local { .. } => false,
+        }) {
+            return Verdict::Waiting;
+        }
+        if rule.upstreams.iter().any(|upstream| {
             self.tasks_by_name
                 .get(upstream.as_str())
                 .is_some_and(|indices| {
                     indices.iter().any(|&idx| {
-                        matches!(
-                            statuses[idx],
-                            TaskStatus::Pending | TaskStatus::Collecting | TaskStatus::Running
-                        ) && local_scopes.contains(&tasks[idx].scope_id)
+                        idx != join_idx
+                            && matches!(
+                                statuses[idx],
+                                TaskStatus::Pending | TaskStatus::Collecting | TaskStatus::Running
+                            )
+                            && local_scopes.contains(&tasks[idx].scope_id)
                     })
                 })
-        });
-        if upstream_active {
-            return false;
+        }) {
+            return Verdict::Waiting;
         }
 
-        for req in &required {
-            match *req {
-                RequiredSource::Entry { task_id } => {
-                    let Some(&idx) = self.task_by_id.get(&task_id) else {
-                        return false;
-                    };
-                    if statuses[idx] != TaskStatus::Succeeded {
-                        return false;
+        // 3) 所有上游均已终结：按实际贡献者 parent_task_ids 做终态裁决，杜绝僵尸 collecting。
+        let contributed: HashSet<i64> = join_task.parent_task_ids.iter().copied().collect();
+        for src in &sources {
+            match *src {
+                SourceCheck::Entry { task_id, optional } => {
+                    let satisfied = self.task_by_id.get(&task_id).is_some_and(|&idx| {
+                        matches!(
+                            statuses[idx],
+                            TaskStatus::Succeeded | TaskStatus::Superseded
+                        ) && contributed.contains(&task_id)
+                    });
+                    if !satisfied && !optional {
+                        return Verdict::Failed(UPSTREAM_UNSATISFIED_ERR);
                     }
                 }
-                RequiredSource::Local(name) => {
-                    let Some(indices) = self.tasks_by_name.get(name) else {
-                        return false;
-                    };
-                    let mut matched = false;
-                    for &idx in indices {
-                        let status = statuses[idx];
-                        if status == TaskStatus::Superseded
-                            || !local_scopes.contains(&tasks[idx].scope_id)
-                        {
-                            continue;
-                        }
-                        matched = true;
-                        if status != TaskStatus::Succeeded {
-                            return false;
+                SourceCheck::Local { name, optional } => {
+                    let mut has_contribution = false;
+                    if let Some(indices) = self.tasks_by_name.get(name) {
+                        for &idx in indices {
+                            if !local_scopes.contains(&tasks[idx].scope_id) {
+                                continue;
+                            }
+                            if matches!(
+                                statuses[idx],
+                                TaskStatus::Succeeded | TaskStatus::Superseded
+                            ) && contributed.contains(&tasks[idx].task_id)
+                            {
+                                has_contribution = true;
+                            }
                         }
                     }
-                    if !matched {
-                        return false;
+                    if !has_contribution && !optional {
+                        return Verdict::Failed(UPSTREAM_UNSATISFIED_ERR);
                     }
                 }
             }
         }
-        true
+        Verdict::Ready
     }
 }
 
-/// 先循环传播依赖失败到不动点（覆盖链式 JOIN），再将收齐输入的 JOIN 推进为 `pending`。
+/// 先循环传播失败与缺失前驱终态到不动点（覆盖链式 JOIN），再将收齐输入的 JOIN 推进为 `pending`。
 pub(crate) fn advance_joins(
     tasks: &[RunTask],
     scopes: &[RunScope],
@@ -257,16 +278,16 @@ pub(crate) fn advance_joins(
             let Some(rule) = rules.get(&task.name) else {
                 continue;
             };
-            if index.is_failed(task.scope_id, rule, tasks, &statuses) {
-                newly_failed.push(idx);
+            if let Verdict::Failed(reason) = index.evaluate(idx, rule, tasks, &statuses) {
+                newly_failed.push((idx, reason));
             }
         }
         if newly_failed.is_empty() {
             break;
         }
-        for idx in newly_failed {
+        for (idx, reason) in newly_failed {
             statuses[idx] = TaskStatus::Failed;
-            transitions.failed.push(tasks[idx].task_id);
+            transitions.failed.push((tasks[idx].task_id, reason));
         }
     }
 
@@ -277,7 +298,7 @@ pub(crate) fn advance_joins(
         let Some(rule) = rules.get(&task.name) else {
             continue;
         };
-        if index.is_ready(task.scope_id, rule, tasks, &statuses) {
+        if matches!(index.evaluate(idx, rule, tasks, &statuses), Verdict::Ready) {
             transitions.ready.push(task.task_id);
         }
     }

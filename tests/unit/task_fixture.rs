@@ -1,6 +1,7 @@
 //! Test seeds may model a task that already belongs to an existing run.
 use crate::{
     Task,
+    graph::MergeMode,
     task::{Dispatch, Successor},
 };
 use serde_json::Value;
@@ -44,9 +45,14 @@ pub(crate) fn scoped_plan(
     }
 }
 
-pub(crate) fn join_plan(dst: &'static str, inputs: Vec<Value>) -> Successor {
+pub(crate) fn join_plan(
+    dst: &'static str,
+    key: &'static str,
+    merge: MergeMode,
+    inputs: Vec<Value>,
+) -> Successor {
     Successor {
-        dispatch: Dispatch::Join,
+        dispatch: Dispatch::Join { key, merge },
         ..plan(dst, inputs)
     }
 }

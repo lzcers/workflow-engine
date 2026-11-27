@@ -53,11 +53,17 @@ pub struct EdgeDescription {
     pub id: String,
     pub source: String,
     pub target: String,
+    /// 目标为 JOIN 节点时的字段槽位名；普通目标为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
     pub kind: EdgeKind,
     /// 箭头的分发方式，对应 `->`、`->*` 或 `->+`。
     pub mode: EdgeMode,
     /// 是否在分发前通过 `|>` 转换载荷。
     pub has_transform: bool,
+    /// 是否为可选 JOIN 前驱边。
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl<Ctx> Graph<Ctx> {
@@ -87,9 +93,11 @@ impl<Ctx> Graph<Ctx> {
                 id: format!("success:{index}"),
                 source: edge.src().to_owned(),
                 target: edge.dst().to_owned(),
+                slot: edge.slot_key().map(str::to_owned),
                 kind: EdgeKind::Success,
                 mode: edge.mode(),
                 has_transform: edge.has_transform(),
+                optional: edge.is_optional(),
             })
             .chain(
                 self.failure_edges
@@ -99,9 +107,11 @@ impl<Ctx> Graph<Ctx> {
                         id: format!("failure:{index}"),
                         source: edge.src().to_owned(),
                         target: edge.dst().to_owned(),
+                        slot: edge.slot_key().map(str::to_owned),
                         kind: EdgeKind::Failure,
                         mode: edge.mode(),
                         has_transform: edge.has_transform(),
+                        optional: false,
                     }),
             )
             .collect();

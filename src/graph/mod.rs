@@ -15,10 +15,14 @@ mod description;
 mod erased;
 
 pub use crate::edge::{
-    Arrow, EdgeError, EdgeMode, FailureEdge, SuccessEdge, direct, failure, failure_transform,
-    isolated_expand, shared_expand, success, success_transform,
+    Arrow, EdgeError, EdgeMode, FailureEdge, SuccessEdge, direct, failure, failure_join,
+    failure_join_transform, failure_transform, isolated_expand, shared_expand, success,
+    success_join, success_join_transform, success_transform,
 };
-pub use crate::node::{JoinNode, Node, NodeContext, NodeError, NodeKey, TaskType, Trigger};
+pub use crate::node::{
+    JoinInput, JoinNode, JoinSlot, MergeMode, Node, NodeContext, NodeError, NodeKey, SlotSpec,
+    TaskType, Trigger,
+};
 pub use builder::GraphBuilder;
 pub use description::{
     EdgeDescription, EdgeKind, GraphDescription, NodeDescription, SubgraphDescription,
@@ -143,7 +147,7 @@ impl<Ctx> Graph<Ctx> {
         Some(subgraph_path(group).map(str::to_owned).collect())
     }
 
-    /// 每条成功边独立规划，`->+` 的每份输入各自进入一个子图实例。
+    /// 每条成功边独立规划，`->+` 的每份输入各自进入一个子图实例；指向 JOIN 槽位的边写入对应字段。
     pub fn plan_success(&self, name: &str, out: &Value) -> Result<Vec<Successor>, EdgeError> {
         let mut plans = Vec::new();
         for edge in self.success_edges.iter().filter(|edge| edge.src() == name) {
@@ -151,19 +155,12 @@ impl<Ctx> Graph<Ctx> {
             if inputs.is_empty() {
                 continue;
             }
-            let dispatch = if self.settlement_rules.join_rules.contains_key(edge.dst()) {
-                if inputs.iter().any(|input| !input.is_object()) {
-                    return Err(EdgeError::BadDstIn {
-                        src: edge.src(),
-                        detail: format!(
-                            "JOIN {} requires a JSON object for each contribution",
-                            edge.dst()
-                        ),
-                    });
-                }
-                Dispatch::Join
-            } else {
-                edge.mode().task_dispatch()
+            let dispatch = match edge.slot() {
+                Some(slot) => Dispatch::Join {
+                    key: slot.key,
+                    merge: slot.merge,
+                },
+                None => edge.mode().task_dispatch(),
             };
             plans.push(Successor {
                 dst: edge.dst(),
@@ -177,7 +174,7 @@ impl<Ctx> Graph<Ctx> {
         Ok(plans)
     }
 
-    /// 失败边也按子图边界进入或退出；失败路由不建立成功 JOIN 等待条件。
+    /// 失败边同样按子图边界路由；指向 JOIN 槽位的失败边作为降级贡献合入同作用域的 collecting JOIN。
     pub fn plan_failure(
         &self,
         name: &str,
@@ -190,13 +187,20 @@ impl<Ctx> Graph<Ctx> {
             if inputs.is_empty() {
                 continue;
             }
+            let dispatch = match edge.slot() {
+                Some(slot) => Dispatch::Join {
+                    key: slot.key,
+                    merge: slot.merge,
+                },
+                None => edge.mode().task_dispatch(),
+            };
             plans.push(Successor {
                 dst: edge.dst(),
                 subgraph_path: self
                     .subgraph_path(edge.dst())
                     .expect("validated edge destination"),
                 inputs,
-                dispatch: edge.mode().task_dispatch(),
+                dispatch,
             });
         }
         Ok(plans)
@@ -219,10 +223,19 @@ impl<Ctx> Graph<Ctx> {
 
     fn join_rule(&self, dst: &str) -> JoinRule {
         let target = self.subgraph_path(dst).expect("validated JOIN node");
-        let mut pending = self.predecessors_of(dst).expect("validated JOIN node");
-        let predecessors = pending
+        let mut pred_optional: HashMap<&'static str, bool> = HashMap::new();
+        for edge in self.success_edges.iter().filter(|edge| edge.dst() == dst) {
+            pred_optional
+                .entry(edge.src())
+                .and_modify(|opt| *opt &= edge.is_optional())
+                .or_insert(edge.is_optional());
+        }
+        let mut pred_names: Vec<&'static str> = pred_optional.keys().copied().collect();
+        pred_names.sort_unstable();
+
+        let predecessors = pred_names
             .iter()
-            .map(|name| {
+            .map(|&name| {
                 let source = self
                     .subgraph_path(name)
                     .expect("validated JOIN predecessor");
@@ -234,28 +247,60 @@ impl<Ctx> Graph<Ctx> {
                         .count()
                 });
                 JoinPredecessor {
-                    name: name.clone(),
+                    name: name.to_owned(),
                     entry_depth,
+                    optional: pred_optional[name],
                 }
             })
             .collect();
+
+        // 反向遍历成功边与失败边，覆盖所有仍可能为该 JOIN 产出贡献的上游，并排除 dst 自身。
+        let mut pending: Vec<String> = self
+            .success_edges
+            .iter()
+            .filter(|edge| edge.dst() == dst)
+            .map(|edge| edge.src().to_owned())
+            .chain(
+                self.failure_edges
+                    .iter()
+                    .filter(|edge| edge.dst() == dst)
+                    .map(|edge| edge.src().to_owned()),
+            )
+            .collect();
         let mut seen = HashSet::new();
         while let Some(name) = pending.pop() {
-            if !seen.insert(name.clone()) {
+            if name == dst || !seen.insert(name.clone()) {
                 continue;
             }
             pending.extend(
                 self.success_edges
                     .iter()
                     .filter(|edge| edge.dst() == name)
-                    .map(|edge| edge.src().to_owned()),
+                    .map(|edge| edge.src().to_owned())
+                    .chain(
+                        self.failure_edges
+                            .iter()
+                            .filter(|edge| edge.dst() == name)
+                            .map(|edge| edge.src().to_owned()),
+                    ),
             );
         }
         let mut upstreams: Vec<_> = seen.into_iter().collect();
         upstreams.sort();
+
+        let append_keys = self.nodes[dst]
+            .node
+            .join_slots()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|spec| spec.merge == MergeMode::Append)
+            .map(|spec| spec.key.to_owned())
+            .collect();
+
         JoinRule {
             predecessors,
             upstreams,
+            append_keys,
         }
     }
 
@@ -284,7 +329,8 @@ impl<Ctx> Graph<Ctx> {
             return Err("workflow title must not be empty".into());
         }
         self.validate_subgraphs()?;
-        for (name, entry) in &self.nodes {
+        let mut join_specs: HashMap<&'static str, Vec<SlotSpec>> = HashMap::new();
+        for (&name, entry) in &self.nodes {
             match (entry.node.task_type(), entry.node.trigger()) {
                 (TaskType::Event, None) => {
                     return Err(format!("event node {name} must declare a trigger"));
@@ -294,9 +340,46 @@ impl<Ctx> Graph<Ctx> {
                 }
                 _ => {}
             }
+            match (entry.node.task_type(), entry.node.join_slots()) {
+                (TaskType::Join, None) => {
+                    return Err(format!("join node {name} must declare join_slots()"));
+                }
+                (TaskType::Join, Some(specs)) => {
+                    let mut keys = HashSet::new();
+                    for spec in &specs {
+                        if !keys.insert(spec.key) {
+                            return Err(format!(
+                                "join node {name} declares duplicate slot `{}`",
+                                spec.key
+                            ));
+                        }
+                    }
+                    join_specs.insert(name, specs);
+                }
+                (TaskType::Normal | TaskType::Event, Some(_)) => {
+                    return Err(format!("non-join node {name} must not declare join_slots()"));
+                }
+                _ => {}
+            }
         }
-        // 所有边端点已在 validate_subgraphs 中校验存在；此处统一检查 Event 目标限制与端口类型指纹。
-        for (kind, src, dst, edge_src_ty, node_src_ty, src_role, edge_dst_ty) in self
+        // 所有边端点已在 validate_subgraphs 中校验存在；此处统一检查 Event/JOIN 槽位约束与端口类型指纹。
+        let mut covered_slots: HashMap<(&'static str, &'static str), usize> = HashMap::new();
+        let mut in_scope_unconditional_set: HashMap<(&'static str, &'static str), usize> =
+            HashMap::new();
+        let mut pred_optional_flags: HashMap<(&'static str, &'static str), bool> = HashMap::new();
+        for (
+            kind,
+            src,
+            dst,
+            slot,
+            mode,
+            optional,
+            has_condition,
+            edge_src_ty,
+            node_src_ty,
+            src_role,
+            edge_dst_ty,
+        ) in self
             .success_edges
             .iter()
             .map(|e| {
@@ -304,6 +387,10 @@ impl<Ctx> Graph<Ctx> {
                     "success",
                     e.src(),
                     e.dst(),
+                    e.slot(),
+                    e.mode(),
+                    e.is_optional(),
+                    e.has_condition(),
                     e.src_out_type(),
                     self.nodes[e.src()].node.out_type(),
                     "输出",
@@ -315,6 +402,10 @@ impl<Ctx> Graph<Ctx> {
                     "failure",
                     e.src(),
                     e.dst(),
+                    e.slot(),
+                    e.mode(),
+                    false,
+                    true,
                     e.src_in_type(),
                     self.nodes[e.src()].node.in_type(),
                     "输入",
@@ -333,12 +424,107 @@ impl<Ctx> Graph<Ctx> {
                     node_src_ty.name()
                 ));
             }
-            if !writable(edge_dst_ty, dst_node.in_type()) {
-                return Err(format!(
-                    "edge {src} -> {dst}: transform 出参类型 {} 与节点 {dst} 输入类型 {} 不匹配",
-                    edge_dst_ty.name(),
-                    dst_node.in_type().name()
-                ));
+            match (dst_node.task_type(), slot) {
+                (TaskType::Join, None) => {
+                    return Err(format!(
+                        "{kind} edge {src} -> {dst} targeting JOIN node must specify a slot ({dst}::field)"
+                    ));
+                }
+                (TaskType::Join, Some(edge_slot)) => {
+                    let specs = &join_specs[dst];
+                    let Some(spec) = specs.iter().find(|s| s.key == edge_slot.key) else {
+                        return Err(format!(
+                            "edge {src} -> {dst}::{}: unknown JOIN slot",
+                            edge_slot.key
+                        ));
+                    };
+                    if spec.merge != edge_slot.merge {
+                        return Err(format!(
+                            "edge {src} -> {dst}::{}: slot merge mode mismatch",
+                            edge_slot.key
+                        ));
+                    }
+                    if !writable(edge_dst_ty, spec.item_type) {
+                        return Err(format!(
+                            "edge {src} -> {dst}::{}: 贡献类型 {} 与槽位类型 {} 不匹配",
+                            edge_slot.key,
+                            edge_dst_ty.name(),
+                            spec.item_type.name()
+                        ));
+                    }
+                    if spec.merge == MergeMode::Set && mode == EdgeMode::SharedExpand {
+                        return Err(format!(
+                            "edge {src} ->* {dst}::{}: single-value JOIN slot does not accept ->* expansion",
+                            edge_slot.key
+                        ));
+                    }
+                    if optional && !spec.allows_optional {
+                        return Err(format!(
+                            "optional edge {src} -> {dst}::{} requires Option<T> or #[join(collect)] slot",
+                            edge_slot.key
+                        ));
+                    }
+                    *covered_slots.entry((dst, spec.key)).or_insert(0) += 1;
+                    if kind == "success" {
+                        if let Some(&prev) = pred_optional_flags.get(&(src, dst))
+                            && prev != optional
+                        {
+                            return Err(format!(
+                                "edges from {src} to JOIN {dst} mix optional and required modifiers"
+                            ));
+                        }
+                        pred_optional_flags.insert((src, dst), optional);
+
+                        if spec.merge == MergeMode::Set && !optional && !has_condition {
+                            let src_path = self.subgraph_path(src).unwrap_or_default();
+                            let dst_path = self.subgraph_path(dst).unwrap_or_default();
+                            if src_path.starts_with(&dst_path) {
+                                let count = in_scope_unconditional_set
+                                    .entry((dst, spec.key))
+                                    .or_insert(0);
+                                *count += 1;
+                                if *count > 1 {
+                                    return Err(format!(
+                                        "JOIN slot {dst}::{} has multiple unconditional in-scope writers; mark it #[join(collect)] or guard with when/optional",
+                                        spec.key
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                (_, Some(edge_slot)) => {
+                    return Err(format!(
+                        "{kind} edge {src} -> {dst}::{}: slot syntax is only valid for JOIN nodes",
+                        edge_slot.key
+                    ));
+                }
+                (_, None) => {
+                    if optional {
+                        return Err(format!(
+                            "optional edge {src} -> {dst} must target a JOIN slot"
+                        ));
+                    }
+                    if !writable(edge_dst_ty, dst_node.in_type()) {
+                        return Err(format!(
+                            "edge {src} -> {dst}: transform 出参类型 {} 与节点 {dst} 输入类型 {} 不匹配",
+                            edge_dst_ty.name(),
+                            dst_node.in_type().name()
+                        ));
+                    }
+                }
+            }
+        }
+        let mut join_names: Vec<&'static str> = join_specs.keys().copied().collect();
+        join_names.sort_unstable();
+        for name in join_names {
+            for spec in &join_specs[name] {
+                if spec.required && !covered_slots.contains_key(&(name, spec.key)) {
+                    return Err(format!(
+                        "JOIN node {name} is missing an incoming edge for required slot `{}`",
+                        spec.key
+                    ));
+                }
             }
         }
 

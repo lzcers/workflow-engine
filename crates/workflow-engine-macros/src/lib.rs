@@ -1,5 +1,6 @@
 //! Typed expansion of the shared workflow syntax tree.
 
+mod join_input;
 mod parse;
 
 use proc_macro::TokenStream;
@@ -7,7 +8,7 @@ use proc_macro2::{Span, TokenStream as Tokens};
 use quote::{ToTokens, format_ident, quote};
 use std::collections::HashMap;
 use syn::{
-    Attribute, Expr, Ident, Meta, Path, Result, Token,
+    Attribute, DeriveInput, Expr, Ident, Meta, Path, Result, Token,
     parse::{Parse, ParseStream},
 };
 
@@ -32,6 +33,14 @@ impl Parse for Input {
 pub fn expand_workflow(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as Input);
     expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+#[proc_macro_derive(JoinInput, attributes(join))]
+pub fn derive_join_input(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    join_input::expand_join_input(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -173,36 +182,90 @@ fn wire(
             Arrow::SharedExpand => quote! { #engine::dsl::shared_expand() },
             Arrow::IsolatedExpand => quote! { #engine::dsl::isolated_expand() },
         };
-        let (method, constructor, condition) = match &edge.route {
-            Route::Success(condition) => (
-                quote! { edge },
-                if edge.transform.is_some() {
+        let transform = &edge.transform;
+        let statement = match (&edge.route, &edge.slot) {
+            (Route::Success(condition), None) => {
+                let constructor = if edge.transform.is_some() {
                     quote! { success_transform_checked }
                 } else {
                     quote! { success_checked }
-                },
-                condition
+                };
+                let cond_expr = condition
                     .as_ref()
-                    .map_or_else(|| quote! { |_| true }, ToTokens::to_token_stream),
-            ),
-            Route::Failure(condition) => (
-                quote! { error_edge },
-                if edge.transform.is_some() {
+                    .map_or_else(|| quote! { |_| true }, ToTokens::to_token_stream);
+                let has_cond = condition.is_some();
+                quote! {
+                    let __workflow_builder = __workflow_builder.edge(
+                        #engine::dsl::#constructor(#source, #target, #arrow, #cond_expr, #transform)
+                            .with_condition(#has_cond)
+                    );
+                }
+            }
+            (Route::Success(condition), Some(slot)) => {
+                let constructor = if edge.transform.is_some() {
+                    quote! { success_join_transform_checked }
+                } else {
+                    quote! { success_join_checked }
+                };
+                let cond_expr = condition
+                    .as_ref()
+                    .map_or_else(|| quote! { |_| true }, ToTokens::to_token_stream);
+                let has_cond = condition.is_some();
+                let optional = edge.optional;
+                quote! {
+                    let __workflow_builder = __workflow_builder.edge(
+                        #engine::dsl::#constructor(
+                            #source,
+                            #target,
+                            #target.slots().#slot(),
+                            #arrow,
+                            #cond_expr,
+                            #transform
+                        )
+                        .with_condition(#has_cond)
+                        .with_optional(#optional)
+                    );
+                }
+            }
+            (Route::Failure(condition), None) => {
+                let constructor = if edge.transform.is_some() {
                     quote! { failure_transform_checked }
                 } else {
                     quote! { failure_checked }
-                },
-                condition
+                };
+                let cond_expr = condition
                     .as_ref()
-                    .map_or_else(|| quote! { |_, _| true }, ToTokens::to_token_stream),
-            ),
+                    .map_or_else(|| quote! { |_, _| true }, ToTokens::to_token_stream);
+                quote! {
+                    let __workflow_builder = __workflow_builder.error_edge(
+                        #engine::dsl::#constructor(#source, #target, #arrow, #cond_expr, #transform)
+                    );
+                }
+            }
+            (Route::Failure(condition), Some(slot)) => {
+                let constructor = if edge.transform.is_some() {
+                    quote! { failure_join_transform_checked }
+                } else {
+                    quote! { failure_join_checked }
+                };
+                let cond_expr = condition
+                    .as_ref()
+                    .map_or_else(|| quote! { |_, _| true }, ToTokens::to_token_stream);
+                quote! {
+                    let __workflow_builder = __workflow_builder.error_edge(
+                        #engine::dsl::#constructor(
+                            #source,
+                            #target,
+                            #target.slots().#slot(),
+                            #arrow,
+                            #cond_expr,
+                            #transform
+                        )
+                    );
+                }
+            }
         };
-        let transform = &edge.transform;
-        statements.extend(quote! {
-            let __workflow_builder = __workflow_builder.#method(
-                #engine::dsl::#constructor(#source, #target, #arrow, #condition, #transform)
-            );
-        });
+        statements.extend(statement);
     }
     Ok(())
 }

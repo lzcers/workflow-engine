@@ -18,7 +18,8 @@ use super::task::TaskRecord;
 
 mod join;
 
-pub use join::JoinNode;
+pub(crate) use join::EdgeSlot;
+pub use join::{JoinInput, JoinNode, JoinSlot, MergeMode, SlotSpec};
 
 /// 外部触发器的注册声明。种类与配置由宿主解释，引擎只负责描述和提交后的任务执行。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +45,12 @@ pub trait Node<Ctx>: Send + Sync {
     /// 此方法仅描述固定的节点配置，必须无副作用，不注册监听或依赖单次任务上下文。
     /// 宿主通过 Workflow::triggers 获取声明，注册后调用 Workflow::submit 投递事件。
     fn trigger(&self) -> Option<Trigger> {
+        None
+    }
+
+    /// JOIN 节点的强类型输入槽位规格。`TaskType::Join` 节点必须返回 `Some(Self::In::slot_specs())`，
+    /// 其他节点必须返回 `None`。
+    fn join_slots(&self) -> Option<Vec<SlotSpec>> {
         None
     }
 
@@ -102,6 +109,17 @@ impl<Ctx, N> NodeKey<Ctx, N> {
     }
 }
 
+impl<Ctx, N> NodeKey<Ctx, N>
+where
+    N: Node<Ctx>,
+    N::In: JoinInput,
+{
+    /// 返回目标 JOIN 节点的强类型字段槽位表，供 `workflow!` 宏和类型化建边函数按字段接线。
+    pub fn slots(self) -> <N::In as JoinInput>::Slots {
+        <N::In as JoinInput>::slots()
+    }
+}
+
 /// 节点/边端口的编译期类型指纹：`TypeId` 做等值比对，`type_name` 用于错误信息与图描述。
 /// 用于 `Graph::build` 期间静态校验命令式边的端口类型接线，把错线从运行时提前到建图期。
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +127,14 @@ pub(crate) struct TypeFingerprint {
     id: TypeId,
     name: &'static str,
 }
+
+impl PartialEq for TypeFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for TypeFingerprint {}
 
 impl TypeFingerprint {
     pub(crate) fn of<T: 'static>() -> Self {
@@ -131,6 +157,7 @@ impl TypeFingerprint {
 pub(crate) trait AnyNode<Ctx>: Send + Sync {
     fn task_type(&self) -> TaskType;
     fn trigger(&self) -> Option<Trigger>;
+    fn join_slots(&self) -> Option<Vec<SlotSpec>>;
     fn in_type(&self) -> TypeFingerprint;
     fn out_type(&self) -> TypeFingerprint;
     fn on_start<'a>(&'a self, ctx: &'a mut Ctx, input: &'a Value) -> BoxFuture<'a, ()>;
@@ -167,6 +194,9 @@ where
     }
     fn trigger(&self) -> Option<Trigger> {
         N::trigger(self)
+    }
+    fn join_slots(&self) -> Option<Vec<SlotSpec>> {
+        N::join_slots(self)
     }
     fn in_type(&self) -> TypeFingerprint {
         TypeFingerprint::of::<N::In>()
