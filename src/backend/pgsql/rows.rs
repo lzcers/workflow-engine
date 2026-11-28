@@ -1,10 +1,10 @@
-//! `tasks` 表的行类型（schema 契约镜像）。JSON 列以 `serde_json::Value` 承载。
+//! PostgreSQL 查询行类型（schema 契约镜像）。JSON 列以 `serde_json::Value` 承载。
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::FromRow;
 
-use crate::{TaskRecord, TaskStatus};
+use crate::{TaskRecord, TaskStatus, task::join::RunTask};
 
 #[derive(Debug, Clone, FromRow)]
 pub(crate) struct TaskRow {
@@ -48,4 +48,34 @@ impl From<TaskRow> for TaskRecord {
             updated_at: row.updated_at,
         }
     }
+}
+
+#[derive(FromRow)]
+pub(super) struct RunTaskRow {
+    pub task_id: i64,
+    pub name: String,
+    #[sqlx(try_from = "String")]
+    pub status: TaskStatus,
+    pub scope_id: Option<i64>,
+    pub contributed_slots: Vec<String>,
+}
+
+impl From<RunTaskRow> for RunTask {
+    fn from(row: RunTaskRow) -> Self {
+        Self {
+            task_id: row.task_id,
+            name: row.name,
+            status: row.status,
+            scope_id: row.scope_id,
+            contributed_slots: row.contributed_slots,
+        }
+    }
+}
+
+#[derive(FromRow)]
+pub(super) struct ScopedTreeRow {
+    pub scope_id: i64,
+    pub parent_scope_id: Option<i64>,
+    pub trigger_task_id: i64,
+    pub is_descendant: bool,
 }

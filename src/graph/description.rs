@@ -1,10 +1,11 @@
 //! 执行图的只读描述，不包含上下文、运行状态或节点载荷。
 
-use std::collections::{HashMap, HashSet};
-
 use serde::{Deserialize, Serialize};
 
-use super::{EdgeKind, EdgeMode, Graph, RetryPolicy, TaskType, Trigger, qualified_parent, subgraph_path};
+use super::{
+    EdgeKind, EdgeMode, Graph, RetryPolicy, TaskType, Trigger, subgraph_path,
+    validate::{validate_node_owner, validate_subgraph_desc, validate_subgraphs},
+};
 use crate::error::GraphError;
 
 fn default_isolated() -> bool {
@@ -135,31 +136,6 @@ impl<Ctx> Graph<Ctx> {
     }
 }
 
-impl SubgraphDescription {
-    fn validate(&self) -> Result<(), GraphError> {
-        if self.id.is_empty() || self.title.trim().is_empty() {
-            return Err(GraphError::EmptySubgraphMetadata);
-        }
-        if qualified_parent(&self.id) != self.parent_id.as_deref() {
-            return Err(GraphError::InvalidQualification {
-                kind: "subgraph",
-                id: self.id.clone(),
-            });
-        }
-        Ok(())
-    }
-}
-
-fn validate_node_owner(id: &str, subgraph: Option<&str>) -> Result<(), GraphError> {
-    if subgraph.is_some() && qualified_parent(id) != subgraph {
-        return Err(GraphError::InvalidQualification {
-            kind: "node",
-            id: id.to_owned(),
-        });
-    }
-    Ok(())
-}
-
 impl GraphDescription {
     /// 从图描述构造可直接提交的入口任务，并解析其运行时隔离作用域路径与重试预算。
     pub fn task(
@@ -196,7 +172,7 @@ impl GraphDescription {
             if groups.next().is_some() {
                 return Err(GraphError::DuplicateSubgraph(id.to_owned()));
             }
-            group.validate()?;
+            validate_subgraph_desc(group)?;
             if group.isolated {
                 path.push(id.to_owned());
             }
@@ -219,115 +195,4 @@ impl GraphDescription {
             .map(|edge| (edge.source.as_str(), edge.target.as_str(), edge.mode));
         validate_subgraphs(nodes, self.subgraphs.iter(), edges)
     }
-}
-
-impl<Ctx> Graph<Ctx> {
-    pub(super) fn validate_subgraphs(&self) -> Result<(), GraphError> {
-        let mut nodes: Vec<_> = self
-            .nodes
-            .iter()
-            .map(|(id, entry)| {
-                (
-                    id.as_ref(),
-                    entry.subgraph_id.as_deref(),
-                    entry.node.role().task_type() == TaskType::Join,
-                )
-            })
-            .collect();
-        nodes.sort_unstable_by_key(|&(id, _, _)| id);
-        let mut groups: Vec<_> = self.subgraphs.iter().collect();
-        groups.sort_by_key(|group| &group.id);
-
-        let success = self
-            .success_edges
-            .iter()
-            .map(|e| (e.src(), e.dst(), e.mode()));
-        let failure = self
-            .failure_edges
-            .iter()
-            .map(|e| (e.src(), e.dst(), e.mode()));
-        validate_subgraphs(
-            nodes.iter().copied(),
-            groups.iter().copied(),
-            success.chain(failure),
-        )
-    }
-}
-
-fn isolated_path<'a>(owner: Option<&'a str>, isolated_set: &HashSet<&str>) -> Vec<&'a str> {
-    subgraph_path(owner)
-        .filter(|id| isolated_set.contains(id))
-        .collect()
-}
-
-fn validate_subgraphs<'a>(
-    nodes: impl Iterator<Item = (&'a str, Option<&'a str>, bool)> + Clone,
-    subgraphs: impl Iterator<Item = &'a SubgraphDescription> + Clone,
-    edges: impl Iterator<Item = (&'a str, &'a str, EdgeMode)>,
-) -> Result<(), GraphError> {
-    let mut owners = HashMap::new();
-    for (id, owner, is_join) in nodes.clone() {
-        validate_node_owner(id, owner)?;
-        if owners.insert(id, (owner, is_join)).is_some() {
-            return Err(GraphError::DuplicateNode(id.to_owned()));
-        }
-    }
-
-    let mut groups = HashSet::new();
-    let mut isolated_groups = HashSet::new();
-    for group in subgraphs.clone() {
-        if !groups.insert(group.id.as_str()) || owners.contains_key(group.id.as_str()) {
-            return Err(GraphError::DuplicateSubgraph(group.id.clone()));
-        }
-        group.validate()?;
-        if group.isolated {
-            isolated_groups.insert(group.id.as_str());
-        }
-    }
-    for group in subgraphs {
-        if let Some(parent) = &group.parent_id
-            && !groups.contains(parent.as_str())
-        {
-            return Err(GraphError::UnknownSubgraph(parent.clone()));
-        }
-    }
-    for (_, owner, _) in nodes {
-        if let Some(group) = owner
-            && !groups.contains(group)
-        {
-            return Err(GraphError::UnknownSubgraph(group.to_owned()));
-        }
-    }
-    for (src, dst, mode) in edges {
-        let &(source_group, _) = owners
-            .get(src)
-            .ok_or_else(|| GraphError::UnknownNode(src.to_owned()))?;
-        let &(destination_group, is_join) = owners
-            .get(dst)
-            .ok_or_else(|| GraphError::UnknownNode(dst.to_owned()))?;
-        if mode.is_isolated() {
-            if is_join {
-                return Err(GraphError::InvalidEdge {
-                    src: src.to_owned(),
-                    dst: dst.to_owned(),
-                    detail: "isolated edge (->! / ->+) must not target a JOIN node".into(),
-                });
-            }
-            let src_scopes = isolated_path(source_group, &isolated_groups);
-            let dst_scopes = isolated_path(destination_group, &isolated_groups);
-            let common = src_scopes
-                .iter()
-                .zip(&dst_scopes)
-                .take_while(|(a, b)| a == b)
-                .count();
-            if dst_scopes.len() <= common {
-                return Err(GraphError::InvalidEdge {
-                    src: src.to_owned(),
-                    dst: dst.to_owned(),
-                    detail: "isolated edge (->! / ->+) must enter a new isolated subgraph".into(),
-                });
-            }
-        }
-    }
-    Ok(())
 }

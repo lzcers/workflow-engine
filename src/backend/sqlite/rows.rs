@@ -1,10 +1,10 @@
-//! `tasks` 表的行类型（schema 契约镜像）。JSON 列以 `serde_json::Value` 承载。
+//! SQLite 查询行类型（schema 契约镜像）。JSON 列以 `serde_json::Value` 承载。
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::FromRow;
 
-use crate::{TaskRecord, TaskStatus};
+use crate::{TaskRecord, TaskStatus, task::join::RunTask};
 
 #[derive(Debug, Clone, FromRow)]
 pub(crate) struct TaskRow {
@@ -49,4 +49,38 @@ impl From<TaskRow> for TaskRecord {
             updated_at: row.updated_at,
         }
     }
+}
+
+#[derive(FromRow)]
+pub(super) struct RunTaskRow {
+    pub task_id: i64,
+    pub name: String,
+    #[sqlx(try_from = "String")]
+    pub status: TaskStatus,
+    pub scope_id: Option<i64>,
+    pub collecting_input: Option<Value>,
+}
+
+impl From<RunTaskRow> for RunTask {
+    fn from(row: RunTaskRow) -> Self {
+        let contributed_slots = match row.collecting_input {
+            Some(Value::Object(map)) => map.into_iter().map(|(k, _)| k).collect(),
+            _ => Vec::new(),
+        };
+        Self {
+            task_id: row.task_id,
+            name: row.name,
+            status: row.status,
+            scope_id: row.scope_id,
+            contributed_slots,
+        }
+    }
+}
+
+#[derive(FromRow)]
+pub(super) struct ScopedTreeRow {
+    pub scope_id: i64,
+    pub parent_scope_id: Option<i64>,
+    pub trigger_task_id: i64,
+    pub is_descendant: i64,
 }
