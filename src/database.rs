@@ -1,32 +1,13 @@
-//! 数据库连接、引擎表初始化、连接池配置与运行控制面查询/取消接口。
+//! 数据库连接、引擎表初始化、健康检查与事务任务提交入口。
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::error::StorageError;
-use crate::task::TaskStore;
-use crate::{RunHandle, RunSnapshot, RunStatus, Task, TaskRecord};
-
-/// 数据库连接池配置参数；未显式传入时使用引擎默认值（PG 10 / SQLite 4，超时 5 秒）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PoolOptions {
-    /// 最大连接数（SQLite 内存/临时库固定为 1）。
-    pub max_connections: u32,
-    /// 获取连接超时时间（SQLite 同时作为 `busy_timeout`）。
-    pub acquire_timeout: Duration,
-}
-
-impl PoolOptions {
-    pub const fn new(max_connections: u32, acquire_timeout: Duration) -> Self {
-        Self {
-            max_connections: if max_connections == 0 { 1 } else { max_connections },
-            acquire_timeout,
-        }
-    }
-}
+use crate::task::{RunHandle, Task, TaskStore};
 
 /// 工作流数据库。默认共享连接池，也可以借用宿主事务来提交任务。
 #[derive(Clone)]
-pub struct Database<C = DatabasePool>(pub(crate) C);
+pub struct Database<C = DatabasePool>(C);
 
 /// 通过数据库 URL 选择的共享连接池。
 #[derive(Clone)]
@@ -51,6 +32,22 @@ impl From<sqlx::SqlitePool> for Database {
     }
 }
 
+#[cfg(feature = "pg")]
+impl Database<&mut sqlx::Transaction<'_, sqlx::Postgres>> {
+    /// 在宿主事务内创建独立运行，同时建立入口所属的隔离作用域并发送 PG NOTIFY。
+    pub async fn submit(self, task: Task) -> Result<RunHandle, StorageError> {
+        crate::backend::pgsql::submit_in_tx(self.0, task).await
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl Database<&mut sqlx::Transaction<'_, sqlx::Sqlite>> {
+    /// 提交独立运行的入口；调用方使用 `BEGIN IMMEDIATE` 事务可避免读升写触发 `SQLITE_BUSY`。
+    pub async fn submit(self, task: Task) -> Result<RunHandle, StorageError> {
+        crate::backend::sqlite::submit_in_tx(self.0, task).await
+    }
+}
+
 impl Database {
     /// 在宿主已有的 SQLx 事务上提交任务，借用在提交任务后结束。
     ///
@@ -66,28 +63,17 @@ impl Database {
         &self.0
     }
 
-    /// 根据 URL 使用默认连接池参数连接 PostgreSQL 或 SQLite，不创建引擎表、不启动 worker。
+    /// 根据 URL 连接 PostgreSQL 或 SQLite，不创建引擎表、不启动 worker。
+    ///
+    /// 需要自定义连接池参数时，直接构造 `PgPool`/`SqlitePool` 并调用 `Database::from(pool)`。
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
-        Self::connect_internal(url, None).await
-    }
-
-    /// 使用自定义连接池参数连接 PostgreSQL 或 SQLite。
-    pub async fn connect_with(url: &str, options: PoolOptions) -> Result<Self, StorageError> {
-        Self::connect_internal(url, Some(options)).await
-    }
-
-    async fn connect_internal(
-        url: &str,
-        pool_cfg: Option<PoolOptions>,
-    ) -> Result<Self, StorageError> {
-        let timeout = pool_cfg.map_or(Duration::from_secs(5), |c| c.acquire_timeout);
+        let timeout = Duration::from_secs(5);
         match url.split_once(':').map(|(scheme, _)| scheme) {
             Some("postgres" | "postgresql") => {
                 #[cfg(feature = "pg")]
                 {
-                    let max_conns = pool_cfg.map_or(10, |c| c.max_connections.max(1));
                     let pool = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(max_conns)
+                        .max_connections(10)
                         .acquire_timeout(timeout)
                         .connect(url)
                         .await?;
@@ -143,8 +129,7 @@ impl Database {
                             .max_lifetime(None)
                             .test_before_acquire(false);
                     } else {
-                        let max_conns = pool_cfg.map_or(4, |c| c.max_connections.max(1));
-                        pool_options = pool_options.max_connections(max_conns);
+                        pool_options = pool_options.max_connections(4);
                         if !read_only && !immutable {
                             options = options.journal_mode(SqliteJournalMode::Wal);
                             if !explicit_mode {
@@ -193,61 +178,33 @@ impl Database {
         }
     }
 
-    /// 查询指定运行下全部任务快照（按 `task_id` 升序）。
-    pub async fn list_tasks(
-        &self,
-        workflow_id: &str,
-        run_id: i64,
-    ) -> Result<Vec<TaskRecord>, StorageError> {
+    pub(crate) fn task_store(&self) -> Arc<dyn TaskStore> {
         match &self.0 {
             #[cfg(feature = "pg")]
             DatabasePool::Postgres(pool) => {
-                crate::backend::pgsql::PgTaskRepo::new(pool.clone())
-                    .list_tasks(workflow_id, run_id)
-                    .await
+                Arc::new(crate::backend::pgsql::PgTaskRepo::new(pool.clone()))
             }
             #[cfg(feature = "sqlite")]
             DatabasePool::Sqlite(pool) => {
-                crate::backend::sqlite::SqliteTaskRepo::new(pool.clone())
-                    .list_tasks(workflow_id, run_id)
-                    .await
+                Arc::new(crate::backend::sqlite::SqliteTaskRepo::new(pool.clone()))
             }
         }
     }
 
-    /// 获取指定运行的汇总状态与任务快照；不存在该运行时返回 `Ok(None)`。
-    pub async fn get_run(
+    /// 按底层后端能力启动跨进程唤醒监听器（PostgreSQL 启动 `PgListener`，SQLite 返回 `None`）。
+    pub(crate) fn spawn_wake_listener(
         &self,
-        workflow_id: &str,
-        run_id: i64,
-    ) -> Result<Option<RunSnapshot>, StorageError> {
-        let tasks = self.list_tasks(workflow_id, run_id).await?;
-        if tasks.is_empty() {
-            return Ok(None);
-        }
-        let status = RunStatus::from_tasks(&tasks);
-        Ok(Some(RunSnapshot {
-            workflow_id: workflow_id.to_owned(),
-            run_id,
-            status,
-            tasks,
-        }))
-    }
-
-    /// 取消指定运行的所有活跃任务（`pending`/`collecting`/`running`），返回被取消的任务数。
-    pub async fn cancel_run(&self, workflow_id: &str, run_id: i64) -> Result<usize, StorageError> {
+        on_wake: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         match &self.0 {
             #[cfg(feature = "pg")]
             DatabasePool::Postgres(pool) => {
-                crate::backend::pgsql::PgTaskRepo::new(pool.clone())
-                    .cancel_run(workflow_id, run_id)
-                    .await
+                Some(crate::backend::pgsql::spawn_wake_listener(pool.clone(), on_wake))
             }
             #[cfg(feature = "sqlite")]
-            DatabasePool::Sqlite(pool) => {
-                crate::backend::sqlite::SqliteTaskRepo::new(pool.clone())
-                    .cancel_run(workflow_id, run_id)
-                    .await
+            DatabasePool::Sqlite(_) => {
+                let _ = on_wake;
+                None
             }
         }
     }

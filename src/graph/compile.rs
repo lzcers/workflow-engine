@@ -1,4 +1,4 @@
-//! 图编译期预计算：隔离作用域路径、O(出度) 邻接索引与静态 JOIN 结算规则。
+//! 图编译期预计算：子图作用域路径、O(出度) 邻接索引与静态 JOIN 结算规则。
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,15 +14,8 @@ use crate::{
 impl<Ctx> Graph<Ctx> {
     /// 校验通过后预计算作用域路径、邻接索引与静态结算规则。
     pub(super) fn finalize(&mut self) {
-        let isolated_set: HashSet<&str> = self
-            .subgraphs
-            .iter()
-            .filter(|s| s.isolated)
-            .map(|s| s.id.as_str())
-            .collect();
         for entry in self.nodes.values_mut() {
             let path: Vec<Arc<str>> = subgraph_path(entry.subgraph_id.as_deref())
-                .filter(|id| isolated_set.contains(id))
                 .map(Arc::from)
                 .collect();
             entry.scope_path = Arc::from(path);
@@ -94,9 +87,9 @@ impl<Ctx> Graph<Ctx> {
             .filter(|spec| spec.required)
             .map(|spec| spec.key.to_owned())
             .collect();
-        let append_keys: Vec<String> = specs
+        let optional_append_slots: Vec<String> = specs
             .iter()
-            .filter(|spec| spec.merge == MergeMode::Append)
+            .filter(|spec| !spec.required && spec.merge == MergeMode::Append)
             .map(|spec| spec.key.to_owned())
             .collect();
 
@@ -143,9 +136,10 @@ impl<Ctx> Graph<Ctx> {
         upstreams.sort();
 
         JoinRule {
+            #[cfg(feature = "pg")]
             scope_depth: target_scope.len(),
             required_slots,
-            append_keys,
+            optional_append_slots,
             external_entries,
             upstreams,
         }

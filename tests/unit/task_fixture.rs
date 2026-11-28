@@ -33,7 +33,6 @@ pub(crate) fn plan(dst: &str, inputs: Vec<Value>) -> Successor {
         subgraph_path: Arc::from([]),
         inputs,
         dispatch: Dispatch::Shared,
-        max_attempts: None,
     }
 }
 

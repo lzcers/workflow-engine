@@ -12,23 +12,24 @@ use serde_json::Value;
 
 use super::node::AnyNode;
 use crate::{
-    EngineError,
-    task::{Dispatch, SettlementRules, Successor},
+    error::EngineError,
+    task::{Dispatch, SettlementRules, Successor, Task},
 };
 
 pub use crate::edge::{
     Arrow, Edge, EdgeError, EdgeKind, EdgeMode, direct, isolated_direct, isolated_expand,
     shared_expand,
 };
+pub use crate::error::GraphError;
 pub use crate::node::{
-    JoinInput, JoinNode, JoinSlot, MergeMode, Node, NodeContext, NodeError, NodeKey,
-    NodeRole as Role, RetryPolicy, SlotSpec, TaskType, Trigger,
+    JoinInput, JoinNode, JoinSlot, MergeMode, Node, NodeContext, NodeError, NodeKey, NodeRole,
+    SlotSpec, TaskType, Trigger,
 };
-pub use builder::{GraphBuilder, SubgraphBuilder};
+pub use builder::GraphBuilder;
 pub use description::{EdgeDescription, GraphDescription, NodeDescription, SubgraphDescription};
 pub use erased::ErasedGraph;
 
-/// 节点实例、展示信息与预计算的运行时隔离作用域路径共用一条记录。
+/// 节点实例、展示信息与预计算的子图作用域路径共用一条记录。
 struct GraphNode<Ctx> {
     node: Box<dyn AnyNode<Ctx>>,
     title: String,
@@ -94,12 +95,6 @@ impl<Ctx> Graph<Ctx> {
             .map(|entry| entry.node.role().task_type())
     }
 
-    pub fn retry_policy_of(&self, name: &str) -> Option<RetryPolicy> {
-        self.nodes
-            .get(name)
-            .and_then(|entry| entry.node.retry_policy())
-    }
-
     /// 入口提交前的强类型输入预校验（直接借用 `&Value`，零额外克隆）。
     pub fn validate_input(&self, name: &str, input: &Value) -> Result<(), EngineError> {
         let entry = self
@@ -107,6 +102,19 @@ impl<Ctx> Graph<Ctx> {
             .get(name)
             .ok_or_else(|| EngineError::UnknownNode(name.to_owned()))?;
         entry.node.validate_input(input).map_err(EngineError::Input)
+    }
+
+    /// 构造并强校验入口任务（解析子图作用域路径，O(1) 无全图克隆），
+    /// 可直接用于 `Database::in_transaction(&mut tx).submit(task)`。
+    pub fn task(&self, entry: &str, input: Value) -> Result<Task, EngineError> {
+        let node = self
+            .nodes
+            .get(entry)
+            .ok_or_else(|| EngineError::UnknownNode(entry.to_owned()))?;
+        node.node.validate_input(&input).map_err(EngineError::Input)?;
+        let mut task = Task::new(&self.workflow_id, entry, input);
+        task.subgraph_path = node.scope_path.iter().map(|s| s.to_string()).collect();
+        Ok(task)
     }
 
     /// 按节点名排序的外部触发声明；只读取声明，不建立监听。
@@ -132,13 +140,13 @@ impl<Ctx> Graph<Ctx> {
         node.node.execute(name, ctx, input).await
     }
 
-    /// 节点的运行时隔离作用域路径；根节点或仅属于纯视觉分组的节点为 Some([])，不存在为 None。
+    /// 节点所属子图作用域路径；根节点为 Some([])，不存在为 None。
     pub fn subgraph_path(&self, name: &str) -> Option<Vec<String>> {
         let entry = self.nodes.get(name)?;
         Some(entry.scope_path.iter().map(|s| s.to_string()).collect())
     }
 
-    /// O(出度) 规划成功后继，直接复用预计算的隔离作用域路径与目标重试预算。
+    /// O(出度) 规划成功后继，直接复用预计算的作用域路径。
     pub fn plan_success(&self, name: &str, out: &Value) -> Result<Vec<Successor>, EdgeError> {
         let Some(indices) = self.success_adj.get(name) else {
             return Ok(Vec::new());
@@ -191,10 +199,6 @@ impl<Ctx> Graph<Ctx> {
             subgraph_path: dst_entry.scope_path.clone(),
             inputs,
             dispatch,
-            max_attempts: dst_entry
-                .node
-                .retry_policy()
-                .map(RetryPolicy::effective_max_attempts),
         }
     }
 

@@ -21,19 +21,21 @@ type FailurePlannerFn =
 /// 内部规划器包装（对外部不透明）。
 #[doc(hidden)]
 pub struct BuiltPlanner {
+    pub(super) kind: EdgeKind,
     pub(super) has_condition: bool,
     pub(super) has_transform: bool,
     pub(super) planner: EdgePlanner,
 }
 
 impl BuiltPlanner {
-    pub(super) fn pass_through(mode: EdgeMode) -> Self {
+    pub(super) fn pass_through(kind: EdgeKind, mode: EdgeMode) -> Self {
         let planner = if mode.is_expand() {
             EdgePlanner::ExpandPassThrough
         } else {
             EdgePlanner::DirectPassThrough
         };
         Self {
+            kind,
             has_condition: false,
             has_transform: false,
             planner,
@@ -46,6 +48,7 @@ impl BuiltPlanner {
         f: impl Fn(&Value) -> Result<Vec<Value>, EdgeError> + Send + Sync + 'static,
     ) -> Self {
         Self {
+            kind: EdgeKind::Success,
             has_condition,
             has_transform,
             planner: EdgePlanner::Success(Box::new(f)),
@@ -58,6 +61,7 @@ impl BuiltPlanner {
         f: impl Fn(&Value, &NodeError) -> Result<Vec<Value>, EdgeError> + Send + Sync + 'static,
     ) -> Self {
         Self {
+            kind: EdgeKind::Failure,
             has_condition,
             has_transform,
             planner: EdgePlanner::Failure(Box::new(f)),

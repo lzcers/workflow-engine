@@ -1,33 +1,33 @@
-use std::collections::HashMap;
-
 use serde_json::json;
 
 use crate::node::MergeMode;
 
-use super::{materialize_join_input, record_join_slot};
+use super::merge_join_slot;
 
 #[test]
-fn join_slot_recording_and_append_materialization() {
-    let acc = record_join_slot(None, "image", MergeMode::Append, &[json!({"prompt": "a"})])
-        .unwrap();
-    assert_eq!(acc, json!({"image": []}));
-
-    let acc = record_join_slot(Some(acc), "summary", MergeMode::Set, &[json!(42)]).unwrap();
-    assert_eq!(acc, json!({"image": [], "summary": 42}));
-
-    let mut contribs = HashMap::new();
-    contribs.insert(
-        "image".to_owned(),
-        vec![json!({"prompt": "a"}), json!({"prompt": "b"})],
-    );
-    let final_input = materialize_join_input(
-        acc,
-        &["image".to_owned(), "optional_tags".to_owned()],
-        contribs,
+fn join_slot_merging_handles_set_append_and_optional_append_defaults() {
+    let opt = vec!["optional_tags".to_owned()];
+    let acc = merge_join_slot(
+        None,
+        &opt,
+        "image",
+        MergeMode::Append,
+        &[json!({"prompt": "a"})],
     )
     .unwrap();
+    assert_eq!(acc, json!({"image": [{"prompt": "a"}], "optional_tags": []}));
+
+    let acc = merge_join_slot(
+        Some(acc),
+        &opt,
+        "image",
+        MergeMode::Append,
+        &[json!({"prompt": "b"})],
+    )
+    .unwrap();
+    let acc = merge_join_slot(Some(acc), &opt, "summary", MergeMode::Set, &[json!(42)]).unwrap();
     assert_eq!(
-        final_input,
+        acc,
         json!({
             "image": [{"prompt": "a"}, {"prompt": "b"}],
             "summary": 42,

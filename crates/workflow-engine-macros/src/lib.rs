@@ -124,10 +124,9 @@ fn register(
                 } else {
                     quote! { Some(#parent) }
                 };
-                let isolated = subgraph.isolated;
                 statements.extend(quote! {
                     let __workflow_builder = __workflow_builder.subgraph_with(
-                        #name, #title, #description, #owner, #isolated
+                        #name, #title, #description, #owner
                     );
                 });
                 register(&subgraph.region, &name, keys, statements)?;

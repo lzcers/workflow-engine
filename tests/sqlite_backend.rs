@@ -1,12 +1,12 @@
-//! 通过公开 API 验证工作流创建恢复、提交预检、并发额度与运行控制面（get/cancel/wait）。
+//! 通过公开 API 验证工作流创建恢复、提交预检与并发额度。
 
 use std::{sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use workflow_engine::{
-    Engine, EngineError, Graph, Node, NodeContext, NodeError, RunStatus, TaskRecord, TaskStatus,
-    Trigger, WorkerOptions, graph::TaskType,
+    Engine, EngineError, Graph, Node, NodeContext, NodeError, TaskRecord, TaskStatus, Trigger,
+    graph::TaskType,
 };
 
 #[derive(Default)]
@@ -102,14 +102,6 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
     assert_ne!(first.run_id, second.run_id);
     assert_ne!(first.run_id, manual.run_id);
     assert_ne!(second.run_id, manual.run_id);
-
-    // 直接通过 wait_run 等待运行完成并检查快照。
-    let snap = tokio::time::timeout(Duration::from_secs(5), workflow.wait_run(first.run_id))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(snap.status, RunStatus::Succeeded);
-    assert_eq!(snap.tasks.len(), 2);
 
     let mut observed = tokio::time::timeout(Duration::from_secs(5), async {
         let mut observed = Vec::new();
@@ -410,54 +402,4 @@ async fn workflow_shares_slots_and_supports_cancel_and_run_task_limit() {
     assert_eq!(completed_runs, submitted_runs);
     submitted_runs.dedup();
     assert_eq!(submitted_runs.len(), 12);
-
-    // 取消运行：阻塞任务被标记为 Cancelled，wait_run 立即返回 Cancelled。
-    let to_cancel = workflow.submit("start", 77).await.unwrap();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), starts.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-        77
-    );
-    assert_eq!(workflow.cancel_run(to_cancel.run_id).await.unwrap(), 1);
-    let cancelled = workflow.wait_run(to_cancel.run_id).await.unwrap();
-    assert_eq!(cancelled.status, RunStatus::Cancelled);
-    release.add_permits(1);
-
-    // 失败环护栏：a <-> b on_error 在达到 max_tasks_per_run 后自动终止为 Failed。
-    struct AlwaysFail;
-    impl Node<Context> for AlwaysFail {
-        type In = i32;
-        type Out = i32;
-        async fn execute(&self, _: &mut Context, _: i32) -> Result<i32, NodeError> {
-            Err(NodeError::permanent("loop boom"))
-        }
-    }
-    let loop_graph = workflow_engine::workflow! {
-        workflow_id: "loop-guard";
-        title: "Failure loop guard";
-        context: Context::default();
-        nodes { a => AlwaysFail, b => AlwaysFail }
-        edges {
-            a -> b on_error,
-            b -> a on_error,
-        }
-    }
-    .unwrap();
-    let loop_wf = engine.make_with(
-        loop_graph,
-        WorkerOptions {
-            max_tasks_per_run: 4,
-            ..WorkerOptions::default()
-        },
-    );
-    let loop_run = loop_wf.submit("a", 1).await.unwrap();
-    let snap = tokio::time::timeout(Duration::from_secs(5), loop_wf.wait_run(loop_run.run_id))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(snap.status, RunStatus::Failed);
-    assert_eq!(snap.tasks.len(), 4);
-    assert!(snap.tasks.last().unwrap().error.as_deref().unwrap().contains("exceeded max tasks limit"));
 }

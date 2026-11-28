@@ -6,17 +6,17 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::{rows::TaskRow, scope, tx::PgTx};
+use super::{PG_NOTIFY_CHANNEL, rows::TaskRow, scope, tx::PgTx};
 use crate::backend::{
-    BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, PG_NOTIFY_CHANNEL, ROW_COLS, claim_lost,
-    common::enqueue_fanouts_and_advance,
+    BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, ROW_COLS, claim_lost,
+    common::{SettleOutcome, enqueue_fanouts_and_advance},
 };
 use crate::error::StorageError;
 use crate::task::{
-    DEFAULT_MAX_ATTEMPTS, SettlementConfig, SettlementRules, Successor, TaskStore,
-    scope::ScopeRecord, store::FanoutSource,
+    MAX_ATTEMPTS, RunHandle, SettlementRules, Successor, Task, TaskRecord, TaskStore,
+    scope::ScopeRecord,
+    store::{FanoutSource, LEASE_DURATION},
 };
-use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
 
 async fn notify_workflow(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -30,53 +30,50 @@ async fn notify_workflow(
     Ok(())
 }
 
-impl Database<&mut sqlx::Transaction<'_, sqlx::Postgres>> {
-    /// 在宿主事务内创建独立运行，同时建立入口所属的隔离作用域并发送 PG NOTIFY。
-    pub async fn submit(self, task: Task) -> Result<RunHandle, StorageError> {
-        let tx = self.0;
-        let run_id: i64 =
-            sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('tasks', 'task_id'))")
-                .fetch_one(&mut **tx)
-                .await?;
-        let scope_id = scope::enter(
-            tx,
-            &task.workflow_id,
-            run_id,
-            run_id,
-            None,
-            &task.subgraph_path,
-            None,
-        )
-        .await?;
-        let max_attempts = task.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS).max(1);
-        sqlx::query(
-            "INSERT INTO tasks (workflow_id, task_id, run_id, name, status, input_json, scope_id, max_attempts)
-             VALUES ($1, $2, $2, $3, 'pending', $4, $5, $6)",
-        )
-        .bind(&task.workflow_id)
-        .bind(run_id)
-        .bind(task.name)
-        .bind(task.input)
-        .bind(scope_id)
-        .bind(max_attempts)
-        .execute(&mut **tx)
-        .await?;
-        notify_workflow(tx, &task.workflow_id).await?;
-        Ok(RunHandle {
-            workflow_id: task.workflow_id,
-            run_id,
-        })
-    }
+/// 在给定 PostgreSQL 事务内创建独立运行，同时建立入口所属的隔离作用域并发送 PG NOTIFY。
+pub(crate) async fn submit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task: Task,
+) -> Result<RunHandle, StorageError> {
+    let run_id: i64 =
+        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('tasks', 'task_id'))")
+            .fetch_one(&mut **tx)
+            .await?;
+    let scope_id = scope::enter(
+        tx,
+        &task.workflow_id,
+        run_id,
+        run_id,
+        None,
+        &task.subgraph_path,
+        None,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO tasks (workflow_id, task_id, run_id, name, status, input_json, scope_id)
+         VALUES ($1, $2, $2, $3, 'pending', $4, $5)",
+    )
+    .bind(&task.workflow_id)
+    .bind(run_id)
+    .bind(task.name)
+    .bind(task.input)
+    .bind(scope_id)
+    .execute(&mut **tx)
+    .await?;
+    notify_workflow(tx, &task.workflow_id).await?;
+    Ok(RunHandle {
+        workflow_id: task.workflow_id,
+        run_id,
+    })
 }
 
-/// 仅当前有效认领可以提交终态；使用任务行上的 `max_attempts` 列做动态预算校验。
+/// 仅当前有效认领可以提交终态；使用统一 [`MAX_ATTEMPTS`] 做预算校验。
 async fn settle_in_tx<'a>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     task: &'a TaskRecord,
-    status: TaskStatus,
-    output: Option<&Value>,
-    error: Option<&str>,
+    outcome: SettleOutcome<'_>,
 ) -> Result<FanoutSource<'a>, StorageError> {
+    let (status, output, error) = outcome.parts();
     let (run_id, scope_id) = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -85,7 +82,7 @@ async fn settle_in_tx<'a>(
         WHERE workflow_id = $1 AND task_id = $2
           AND attempt = $3
           AND status = 'running' AND lease_until > clock_timestamp()
-          AND ($4 IN ('failed', 'superseded') OR attempt <= max_attempts)
+          AND ($4 IN ('failed', 'superseded') OR attempt <= $7)
         RETURNING run_id, scope_id
         "#,
     )
@@ -95,6 +92,7 @@ async fn settle_in_tx<'a>(
     .bind(status.as_str())
     .bind(output)
     .bind(error)
+    .bind(MAX_ATTEMPTS)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| claim_lost(task))?;
@@ -191,18 +189,50 @@ impl PgTaskRepo {
         }
         Ok(chain)
     }
+
+    async fn settle(
+        &self,
+        task: &TaskRecord,
+        outcome: SettleOutcome<'_>,
+        successors: &[Successor],
+        rules: &SettlementRules,
+    ) -> Result<(), StorageError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await?;
+        let chain = Self::lock_settlement(&mut tx, task, rules).await?;
+        let settled = settle_in_tx(&mut tx, task, outcome).await?;
+        let created_pending = enqueue_fanouts_and_advance(
+            &mut PgTx(&mut tx),
+            &settled,
+            successors,
+            rules,
+            chain,
+        )
+        .await?;
+        if created_pending {
+            notify_workflow(&mut tx, &task.workflow_id).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 impl TaskStore for PgTaskRepo {
     fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, StorageError>> {
-        Box::pin(async move { Database::from(self.pool.clone()).submit(task).await })
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await?;
+            let run = submit_in_tx(&mut tx, task).await?;
+            tx.commit().await?;
+            Ok(run)
+        })
     }
 
     fn claim_many<'a>(
         &'a self,
         workflow_id: &'a str,
         limit: usize,
-        lease_duration: Duration,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
         Box::pin(async move {
             if limit == 0 {
@@ -224,7 +254,7 @@ impl TaskStore for PgTaskRepo {
                 )
                 UPDATE tasks
                 SET status = 'running',
-                    error = CASE WHEN attempt >= max_attempts THEN
+                    error = CASE WHEN attempt >= $6 THEN
                         COALESCE(error, CASE WHEN lease_until IS NOT NULL THEN $4 ELSE $5 END)
                         ELSE NULL END,
                     available_at = NULL,
@@ -238,10 +268,11 @@ impl TaskStore for PgTaskRepo {
             );
             let mut rows = sqlx::query_as::<_, TaskRow>(&sql)
                 .bind(workflow_id)
-                .bind(lease_duration.as_secs_f64())
+                .bind(LEASE_DURATION.as_secs_f64())
                 .bind(i64::try_from(limit).unwrap_or(i64::MAX))
                 .bind(LEASE_EXPIRED_ERR)
                 .bind(BUDGET_EXHAUSTED_ERR)
+                .bind(MAX_ATTEMPTS)
                 .fetch_all(&mut *tx)
                 .await?;
             tx.commit().await?;
@@ -253,7 +284,6 @@ impl TaskStore for PgTaskRepo {
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
-        lease_duration: Duration,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
         Box::pin(async move {
             let mut tx = self.pool.begin().await?;
@@ -276,7 +306,7 @@ impl TaskStore for PgTaskRepo {
             .bind(&task.workflow_id)
             .bind(task.task_id)
             .bind(task.attempt)
-            .bind(lease_duration.as_secs_f64())
+            .bind(LEASE_DURATION.as_secs_f64())
             .fetch_optional(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -290,30 +320,10 @@ impl TaskStore for PgTaskRepo {
         output: &'a Value,
         successors: &'a [Successor],
         rules: &'a SettlementRules,
-        config: SettlementConfig,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
-                .await?;
-            let chain = Self::lock_settlement(&mut tx, task, rules).await?;
-            let settled =
-                settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
-            let created_pending = enqueue_fanouts_and_advance(
-                &mut PgTx(&mut tx),
-                &settled,
-                successors,
-                rules,
-                config,
-                chain,
-            )
-            .await?;
-            if created_pending {
-                notify_workflow(&mut tx, &task.workflow_id).await?;
-            }
-            tx.commit().await?;
-            Ok(())
+            self.settle(task, SettleOutcome::Succeeded(output), successors, rules)
+                .await
         })
     }
 
@@ -323,34 +333,15 @@ impl TaskStore for PgTaskRepo {
         message: &'a str,
         successors: &'a [Successor],
         rules: &'a SettlementRules,
-        config: SettlementConfig,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
-                .await?;
-            let chain = Self::lock_settlement(&mut tx, task, rules).await?;
-            let status = if successors.iter().all(|plan| plan.inputs.is_empty()) {
-                TaskStatus::Failed
-            } else {
-                TaskStatus::Superseded
-            };
-            let settled = settle_in_tx(&mut tx, task, status, None, Some(message)).await?;
-            let created_pending = enqueue_fanouts_and_advance(
-                &mut PgTx(&mut tx),
-                &settled,
+            self.settle(
+                task,
+                SettleOutcome::failure(message, successors),
                 successors,
                 rules,
-                config,
-                chain,
             )
-            .await?;
-            if created_pending {
-                notify_workflow(&mut tx, &task.workflow_id).await?;
-            }
-            tx.commit().await?;
-            Ok(())
+            .await
         })
     }
 
@@ -371,7 +362,7 @@ impl TaskStore for PgTaskRepo {
                     updated_at = clock_timestamp()
                 WHERE workflow_id = $1 AND task_id = $2
                   AND attempt = $3
-                  AND status = 'running' AND attempt < max_attempts
+                  AND status = 'running' AND attempt < $6
                   AND lease_until > clock_timestamp()
                 "#,
             )
@@ -380,6 +371,7 @@ impl TaskStore for PgTaskRepo {
             .bind(task.attempt)
             .bind(message)
             .bind(delay.as_secs_f64())
+            .bind(MAX_ATTEMPTS)
             .execute(&mut *tx)
             .await?;
             if result.rows_affected() == 0 {
@@ -405,7 +397,7 @@ impl TaskStore for PgTaskRepo {
                 SET lease_until = NULL,
                     error = COALESCE($4, error),
                     available_at = CASE
-                        WHEN $5::double precision IS NOT NULL AND attempt < max_attempts
+                        WHEN $5::double precision IS NOT NULL AND attempt < $6
                         THEN clock_timestamp() + make_interval(secs => $5)
                         ELSE available_at
                     END,
@@ -420,6 +412,7 @@ impl TaskStore for PgTaskRepo {
             .bind(task.attempt)
             .bind(error)
             .bind(delay.map(|d| d.as_secs_f64()))
+            .bind(MAX_ATTEMPTS)
             .execute(&mut *tx)
             .await?;
             if result.rows_affected() == 0 {
@@ -452,59 +445,6 @@ impl TaskStore for PgTaskRepo {
             .fetch_all(&self.pool)
             .await?;
             Ok(ids)
-        })
-    }
-
-    fn list_tasks<'a>(
-        &'a self,
-        workflow_id: &'a str,
-        run_id: i64,
-    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(async move {
-            let sql = format!(
-                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = $1 AND run_id = $2 ORDER BY task_id"
-            );
-            let rows = sqlx::query_as::<_, TaskRow>(&sql)
-                .bind(workflow_id)
-                .bind(run_id)
-                .fetch_all(&self.pool)
-                .await?;
-            Ok(rows.into_iter().map(TaskRecord::from).collect())
-        })
-    }
-
-    fn cancel_run<'a>(
-        &'a self,
-        workflow_id: &'a str,
-        run_id: i64,
-    ) -> BoxFuture<'a, Result<usize, StorageError>> {
-        Box::pin(async move {
-            let mut tx = self.pool.begin().await?;
-            let cancelled: Vec<i64> = sqlx::query_scalar(
-                r#"
-                UPDATE tasks
-                SET status = 'cancelled', lease_until = NULL, available_at = NULL,
-                    updated_at = clock_timestamp()
-                WHERE workflow_id = $1 AND run_id = $2
-                  AND status IN ('pending', 'collecting', 'running')
-                RETURNING task_id
-                "#,
-            )
-            .bind(workflow_id)
-            .bind(run_id)
-            .fetch_all(&mut *tx)
-            .await?;
-            if !cancelled.is_empty() {
-                sqlx::query(
-                    "DELETE FROM join_contributions WHERE workflow_id = $1 AND task_id = ANY($2)",
-                )
-                .bind(workflow_id)
-                .bind(&cancelled)
-                .execute(&mut *tx)
-                .await?;
-            }
-            tx.commit().await?;
-            Ok(cancelled.len())
         })
     }
 }

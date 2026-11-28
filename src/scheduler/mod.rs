@@ -1,11 +1,11 @@
 //! 单图调度器：认领当前工作流任务、维护并发执行槽、独立排空回调与优雅停机。
 //!
-//! 关键改进：
 //! - 轻载不发冗余 `claim_many`：仅当本批认领满槽（`claimed == available`）时立即续查；
-//! - 回调与执行槽彻底解耦：结算落库后立即释放执行槽并唤醒下游认领，`NodeContext` 回调在独立 `JoinSet` 中运行，停机时一并排空；
-//! - 崩溃与结算异常在 `release_claim` 中保留原始诊断信息并附加短暂退避；超出单次运行任务数上限时立即以永久失败结算。
+//! - 回调与执行槽解耦：结算落库后立即释放执行槽并唤醒下游认领，`NodeContext` 回调在独立 `JoinSet` 中运行，停机时一并排空；
+//! - 崩溃与结算异常在 `release_claim` 中保留原始诊断信息并附加短暂退避。
 
 mod runner;
+mod wake_hub;
 
 use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
@@ -18,14 +18,12 @@ use tokio::{
 use tracing::{error, info};
 
 use runner::{ExecutionOutcome, notify_outcome, panic_detail, run_task};
+pub(crate) use wake_hub::{HubRegistration, WakeHub};
 
 use crate::{
     graph::Graph,
-    node::{NodeContext, RetryPolicy},
-    task::{
-        SettlementConfig, TaskRecord, TaskStore,
-        store::{DEFAULT_LEASE_DURATION, DEFAULT_MAX_TASKS_PER_RUN},
-    },
+    node::NodeContext,
+    task::{TaskRecord, TaskStore, store::LEASE_DURATION},
 };
 
 pub(crate) const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -41,11 +39,7 @@ where
     poll: Duration,
     shared_poller: bool,
     max_concurrency: usize,
-    lease_duration: Duration,
-    default_retry: RetryPolicy,
-    max_tasks_per_run: usize,
     wake: Arc<Notify>,
-    settled: Arc<Notify>,
     shutdown: Option<watch::Receiver<bool>>,
 }
 
@@ -61,11 +55,7 @@ where
             poll,
             shared_poller: false,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
-            lease_duration: DEFAULT_LEASE_DURATION,
-            default_retry: RetryPolicy::default(),
-            max_tasks_per_run: DEFAULT_MAX_TASKS_PER_RUN,
             wake: Arc::new(Notify::new()),
-            settled: Arc::new(Notify::new()),
             shutdown: None,
         }
     }
@@ -75,28 +65,8 @@ where
         self
     }
 
-    pub(crate) fn with_lease_duration(mut self, duration: Duration) -> Self {
-        self.lease_duration = duration.max(Duration::from_secs(3));
-        self
-    }
-
-    pub(crate) fn with_default_retry(mut self, policy: RetryPolicy) -> Self {
-        self.default_retry = policy;
-        self
-    }
-
-    pub(crate) fn with_max_tasks_per_run(mut self, limit: usize) -> Self {
-        self.max_tasks_per_run = limit;
-        self
-    }
-
     pub(crate) fn with_wake(mut self, wake: Arc<Notify>) -> Self {
         self.wake = wake;
-        self
-    }
-
-    pub(crate) fn with_settled(mut self, settled: Arc<Notify>) -> Self {
-        self.settled = settled;
         self
     }
 
@@ -109,13 +79,6 @@ where
     pub(crate) fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
         self.shutdown = Some(shutdown);
         self
-    }
-
-    fn settlement_config(&self) -> SettlementConfig {
-        SettlementConfig {
-            default_max_attempts: self.default_retry.effective_max_attempts(),
-            max_tasks_per_run: self.max_tasks_per_run,
-        }
     }
 
     /// 持续驱动当前图，直到收到停机信号且在途任务与回调全部退出，或此 future 被取消。
@@ -139,8 +102,7 @@ where
     ) {
         match result {
             Ok(Some((task, outcome))) => {
-                // 结算已落库：唤醒本地 wait_run 与下游认领，并在独立回调集合中执行钩子（不占执行槽）。
-                self.settled.notify_waiters();
+                // 结算已落库：立即唤醒下游认领，并在独立回调集合中执行钩子（不占执行槽）。
                 if matches!(
                     outcome,
                     ExecutionOutcome::Success { ref successors, .. }
@@ -201,8 +163,6 @@ where
             let available = self.max_concurrency - in_flight.len();
             if available > 0 {
                 let claimed = self.claim_and_spawn(in_flight, available).await;
-                // 只有打满本批额度时才立即循环补槽；返回少于额度说明当前无更多可认领任务，
-                // 避免顺序流/轻载下每次都多打一倍必然空集的 claim_many 查询。
                 if claimed == available {
                     continue;
                 }
@@ -234,13 +194,8 @@ where
         in_flight: &mut JoinSet<Option<(TaskRecord, ExecutionOutcome<Ctx>)>>,
         limit: usize,
     ) -> usize {
-        let lease_duration = self.lease_duration;
-        let lease_deadline = Instant::now() + lease_duration;
-        match self
-            .store
-            .claim_many(self.graph.workflow_id(), limit, lease_duration)
-            .await
-        {
+        let lease_deadline = Instant::now() + LEASE_DURATION;
+        match self.store.claim_many(self.graph.workflow_id(), limit).await {
             Ok(tasks) => {
                 let count = tasks.len();
                 if count > 0 {
@@ -251,16 +206,12 @@ where
                         "claim tasks"
                     );
                 }
-                let config = self.settlement_config();
                 for task in tasks {
                     in_flight.spawn(run_task(
                         self.graph.clone(),
                         self.store.clone(),
                         task,
                         lease_deadline,
-                        lease_duration,
-                        self.default_retry,
-                        config,
                     ));
                 }
                 count
@@ -282,7 +233,7 @@ fn is_shutting_down(shutdown: &Option<watch::Receiver<bool>>) -> bool {
 async fn wait_shutdown(shutdown: &mut Option<watch::Receiver<bool>>) {
     let Some(rx) = shutdown.as_mut() else {
         std::future::pending::<()>().await;
-        unreachable!()
+        return;
     };
     while !*rx.borrow() {
         if rx.changed().await.is_err() {

@@ -14,7 +14,6 @@ mod keyword {
     syn::custom_keyword!(nodes);
     syn::custom_keyword!(edges);
     syn::custom_keyword!(subgraph);
-    syn::custom_keyword!(group);
     syn::custom_keyword!(on_error);
     syn::custom_keyword!(when);
     syn::custom_keyword!(when_error);
@@ -49,7 +48,6 @@ pub struct Node {
 pub struct Subgraph {
     pub name: Ident,
     pub attributes: Vec<Attribute>,
-    pub isolated: bool,
     pub region: Region,
 }
 
@@ -133,27 +131,15 @@ impl Parse for Region {
                         body.parse::<Token![,]>()?;
                     }
                 }
-            } else if input.peek(keyword::subgraph)
-                || input.peek(keyword::group)
-                || input.peek(Token![#])
-            {
+            } else if input.peek(keyword::subgraph) || input.peek(Token![#]) {
                 let attributes = input.call(Attribute::parse_outer)?;
-                let isolated = if input.peek(keyword::subgraph) {
-                    input.parse::<keyword::subgraph>()?;
-                    true
-                } else if input.peek(keyword::group) {
-                    input.parse::<keyword::group>()?;
-                    false
-                } else {
-                    return Err(input.error("expected `subgraph` or `group` after attributes"));
-                };
+                input.parse::<keyword::subgraph>()?;
                 let name = input.parse()?;
                 let body;
                 braced!(body in input);
                 region.items.push(RegionItem::Subgraph(Subgraph {
                     name,
                     attributes,
-                    isolated,
                     region: body.parse()?,
                 }));
             } else if input.peek(keyword::edges) {
@@ -169,7 +155,7 @@ impl Parse for Region {
                 }
                 region.items.push(RegionItem::Edges(edges));
             } else {
-                return Err(input.error("expected nodes, subgraph, group, or edges"));
+                return Err(input.error("expected nodes, subgraph, or edges"));
             }
         }
         Ok(region)

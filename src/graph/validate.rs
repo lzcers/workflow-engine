@@ -41,12 +41,6 @@ impl<Ctx> Graph<Ctx> {
             }
         }
 
-        let isolated_set: HashSet<&str> = self
-            .subgraphs
-            .iter()
-            .filter(|s| s.isolated)
-            .map(|s| s.id.as_str())
-            .collect();
         let mut covered_slots: HashMap<(&str, &str), usize> = HashMap::new();
         let mut in_scope_unconditional_set: HashMap<(&str, &str), usize> = HashMap::new();
 
@@ -126,8 +120,10 @@ impl<Ctx> Graph<Ctx> {
                         && spec.merge == MergeMode::Set
                         && !edge.has_condition()
                     {
-                        let src_scopes = isolated_path(src_node.subgraph_id.as_deref(), &isolated_set);
-                        let dst_scopes = isolated_path(dst_node.subgraph_id.as_deref(), &isolated_set);
+                        let src_scopes: Vec<_> =
+                            subgraph_path(src_node.subgraph_id.as_deref()).collect();
+                        let dst_scopes: Vec<_> =
+                            subgraph_path(dst_node.subgraph_id.as_deref()).collect();
                         if src_scopes.starts_with(&dst_scopes) {
                             let count = in_scope_unconditional_set
                                 .entry((dst, spec.key))
@@ -214,7 +210,7 @@ impl<Ctx> Graph<Ctx> {
             return Err(GraphError::SuccessCycle);
         }
 
-        // failure 回边禁止指回自身（非自环循环由运行期 max_tasks_per_run 护栏限制）。
+        // failure 回边禁止指回自身。
         for e in &self.failure_edges {
             if e.src() == e.dst() {
                 return Err(GraphError::FailureSelfLoop {
@@ -281,12 +277,6 @@ pub(super) fn validate_node_owner(id: &str, subgraph: Option<&str>) -> Result<()
     Ok(())
 }
 
-fn isolated_path<'a>(owner: Option<&'a str>, isolated_set: &HashSet<&str>) -> Vec<&'a str> {
-    subgraph_path(owner)
-        .filter(|id| isolated_set.contains(id))
-        .collect()
-}
-
 pub(super) fn validate_subgraphs<'a>(
     nodes: impl Iterator<Item = (&'a str, Option<&'a str>, bool)> + Clone,
     subgraphs: impl Iterator<Item = &'a SubgraphDescription> + Clone,
@@ -301,15 +291,11 @@ pub(super) fn validate_subgraphs<'a>(
     }
 
     let mut groups = HashSet::new();
-    let mut isolated_groups = HashSet::new();
     for group in subgraphs.clone() {
         if !groups.insert(group.id.as_str()) || owners.contains_key(group.id.as_str()) {
             return Err(GraphError::DuplicateSubgraph(group.id.clone()));
         }
         validate_subgraph_desc(group)?;
-        if group.isolated {
-            isolated_groups.insert(group.id.as_str());
-        }
     }
     for group in subgraphs {
         if let Some(parent) = &group.parent_id
@@ -340,8 +326,8 @@ pub(super) fn validate_subgraphs<'a>(
                     detail: "isolated edge (->! / ->+) must not target a JOIN node".into(),
                 });
             }
-            let src_scopes = isolated_path(source_group, &isolated_groups);
-            let dst_scopes = isolated_path(destination_group, &isolated_groups);
+            let src_scopes: Vec<_> = subgraph_path(source_group).collect();
+            let dst_scopes: Vec<_> = subgraph_path(destination_group).collect();
             let common = src_scopes
                 .iter()
                 .zip(&dst_scopes)
@@ -351,7 +337,7 @@ pub(super) fn validate_subgraphs<'a>(
                 return Err(GraphError::InvalidEdge {
                     src: src.to_owned(),
                     dst: dst.to_owned(),
-                    detail: "isolated edge (->! / ->+) must enter a new isolated subgraph".into(),
+                    detail: "isolated edge (->! / ->+) must enter a new subgraph".into(),
                 });
             }
         }

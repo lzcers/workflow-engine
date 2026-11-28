@@ -9,14 +9,13 @@ use sqlx::{SqlitePool, types::Json};
 use super::{rows::TaskRow, scope, tx::SqliteTx};
 use crate::backend::{
     BUDGET_EXHAUSTED_ERR, LEASE_EXPIRED_ERR, ROW_COLS, claim_lost,
-    common::enqueue_fanouts_and_advance,
+    common::{SettleOutcome, enqueue_fanouts_and_advance},
 };
 use crate::error::StorageError;
 use crate::task::{
-    DEFAULT_MAX_ATTEMPTS, SettlementConfig, SettlementRules, Successor, TaskStore,
-    store::FanoutSource,
+    MAX_ATTEMPTS, RunHandle, SettlementRules, Successor, Task, TaskRecord, TaskStore,
+    store::{FanoutSource, LEASE_DURATION},
 };
-use crate::{Database, RunHandle, Task, TaskRecord, TaskStatus};
 
 /// SQLite task repository shared across workflow graphs.
 #[derive(Clone)]
@@ -24,52 +23,49 @@ pub(crate) struct SqliteTaskRepo {
     pub(super) pool: SqlitePool,
 }
 
-impl Database<&mut sqlx::Transaction<'_, sqlx::Sqlite>> {
-    /// 提交独立运行的入口；调用方使用 `BEGIN IMMEDIATE` 事务可避免读升写触发 `SQLITE_BUSY`。
-    pub async fn submit(self, task: Task) -> Result<RunHandle, StorageError> {
-        let tx = self.0;
-        let max_attempts = task.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS).max(1);
-        let run_id = sqlx::query(
-            "INSERT INTO tasks (workflow_id, name, status, input_json, max_attempts)
-             VALUES (?1, ?2, 'pending', ?3, ?4)",
-        )
-        .bind(&task.workflow_id)
-        .bind(&task.name)
-        .bind(&task.input)
-        .bind(max_attempts)
+/// 在给定 SQLite 事务内创建独立运行，同时建立入口所属的隔离作用域。
+pub(crate) async fn submit_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task: Task,
+) -> Result<RunHandle, StorageError> {
+    let run_id = sqlx::query(
+        "INSERT INTO tasks (workflow_id, name, status, input_json)
+         VALUES (?1, ?2, 'pending', ?3)",
+    )
+    .bind(&task.workflow_id)
+    .bind(&task.name)
+    .bind(&task.input)
+    .execute(&mut **tx)
+    .await?
+    .last_insert_rowid();
+    let scope_id = scope::enter(
+        tx,
+        &task.workflow_id,
+        run_id,
+        run_id,
+        None,
+        &task.subgraph_path,
+        None,
+    )
+    .await?;
+    sqlx::query("UPDATE tasks SET run_id = task_id, scope_id = ?1 WHERE task_id = ?2")
+        .bind(scope_id)
+        .bind(run_id)
         .execute(&mut **tx)
-        .await?
-        .last_insert_rowid();
-        let scope_id = scope::enter(
-            tx,
-            &task.workflow_id,
-            run_id,
-            run_id,
-            None,
-            &task.subgraph_path,
-            None,
-        )
         .await?;
-        sqlx::query("UPDATE tasks SET run_id = task_id, scope_id = ?1 WHERE task_id = ?2")
-            .bind(scope_id)
-            .bind(run_id)
-            .execute(&mut **tx)
-            .await?;
-        Ok(RunHandle {
-            workflow_id: task.workflow_id,
-            run_id,
-        })
-    }
+    Ok(RunHandle {
+        workflow_id: task.workflow_id,
+        run_id,
+    })
 }
 
 /// 仅当前有效认领可以提交终态；定长 UTC 文本直接比较（无 `julianday` 包装）。
 async fn settle_in_tx<'a>(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     task: &'a TaskRecord,
-    status: TaskStatus,
-    output: Option<&Value>,
-    error: Option<&str>,
+    outcome: SettleOutcome<'_>,
 ) -> Result<FanoutSource<'a>, StorageError> {
+    let (status, output, error) = outcome.parts();
     let (run_id, scope_id) = sqlx::query_as(
         r#"
         UPDATE tasks
@@ -77,7 +73,7 @@ async fn settle_in_tx<'a>(
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE workflow_id = ?1 AND task_id = ?2
           AND status = 'running' AND attempt = ?6
-          AND (?3 IN ('failed', 'superseded') OR attempt <= max_attempts)
+          AND (?3 IN ('failed', 'superseded') OR attempt <= ?7)
           AND lease_until > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         RETURNING run_id, scope_id
         "#,
@@ -88,6 +84,7 @@ async fn settle_in_tx<'a>(
     .bind(output)
     .bind(error)
     .bind(task.attempt)
+    .bind(MAX_ATTEMPTS)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| claim_lost(task))?;
@@ -104,18 +101,37 @@ impl SqliteTaskRepo {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    async fn settle(
+        &self,
+        task: &TaskRecord,
+        outcome: SettleOutcome<'_>,
+        successors: &[Successor],
+        rules: &SettlementRules,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let source = settle_in_tx(&mut tx, task, outcome).await?;
+        enqueue_fanouts_and_advance(&mut SqliteTx(&mut tx), &source, successors, rules, None)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 impl TaskStore for SqliteTaskRepo {
     fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, StorageError>> {
-        Box::pin(async move { Database::from(self.pool.clone()).submit(task).await })
+        Box::pin(async move {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let run = submit_in_tx(&mut tx, task).await?;
+            tx.commit().await?;
+            Ok(run)
+        })
     }
 
     fn claim_many<'a>(
         &'a self,
         workflow_id: &'a str,
         limit: usize,
-        lease_duration: Duration,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
         Box::pin(async move {
             if limit == 0 {
@@ -134,7 +150,7 @@ impl TaskStore for SqliteTaskRepo {
                 )
                 UPDATE tasks
                 SET status = 'running',
-                    error = CASE WHEN attempt >= max_attempts THEN COALESCE(error,
+                    error = CASE WHEN attempt >= ?6 THEN COALESCE(error,
                         CASE WHEN lease_until IS NOT NULL THEN ?4 ELSE ?5 END)
                         ELSE NULL END,
                     available_at = NULL,
@@ -147,10 +163,11 @@ impl TaskStore for SqliteTaskRepo {
             );
             let mut rows = sqlx::query_as::<_, TaskRow>(&sql)
                 .bind(workflow_id)
-                .bind(lease_duration.as_secs_f64())
+                .bind(LEASE_DURATION.as_secs_f64())
                 .bind(i64::try_from(limit).unwrap_or(i64::MAX))
                 .bind(LEASE_EXPIRED_ERR)
                 .bind(BUDGET_EXHAUSTED_ERR)
+                .bind(MAX_ATTEMPTS)
                 .fetch_all(&mut *tx)
                 .await?;
             tx.commit().await?;
@@ -162,7 +179,6 @@ impl TaskStore for SqliteTaskRepo {
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
-        lease_duration: Duration,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
         Box::pin(async move {
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -181,7 +197,7 @@ impl TaskStore for SqliteTaskRepo {
             .bind(&task.workflow_id)
             .bind(task.task_id)
             .bind(task.attempt)
-            .bind(lease_duration.as_secs_f64())
+            .bind(LEASE_DURATION.as_secs_f64())
             .fetch_optional(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -195,23 +211,10 @@ impl TaskStore for SqliteTaskRepo {
         output: &'a Value,
         successors: &'a [Successor],
         rules: &'a SettlementRules,
-        config: SettlementConfig,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            let source =
-                settle_in_tx(&mut tx, task, TaskStatus::Succeeded, Some(output), None).await?;
-            enqueue_fanouts_and_advance(
-                &mut SqliteTx(&mut tx),
-                &source,
-                successors,
-                rules,
-                config,
-                None,
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(())
+            self.settle(task, SettleOutcome::Succeeded(output), successors, rules)
+                .await
         })
     }
 
@@ -221,27 +224,15 @@ impl TaskStore for SqliteTaskRepo {
         message: &'a str,
         successors: &'a [Successor],
         rules: &'a SettlementRules,
-        config: SettlementConfig,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            let status = if successors.iter().all(|plan| plan.inputs.is_empty()) {
-                TaskStatus::Failed
-            } else {
-                TaskStatus::Superseded
-            };
-            let source = settle_in_tx(&mut tx, task, status, None, Some(message)).await?;
-            enqueue_fanouts_and_advance(
-                &mut SqliteTx(&mut tx),
-                &source,
+            self.settle(
+                task,
+                SettleOutcome::failure(message, successors),
                 successors,
                 rules,
-                config,
-                None,
             )
-            .await?;
-            tx.commit().await?;
-            Ok(())
+            .await
         })
     }
 
@@ -261,7 +252,7 @@ impl TaskStore for SqliteTaskRepo {
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE workflow_id = ?1 AND task_id = ?2
                   AND status = 'running' AND attempt = ?4
-                  AND attempt < max_attempts
+                  AND attempt < ?6
                   AND lease_until > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 "#,
             )
@@ -270,6 +261,7 @@ impl TaskStore for SqliteTaskRepo {
             .bind(message)
             .bind(task.attempt)
             .bind(delay.as_secs_f64())
+            .bind(MAX_ATTEMPTS)
             .execute(&mut *tx)
             .await?;
             if result.rows_affected() == 0 {
@@ -294,7 +286,7 @@ impl TaskStore for SqliteTaskRepo {
                 SET lease_until = NULL,
                     error = COALESCE(?4, error),
                     available_at = CASE
-                        WHEN ?5 IS NOT NULL AND attempt < max_attempts
+                        WHEN ?5 IS NOT NULL AND attempt < ?6
                         THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ?5 || ' seconds')
                         ELSE available_at
                     END,
@@ -309,6 +301,7 @@ impl TaskStore for SqliteTaskRepo {
             .bind(task.attempt)
             .bind(error)
             .bind(delay.map(|d| d.as_secs_f64()))
+            .bind(MAX_ATTEMPTS)
             .execute(&mut *tx)
             .await?;
             if result.rows_affected() == 0 {
@@ -341,60 +334,6 @@ impl TaskStore for SqliteTaskRepo {
             .fetch_all(&self.pool)
             .await?;
             Ok(ids)
-        })
-    }
-
-    fn list_tasks<'a>(
-        &'a self,
-        workflow_id: &'a str,
-        run_id: i64,
-    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(async move {
-            let sql = format!(
-                "SELECT {ROW_COLS} FROM tasks WHERE workflow_id = ?1 AND run_id = ?2 ORDER BY task_id"
-            );
-            let rows = sqlx::query_as::<_, TaskRow>(&sql)
-                .bind(workflow_id)
-                .bind(run_id)
-                .fetch_all(&self.pool)
-                .await?;
-            Ok(rows.into_iter().map(TaskRecord::from).collect())
-        })
-    }
-
-    fn cancel_run<'a>(
-        &'a self,
-        workflow_id: &'a str,
-        run_id: i64,
-    ) -> BoxFuture<'a, Result<usize, StorageError>> {
-        Box::pin(async move {
-            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-            let cancelled: Vec<i64> = sqlx::query_scalar(
-                r#"
-                UPDATE tasks
-                SET status = 'cancelled', lease_until = NULL, available_at = NULL,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE workflow_id = ?1 AND run_id = ?2
-                  AND status IN ('pending', 'collecting', 'running')
-                RETURNING task_id
-                "#,
-            )
-            .bind(workflow_id)
-            .bind(run_id)
-            .fetch_all(&mut *tx)
-            .await?;
-            if !cancelled.is_empty() {
-                sqlx::query(
-                    "DELETE FROM join_contributions
-                     WHERE workflow_id = ?1 AND task_id IN (SELECT value FROM json_each(?2))",
-                )
-                .bind(workflow_id)
-                .bind(Json(&cancelled))
-                .execute(&mut *tx)
-                .await?;
-            }
-            tx.commit().await?;
-            Ok(cancelled.len())
         })
     }
 }

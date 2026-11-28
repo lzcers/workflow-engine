@@ -11,9 +11,8 @@
 //!    - `->+`（[`isolated_expand`] / `.expand_isolated()`）：展开 `Vec<T>`，每项建立独立子图作用域
 
 mod arrow;
-mod failure;
+mod builder;
 mod planner;
-mod success;
 
 use std::sync::Arc;
 
@@ -22,9 +21,8 @@ use serde_json::Value;
 
 pub use arrow::{Arrow, EdgeMode, direct, isolated_direct, isolated_expand, shared_expand};
 
-use failure::{CheckedFailureFrom, FailureFrom};
+use builder::{CheckedFrom, EdgeFrom, Failure, Success};
 use planner::{BuiltPlanner, EdgePlanner};
-use success::{CheckedSuccessFrom, SuccessFrom};
 
 use crate::node::{EdgeSlot, Node, NodeError, NodeKey, TypeFingerprint};
 
@@ -66,34 +64,34 @@ pub struct Edge {
 
 impl Edge {
     /// 从类型化 `NodeKey` 出发构造成功边（编译期检查类型接线）。
-    pub fn from<Ctx, Src: Node<Ctx>>(src: &NodeKey<Ctx, Src>) -> CheckedSuccessFrom<Ctx, Src> {
-        CheckedSuccessFrom::new(src.arc_name())
+    pub fn from<Ctx, Src: Node<Ctx>>(src: &NodeKey<Ctx, Src>) -> CheckedFrom<Success, Ctx, Src> {
+        CheckedFrom::new(src.arc_name())
     }
 
     /// 从类型化 `NodeKey` 出发构造失败边（编译期检查类型接线）。
-    pub fn on_error<Ctx, Src: Node<Ctx>>(src: &NodeKey<Ctx, Src>) -> CheckedFailureFrom<Ctx, Src> {
-        CheckedFailureFrom::new(src.arc_name())
+    pub fn on_error<Ctx, Src: Node<Ctx>>(
+        src: &NodeKey<Ctx, Src>,
+    ) -> CheckedFrom<Failure, Ctx, Src> {
+        CheckedFrom::new(src.arc_name())
     }
 
     /// 从动态/静态节点名出发构造成功边（建图期检查类型指纹）。
-    pub fn success<SrcOut>(src: impl Into<Arc<str>>) -> SuccessFrom<SrcOut>
+    pub fn success<SrcOut>(src: impl Into<Arc<str>>) -> EdgeFrom<Success, SrcOut>
     where
         SrcOut: DeserializeOwned + 'static,
     {
-        SuccessFrom::new(src.into())
+        EdgeFrom::new(src.into())
     }
 
     /// 从动态/静态节点名出发构造失败边（建图期检查类型指纹）。
-    pub fn failure<SrcIn>(src: impl Into<Arc<str>>) -> FailureFrom<SrcIn>
+    pub fn failure<SrcIn>(src: impl Into<Arc<str>>) -> EdgeFrom<Failure, SrcIn>
     where
         SrcIn: DeserializeOwned + 'static,
     {
-        FailureFrom::new(src.into())
+        EdgeFrom::new(src.into())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_built(
-        kind: EdgeKind,
         src: Arc<str>,
         dst: Arc<str>,
         slot: Option<EdgeSlot>,
@@ -103,7 +101,7 @@ impl Edge {
         built: BuiltPlanner,
     ) -> Self {
         Self {
-            kind,
+            kind: built.kind,
             src,
             dst,
             slot,

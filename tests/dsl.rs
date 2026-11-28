@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::future::Future;
 use workflow_engine::{
     Edge, Graph, GraphError, JoinInput, JoinNode, Node, NodeError, Trigger,
     graph::{EdgeMode, MergeMode, TaskType},
@@ -13,12 +12,9 @@ struct PassThrough;
 impl Node<Ctx> for PassThrough {
     type In = serde_json::Value;
     type Out = serde_json::Value;
-    fn execute(
-        &self,
-        _ctx: &mut Ctx,
-        input: Self::In,
-    ) -> impl Future<Output = Result<Self::Out, NodeError>> + Send {
-        async move { Ok(input) }
+
+    async fn execute(&self, _ctx: &mut Ctx, input: Self::In) -> Result<Self::Out, NodeError> {
+        Ok(input)
     }
 }
 
@@ -317,16 +313,12 @@ struct NestedJoin {
 }
 
 #[test]
-fn nested_subgraphs_ui_groups_and_reusable_mount() {
+fn nested_subgraphs_and_dynamic_conditional_join() {
     let graph = workflow! {
         workflow_id: "nested";
         title: "Nested";
         context: Ctx;
         nodes { source => PassThrough }
-        #[description = "纯画布视觉分组，不产生 scopes 行"]
-        group visual_stage {
-            nodes { prep => PassThrough }
-        }
         subgraph batch {
             nodes { fetch => PassThrough }
             #[title = "信号分析"]
@@ -339,29 +331,19 @@ fn nested_subgraphs_ui_groups_and_reusable_mount() {
         }
         nodes { output => PassThrough }
         edges {
-            source -> visual_stage.prep,
-            visual_stage.prep -> batch.fetch,
+            source -> batch.fetch,
             batch.analysis.join -> output |> |joined| serde_json::to_value(joined).unwrap(),
         }
     }
     .unwrap();
     let description = graph.describe();
-    assert_eq!(description.subgraphs.len(), 3);
-    let visual = description
-        .subgraphs
-        .iter()
-        .find(|s| s.id == "visual_stage")
-        .unwrap();
-    assert!(!visual.isolated);
-    assert_eq!(visual.description, "纯画布视觉分组，不产生 scopes 行");
-    assert!(graph.subgraph_path("visual_stage.prep").unwrap().is_empty());
+    assert_eq!(description.subgraphs.len(), 2);
 
     let analysis = description
         .subgraphs
         .iter()
         .find(|s| s.id == "batch.analysis")
         .unwrap();
-    assert!(analysis.isolated);
     assert_eq!(analysis.parent_id.as_deref(), Some("batch"));
     assert_eq!(analysis.description, "隔离计算子图");
     assert_eq!(
@@ -388,15 +370,16 @@ fn nested_subgraphs_ui_groups_and_reusable_mount() {
     assert_eq!(graph.subgraph_path("batch.fetch").unwrap(), ["batch"]);
     assert!(graph.subgraph_path("missing").is_none());
 
-    // 命令式可复用子图挂载 + 条件边对称校验（多条命令式 when 边可共写同一必填 Set 槽位）
-    let reusable = |sub: workflow_engine::graph::SubgraphBuilder<Ctx>| {
-        let (sub, a) = sub.node_key("a", PassThrough);
-        let (sub, b) = sub.node_key("b", PassThrough);
-        sub.edge(Edge::from(&a).to(&b).direct())
-    };
+    // 命令式子图与条件边对称校验（多条命令式 when 边可共写同一必填 Set 槽位）
     let dynamic = Graph::builder("dynamic", "Dynamic", Ctx)
-        .mount("s1", "Stage 1", reusable)
-        .mount("s2", "Stage 2", reusable)
+        .subgraph("s1", "Stage 1", None)
+        .subgraph("s2", "Stage 2", None)
+        .node_in_subgraph_with_key("s1.a", PassThrough, "a", "", Some("s1"))
+        .0
+        .node_in_subgraph_with_key("s1.b", PassThrough, "b", "", Some("s1"))
+        .0
+        .node_in_subgraph_with_key("s2.b", PassThrough, "b", "", Some("s2"))
+        .0
         .node("j", JoinNode::<NestedJoin>::new())
         .edge(
             Edge::success::<serde_json::Value>("s1.b")
@@ -494,7 +477,7 @@ fn interleaved_subgraph_declarations_preserve_construction_order() {
 }
 
 #[test]
-fn isolated_arrows_require_an_explicit_isolated_subgraph_boundary() {
+fn isolated_arrows_require_an_explicit_subgraph_boundary() {
     let result = workflow! {
         workflow_id: "unbounded";
         title: "Unbounded";
@@ -503,14 +486,4 @@ fn isolated_arrows_require_an_explicit_isolated_subgraph_boundary() {
         edges { source ->+ target }
     };
     assert!(matches!(result, Err(GraphError::InvalidEdge { .. })));
-
-    let into_group = workflow! {
-        workflow_id: "into-group";
-        title: "Into UI Group";
-        context: Ctx;
-        nodes { source => PassThrough }
-        group ui { nodes { target => PassThrough } }
-        edges { source ->! ui.target }
-    };
-    assert!(matches!(into_group, Err(GraphError::InvalidEdge { .. })));
 }

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::FromRow;
 
-use crate::{TaskRecord, TaskStatus, task::join::RunTask};
+use crate::task::{TaskRecord, TaskStatus, join::RunTask};
 
 #[derive(Debug, Clone, FromRow)]
 pub(crate) struct TaskRow {
@@ -20,7 +20,6 @@ pub(crate) struct TaskRow {
     pub lease_until: Option<DateTime<Utc>>,
     pub available_at: Option<DateTime<Utc>>,
     pub attempt: i32,
-    pub max_attempts: i32,
     pub input_json: Value,
     pub output_json: Option<Value>,
     pub error: Option<String>,
@@ -41,7 +40,6 @@ impl From<TaskRow> for TaskRecord {
             lease_until: row.lease_until,
             available_at: row.available_at,
             attempt: row.attempt,
-            max_attempts: row.max_attempts,
             input: row.input_json,
             output: row.output_json,
             error: row.error,
@@ -75,12 +73,4 @@ impl From<RunTaskRow> for RunTask {
             contributed_slots,
         }
     }
-}
-
-#[derive(FromRow)]
-pub(super) struct ScopedTreeRow {
-    pub scope_id: i64,
-    pub parent_scope_id: Option<i64>,
-    pub trigger_task_id: i64,
-    pub is_descendant: i64,
 }

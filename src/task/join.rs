@@ -7,13 +7,14 @@
 //!    任一必填槽缺失则立即标 `failed`，全部满足则转 `pending` 并物化 `Append` 槽位。
 
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use super::{JoinRule, TaskStatus};
-use crate::backend::{UPSTREAM_FAILED_ERR, UPSTREAM_UNSATISFIED_ERR};
+
+const UPSTREAM_FAILED_ERR: &str = "upstream dependency failed";
+const UPSTREAM_UNSATISFIED_ERR: &str = "upstream dependency did not contribute";
 
 /// 参与 JOIN 判定的最小任务快照（不搬运普通任务的 `input_json`）。
 #[derive(Debug, Clone)]
@@ -52,8 +53,8 @@ struct RunIndex<'a> {
     tasks_by_name: HashMap<&'a str, Vec<usize>>,
     scope_by_id: HashMap<i64, RunScope>,
     children_by_parent: HashMap<Option<i64>, Vec<i64>>,
-    local_scopes_cache: RefCell<HashMap<Option<i64>, Arc<HashSet<Option<i64>>>>>,
-    entry_triggers_cache: RefCell<HashMap<Option<i64>, Arc<Vec<i64>>>>,
+    local_scopes_cache: HashMap<Option<i64>, HashSet<Option<i64>>>,
+    entry_triggers_cache: HashMap<Option<i64>, Vec<i64>>,
 }
 
 impl<'a> RunIndex<'a> {
@@ -80,14 +81,14 @@ impl<'a> RunIndex<'a> {
             tasks_by_name,
             scope_by_id,
             children_by_parent,
-            local_scopes_cache: RefCell::new(HashMap::new()),
-            entry_triggers_cache: RefCell::new(HashMap::new()),
+            local_scopes_cache: HashMap::new(),
+            entry_triggers_cache: HashMap::new(),
         }
     }
 
-    fn local_scopes(&self, root: Option<i64>) -> Arc<HashSet<Option<i64>>> {
-        if let Some(cached) = self.local_scopes_cache.borrow().get(&root) {
-            return cached.clone();
+    fn ensure_local_scopes(&mut self, root: Option<i64>) {
+        if self.local_scopes_cache.contains_key(&root) {
+            return;
         }
         let mut visited = HashSet::new();
         let mut stack = vec![root];
@@ -101,17 +102,13 @@ impl<'a> RunIndex<'a> {
                 }
             }
         }
-        let result = Arc::new(visited);
-        self.local_scopes_cache
-            .borrow_mut()
-            .insert(root, result.clone());
-        result
+        self.local_scopes_cache.insert(root, visited);
     }
 
     /// 从最外层隔离作用域（depth = 0）到当前作用域的触发任务 ID 链。
-    fn entry_triggers(&self, root: Option<i64>) -> Arc<Vec<i64>> {
-        if let Some(cached) = self.entry_triggers_cache.borrow().get(&root) {
-            return cached.clone();
+    fn ensure_entry_triggers(&mut self, root: Option<i64>) {
+        if self.entry_triggers_cache.contains_key(&root) {
+            return;
         }
         let mut triggers = Vec::new();
         let mut seen = HashSet::new();
@@ -127,16 +124,12 @@ impl<'a> RunIndex<'a> {
             scope_id = scope.parent_scope_id;
         }
         triggers.reverse();
-        let result = Arc::new(triggers);
-        self.entry_triggers_cache
-            .borrow_mut()
-            .insert(root, result.clone());
-        result
+        self.entry_triggers_cache.insert(root, triggers);
     }
 
     /// 匹配触发当前子图实例的外部直接入口任务索引。
     fn matched_external_entries(
-        &self,
+        &mut self,
         scope_id: Option<i64>,
         rule: &JoinRule,
         tasks: &[RunTask],
@@ -144,7 +137,8 @@ impl<'a> RunIndex<'a> {
         if rule.external_entries.is_empty() {
             return Vec::new();
         }
-        let entries = self.entry_triggers(scope_id);
+        self.ensure_entry_triggers(scope_id);
+        let entries = &self.entry_triggers_cache[&scope_id];
         let mut matched = Vec::new();
         for ext in &rule.external_entries {
             let Some(&trigger_task_id) = entries.get(ext.entry_depth) else {
@@ -180,7 +174,7 @@ impl<'a> RunIndex<'a> {
     }
 
     fn evaluate(
-        &self,
+        &mut self,
         join_idx: usize,
         rule: &JoinRule,
         tasks: &[RunTask],
@@ -188,8 +182,9 @@ impl<'a> RunIndex<'a> {
     ) -> Verdict {
         let join_task = &tasks[join_idx];
         let matched_entries = self.matched_external_entries(join_task.scope_id, rule, tasks);
-        let local_scopes = self.local_scopes(join_task.scope_id);
         let cutoff = self.failure_cutoff(join_task, tasks, statuses);
+        self.ensure_local_scopes(join_task.scope_id);
+        let local_scopes = &self.local_scopes_cache[&join_task.scope_id];
 
         // 1) 实时失败传播：外部入口或本作用域内本轮上游失败则立即级联失败。
         if matched_entries
@@ -253,7 +248,7 @@ pub(crate) fn advance_joins(
 
     let mut statuses: Vec<TaskStatus> = tasks.iter().map(|t| t.status).collect();
     let mut transitions = JoinTransitions::default();
-    let index = RunIndex::build(tasks, scopes);
+    let mut index = RunIndex::build(tasks, scopes);
 
     loop {
         let mut newly_failed = Vec::new();

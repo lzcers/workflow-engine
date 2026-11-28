@@ -3,14 +3,13 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EdgeKind, EdgeMode, Graph, RetryPolicy, TaskType, Trigger, subgraph_path,
+    Edge, EdgeKind, EdgeMode, Graph, TaskType, Trigger, subgraph_path,
     validate::{validate_node_owner, validate_subgraph_desc, validate_subgraphs},
 };
-use crate::error::GraphError;
-
-fn default_isolated() -> bool {
-    true
-}
+use crate::{
+    error::{EngineError, GraphError},
+    task::Task,
+};
 
 /// 已构建执行图的可序列化拓扑。节点按 ID 排序，边按成功/失败及各自注册顺序输出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,12 +34,9 @@ pub struct NodeDescription {
     pub trigger: Option<Trigger>,
     pub input_type: String,
     pub output_type: String,
-    /// 节点级重试策略覆盖；None 时沿用工作流默认策略。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_policy: Option<RetryPolicy>,
 }
 
-/// 静态子图或纯视觉分组定义；ID 为完整点路径。
+/// 静态子图定义；ID 为完整点路径。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubgraphDescription {
     pub id: String,
@@ -48,9 +44,6 @@ pub struct SubgraphDescription {
     #[serde(default)]
     pub description: String,
     pub parent_id: Option<String>,
-    /// true 表示运行时隔离作用域（写 `scopes` 表）；false 表示纯 UI 分组。
-    #[serde(default = "default_isolated")]
-    pub isolated: bool,
 }
 
 /// 一条实际注册的边。相同端点的多条边仍保留为独立记录。
@@ -88,7 +81,6 @@ impl<Ctx> Graph<Ctx> {
                 subgraph_id: entry.subgraph_id.clone(),
                 input_type: entry.node.in_type().name().to_owned(),
                 output_type: entry.node.out_type().name().to_owned(),
-                retry_policy: entry.node.retry_policy(),
             })
             .collect();
         nodes.sort_by(|left, right| left.id.cmp(&right.id));
@@ -97,30 +89,12 @@ impl<Ctx> Graph<Ctx> {
             .success_edges
             .iter()
             .enumerate()
-            .map(|(index, edge)| EdgeDescription {
-                id: format!("success:{index}"),
-                source: edge.src().to_owned(),
-                target: edge.dst().to_owned(),
-                slot: edge.slot_key().map(str::to_owned),
-                kind: EdgeKind::Success,
-                mode: edge.mode(),
-                has_transform: edge.has_transform(),
-                has_condition: edge.has_condition(),
-            })
+            .map(|(index, edge)| describe_edge(EdgeKind::Success, index, edge))
             .chain(
                 self.failure_edges
                     .iter()
                     .enumerate()
-                    .map(|(index, edge)| EdgeDescription {
-                        id: format!("failure:{index}"),
-                        source: edge.src().to_owned(),
-                        target: edge.dst().to_owned(),
-                        slot: edge.slot_key().map(str::to_owned),
-                        kind: EdgeKind::Failure,
-                        mode: edge.mode(),
-                        has_transform: edge.has_transform(),
-                        has_condition: edge.has_condition(),
-                    }),
+                    .map(|(index, edge)| describe_edge(EdgeKind::Failure, index, edge)),
             )
             .collect();
 
@@ -136,27 +110,37 @@ impl<Ctx> Graph<Ctx> {
     }
 }
 
+fn describe_edge(kind: EdgeKind, index: usize, edge: &Edge) -> EdgeDescription {
+    let prefix = match kind {
+        EdgeKind::Success => "success",
+        EdgeKind::Failure => "failure",
+    };
+    EdgeDescription {
+        id: format!("{prefix}:{index}"),
+        source: edge.src().to_owned(),
+        target: edge.dst().to_owned(),
+        slot: edge.slot_key().map(str::to_owned),
+        kind,
+        mode: edge.mode(),
+        has_transform: edge.has_transform(),
+        has_condition: edge.has_condition(),
+    }
+}
+
 impl GraphDescription {
-    /// 从图描述构造可直接提交的入口任务，并解析其运行时隔离作用域路径与重试预算。
-    pub fn task(
-        &self,
-        entry: &str,
-        input: serde_json::Value,
-    ) -> Result<crate::Task, crate::EngineError> {
+    /// 从图描述构造可直接提交的入口任务，并解析其子图作用域路径。
+    pub fn task(&self, entry: &str, input: serde_json::Value) -> Result<Task, EngineError> {
         let mut entries = self.nodes.iter().filter(|node| node.id == entry);
         let node = entries
             .next()
-            .ok_or_else(|| crate::EngineError::UnknownNode(entry.to_owned()))?;
+            .ok_or_else(|| EngineError::UnknownNode(entry.to_owned()))?;
         if entries.next().is_some() {
-            return Err(crate::EngineError::InvalidGraph(GraphError::DuplicateNode(
+            return Err(EngineError::InvalidGraph(GraphError::DuplicateNode(
                 entry.to_owned(),
             )));
         }
-        let mut task = crate::Task::new(&self.workflow_id, entry, input);
-        task.subgraph_path = self
-            .entry_path(node)
-            .map_err(crate::EngineError::InvalidGraph)?;
-        task.max_attempts = node.retry_policy.map(RetryPolicy::effective_max_attempts);
+        let mut task = Task::new(&self.workflow_id, entry, input);
+        task.subgraph_path = self.entry_path(node).map_err(EngineError::InvalidGraph)?;
         Ok(task)
     }
 
@@ -173,9 +157,7 @@ impl GraphDescription {
                 return Err(GraphError::DuplicateSubgraph(id.to_owned()));
             }
             validate_subgraph_desc(group)?;
-            if group.isolated {
-                path.push(id.to_owned());
-            }
+            path.push(id.to_owned());
         }
         Ok(path)
     }

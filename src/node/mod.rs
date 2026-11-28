@@ -1,22 +1,16 @@
-//! 节点抽象：强类型输入/输出、角色声明、重试策略与上下文生命周期钩子。
+//! 节点抽象：强类型输入/输出、角色声明、外部触发声明与上下文生命周期钩子。
 //!
 //! [`Node`] 是业务节点实现的接口，`In`/`Out` 支持序列化以便落库（对应 DB `task.input`/`task.output`）。
 //! 节点**不携带名字**，节点名由 [`crate::graph::Graph`] 在注册实例时外部绑定。
 //! 跨节点的观测钩子（`on_start` / `on_success` / `on_error`）统一收敛在 [`NodeContext`] 上。
 
-use std::{
-    any::TypeId,
-    future::Future,
-    marker::PhantomData,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{any::TypeId, future::Future, marker::PhantomData, sync::Arc};
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use super::task::{DEFAULT_MAX_ATTEMPTS, TaskRecord};
+use super::task::TaskRecord;
 
 mod join;
 
@@ -30,80 +24,6 @@ pub struct Trigger {
     pub kind: String,
     /// 对应种类的注册配置，例如 cron 表达式与时区。
     pub config: Value,
-}
-
-/// 任务级/工作流级重试策略：指数退避 + 抖动（jitter）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    /// 最大业务执行次数（含首次认领，至少为 1；默认 3）。
-    pub max_attempts: i32,
-    /// 首次重试基础延迟（默认 1 秒）。
-    pub base_delay: Duration,
-    /// 单次退避延迟上限（默认 60 秒）。
-    pub max_delay: Duration,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: DEFAULT_MAX_ATTEMPTS,
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(60),
-        }
-    }
-}
-
-impl RetryPolicy {
-    pub const fn new(max_attempts: i32) -> Self {
-        let clamped = if max_attempts < 1 { 1 } else { max_attempts };
-        Self {
-            max_attempts: clamped,
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(60),
-        }
-    }
-
-    /// 禁用自动重试（仅执行 1 次）。
-    pub const fn no_retry() -> Self {
-        Self::new(1)
-    }
-
-    /// 规范化最大尝试次数（至少 1）。
-    pub const fn effective_max_attempts(self) -> i32 {
-        if self.max_attempts < 1 {
-            1
-        } else {
-            self.max_attempts
-        }
-    }
-
-    /// 计算第 `attempt` 次失败后的指数退避时长，附带 75%~100% 抖动防惊群。
-    pub fn delay_for(self, task_id: i64, attempt: i32) -> Duration {
-        let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0).min(16);
-        let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
-        let raw = self.base_delay.saturating_mul(factor).min(self.max_delay);
-        if raw.is_zero() {
-            return Duration::ZERO;
-        }
-        // splitmix64 混合 task_id、attempt 与当前纳秒，提供轻量无依赖抖动（[75%, 100%]）。
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos() as u64);
-        let mut z = (task_id as u64)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (attempt as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
-            ^ nanos;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        let pct = 75 + (z % 26); // 75..=100
-        let ms = raw.as_millis() as u64;
-        if ms == 0 {
-            raw
-        } else {
-            Duration::from_millis((ms.saturating_mul(pct) / 100).max(1))
-        }
-    }
 }
 
 /// 节点在图中的执行角色（以单一 ADT 消除非法组合状态）。
@@ -148,11 +68,6 @@ pub trait Node<Ctx>: Send + Sync {
 
     /// 外部触发器的静态注册声明（无副作用，与入边正交）。
     fn trigger(&self) -> Option<Trigger> {
-        None
-    }
-
-    /// 节点级重试策略覆盖；None 时继承工作流默认策略。
-    fn retry_policy(&self) -> Option<RetryPolicy> {
         None
     }
 
@@ -244,7 +159,6 @@ impl TypeFingerprint {
 pub(crate) trait AnyNode<Ctx>: Send + Sync {
     fn role(&self) -> NodeRole;
     fn trigger(&self) -> Option<Trigger>;
-    fn retry_policy(&self) -> Option<RetryPolicy>;
     fn in_type(&self) -> TypeFingerprint;
     fn out_type(&self) -> TypeFingerprint;
     fn validate_input(&self, input: &Value) -> Result<(), serde_json::Error>;
@@ -300,10 +214,6 @@ where
 
     fn trigger(&self) -> Option<Trigger> {
         N::trigger(self)
-    }
-
-    fn retry_policy(&self) -> Option<RetryPolicy> {
-        N::retry_policy(self)
     }
 
     fn in_type(&self) -> TypeFingerprint {

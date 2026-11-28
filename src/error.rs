@@ -1,4 +1,4 @@
-//! 引擎统一的存储与构图错误类型。
+//! 引擎统一的存储、构图与运行错误类型。
 
 /// 所有持久化后端共同的错误类型。
 #[derive(Debug, thiserror::Error)]
@@ -9,12 +9,6 @@ pub enum StorageError {
     ClaimLost { workflow_id: String, task_id: i64 },
     #[error("invalid fanout plan: {detail}")]
     InvalidFanout { detail: String },
-    #[error("run {workflow_id}:{run_id} exceeded max tasks limit ({limit})")]
-    RunTaskLimitExceeded {
-        workflow_id: String,
-        run_id: i64,
-        limit: usize,
-    },
     #[error("unsupported database URL scheme; expected postgres, postgresql, or sqlite")]
     UnsupportedScheme,
     #[error("database backend {backend} is not enabled")]
@@ -54,4 +48,17 @@ pub enum GraphError {
     SuccessCycle,
     #[error("failure edge {src} -> {dst} must not loop back to itself")]
     FailureSelfLoop { src: String, dst: String },
+}
+
+/// 引擎初始化或提交失败。
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    #[error("no node registered for name={0}")]
+    UnknownNode(String),
+    #[error("invalid graph: {0}")]
+    InvalidGraph(#[from] GraphError),
+    #[error("invalid workflow input: {0}")]
+    Input(#[from] serde_json::Error),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }

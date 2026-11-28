@@ -1,4 +1,4 @@
-//! 数据库无关的任务记录、入队输入、状态与运行快照。
+//! 数据库无关的任务记录、入队输入、状态与运行句柄。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,8 +16,6 @@ pub enum TaskStatus {
     Failed,
     /// 失败已由后继任务接管。
     Superseded,
-    /// 运行被主动取消。
-    Cancelled,
 }
 
 impl TaskStatus {
@@ -29,7 +27,6 @@ impl TaskStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Superseded => "superseded",
-            Self::Cancelled => "cancelled",
         }
     }
 
@@ -55,7 +52,6 @@ impl std::str::FromStr for TaskStatus {
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
             "superseded" => Ok(Self::Superseded),
-            "cancelled" => Ok(Self::Cancelled),
             _ => Err(format!("unknown task status: {value}")),
         }
     }
@@ -69,41 +65,11 @@ impl TryFrom<String> for TaskStatus {
     }
 }
 
-/// 一次运行的汇总状态，由该运行下全部任务快照推导。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
-
-impl RunStatus {
-    pub fn from_tasks(tasks: &[TaskRecord]) -> Self {
-        if tasks.iter().any(|t| t.status.is_active()) {
-            Self::Running
-        } else if tasks.iter().any(|t| t.status == TaskStatus::Cancelled) {
-            Self::Cancelled
-        } else if tasks.iter().any(|t| t.status == TaskStatus::Failed) {
-            Self::Failed
-        } else {
-            Self::Succeeded
-        }
-    }
-
-    pub const fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
-    }
-}
-
-/// 一次运行的完整状态快照。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunSnapshot {
+/// 一次提交的运行句柄；`workflow_id` 与 `run_id` 共同确定运行身份。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RunHandle {
     pub workflow_id: String,
     pub run_id: i64,
-    pub status: RunStatus,
-    pub tasks: Vec<TaskRecord>,
 }
 
 /// 已创建任务的快照，包含引擎分配的身份、执行状态和结果。
@@ -124,10 +90,8 @@ pub struct TaskRecord {
     pub lease_until: Option<chrono::DateTime<chrono::Utc>>,
     /// 下次允许被认领的时间；None 表示立即可认领，退避重试时为未来时间。
     pub available_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// 每次认领递增的代次，用于写入校验；超过 max_attempts 后只处理最终失败。
+    /// 每次认领递增的代次，用于写入校验；超过 [`super::MAX_ATTEMPTS`] 后只处理最终失败。
     pub attempt: i32,
-    /// 该任务允许的最大业务执行次数（含首次认领）。
-    pub max_attempts: i32,
     /// 任务输入因 name 而异，保留为通用 JSON。
     pub input: Value,
     /// 节点输出以 JSON 落库，尚未写入时为 None。
@@ -142,25 +106,21 @@ pub struct TaskRecord {
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub workflow_id: String,
-    /// 从根到入口所属隔离作用域的完整子图 ID，根节点为空。
+    /// 从根到入口所属子图的完整子图 ID，根节点为空。
     #[serde(default)]
     pub subgraph_path: Vec<String>,
     pub name: String,
     pub input: Value,
-    /// 可选覆盖该入口任务的最大业务执行次数；None 时使用引擎默认上限。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_attempts: Option<i32>,
 }
 
 impl Task {
-    /// 创建根作用域的独立运行入口。子图入口可通过 GraphDescription::task 构造。
+    /// 创建根作用域的独立运行入口。子图入口可通过 `Graph::task` 或 `GraphDescription::task` 构造。
     pub fn new(workflow_id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             workflow_id: workflow_id.into(),
             subgraph_path: Vec::new(),
             name: name.into(),
             input,
-            max_attempts: None,
         }
     }
 }

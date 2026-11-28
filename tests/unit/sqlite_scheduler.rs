@@ -15,7 +15,7 @@ use crate::{
     dsl,
     graph::{JoinNode, Node, NodeContext, NodeError},
     scheduler::Scheduler,
-    task::{TaskRecord, TaskStatus, TaskStore, store::DEFAULT_LEASE_DURATION},
+    task::{TaskRecord, TaskStatus, TaskStore},
 };
 
 #[derive(Default)]
@@ -223,7 +223,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .unwrap();
     assert_eq!(other_total.output, Some(json!(316)));
     assert!(
-        repo.claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
+        repo.claim_many(graph.workflow_id(), 1)
             .await
             .unwrap()
             .is_empty()

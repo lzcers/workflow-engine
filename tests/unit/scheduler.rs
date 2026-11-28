@@ -22,13 +22,10 @@ use tokio::{
 use super::{Scheduler, notify_outcome, run_task};
 use crate::backend::task_fixture::TaskSeed;
 use crate::{
-    Edge, Graph, Node, NodeContext, NodeError, RetryPolicy, TaskRecord, TaskStatus,
+    Edge, Graph, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, migrate},
     error::StorageError,
-    task::{
-        DEFAULT_MAX_ATTEMPTS, SettlementConfig, SettlementRules, Successor, TaskStore,
-        store::DEFAULT_LEASE_DURATION,
-    },
+    task::{MAX_ATTEMPTS, SettlementRules, Successor, TaskStore, store::LEASE_DURATION},
 };
 
 struct Context {
@@ -160,16 +157,16 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     let repo = SqliteTaskRepo::new(pool.clone());
     let input = TaskSeed::new("timeout", "pending", json!(41));
     repo.seed_task(graph.as_ref(), &input).await.unwrap();
-    for _ in 1..DEFAULT_MAX_ATTEMPTS {
+    for _ in 1..MAX_ATTEMPTS {
         let previous = repo
-            .claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
+            .claim_many(graph.workflow_id(), 1)
             .await
             .unwrap()
             .remove(0);
         repo.release_claim(&previous, None, None).await.unwrap();
     }
     let claim = repo
-        .claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
+        .claim_many(graph.workflow_id(), 1)
         .await
         .unwrap()
         .remove(0);
@@ -190,9 +187,6 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         store,
         claim.clone(),
         Instant::now() + Duration::from_millis(100),
-        DEFAULT_LEASE_DURATION,
-        RetryPolicy::default(),
-        SettlementConfig::default(),
     ));
     let seen = timeout(Duration::from_secs(5), async {
         tokio::select! {
@@ -232,7 +226,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     assert_eq!(tasks.len(), 2);
     assert_eq!(tasks[0].task_id, claim.task_id);
     assert_eq!(tasks[0].status, TaskStatus::Superseded);
-    assert_eq!(tasks[0].attempt, DEFAULT_MAX_ATTEMPTS + 1);
+    assert_eq!(tasks[0].attempt, MAX_ATTEMPTS + 1);
     assert_eq!(tasks[1].status, TaskStatus::Succeeded);
     assert_eq!(tasks[1].output, Some(json!(42)));
     assert_eq!(tasks[1].parent_task_ids, [claim.task_id]);
@@ -265,7 +259,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
     .await
     .unwrap();
     let claim = repo
-        .claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
+        .claim_many(graph.workflow_id(), 1)
         .await
         .unwrap()
         .remove(0);
@@ -283,9 +277,6 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
             Arc::new(repo.clone()),
             claim.clone(),
             Instant::now() - Duration::from_secs(1),
-            DEFAULT_LEASE_DURATION,
-            RetryPolicy::default(),
-            SettlementConfig::default(),
         ),
     )
     .await
@@ -339,7 +330,6 @@ impl TaskStore for Store {
         &'a self,
         _: &'a str,
         _: usize,
-        _: Duration,
     ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
         Box::pin(async { unreachable!("run_task receives an existing claim") })
     }
@@ -347,7 +337,6 @@ impl TaskStore for Store {
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
-        _: Duration,
     ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
         Box::pin(async move {
             assert_eq!(task.attempt, 1, "renewal must not create another attempt");
@@ -376,7 +365,6 @@ impl TaskStore for Store {
         _: &'a Value,
         _: &'a [Successor],
         _: &'a SettlementRules,
-        _: SettlementConfig,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.settlements.fetch_add(1, Ordering::SeqCst);
@@ -394,7 +382,6 @@ impl TaskStore for Store {
         _: &'a str,
         _: &'a [Successor],
         _: &'a SettlementRules,
-        _: SettlementConfig,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async { panic!("lease loss must not be recorded as a business failure") })
     }
@@ -425,22 +412,6 @@ impl TaskStore for Store {
         _: &'a [String],
     ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
         Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn list_tasks<'a>(
-        &'a self,
-        _: &'a str,
-        _: i64,
-    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn cancel_run<'a>(
-        &'a self,
-        _: &'a str,
-        _: i64,
-    ) -> BoxFuture<'a, Result<usize, StorageError>> {
-        Box::pin(async { Ok(0) })
     }
 }
 
@@ -522,7 +493,6 @@ fn claim() -> TaskRecord {
         lease_until: Some(now + chrono::Duration::seconds(300)),
         available_at: None,
         attempt: 1,
-        max_attempts: DEFAULT_MAX_ATTEMPTS,
         input: json!(7),
         output: None,
         error: None,
@@ -561,10 +531,7 @@ async fn start_probe(
             graph.clone(),
             store,
             claim(),
-            Instant::now() + DEFAULT_LEASE_DURATION,
-            DEFAULT_LEASE_DURATION,
-            RetryPolicy::default(),
-            SettlementConfig::default(),
+            Instant::now() + LEASE_DURATION,
         )
         .await
         {

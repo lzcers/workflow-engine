@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::sync::{Semaphore, mpsc};
 use workflow_engine::{
-    Edge, Engine, Graph, JoinInput, JoinNode, Node, NodeContext, NodeError, RunStatus, TaskRecord,
-    TaskStatus, workflow,
+    Edge, Engine, Graph, JoinInput, JoinNode, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
+    workflow,
 };
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -126,6 +126,35 @@ async fn read_scopes(url: &str, workflow_id: &str) -> Vec<ScopeRow> {
     panic!("unsupported test backend")
 }
 
+async fn read_task_status(url: &str, workflow_id: &str, name: &str) -> Option<String> {
+    let sql = "SELECT status FROM tasks WHERE workflow_id=$1 AND name=$2 ORDER BY task_id DESC LIMIT 1";
+    #[cfg(feature = "sqlite")]
+    if url.starts_with("sqlite:") {
+        let pool = sqlx::SqlitePool::connect(url).await.unwrap();
+        let status = sqlx::query_scalar(sql)
+            .bind(workflow_id)
+            .bind(name)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        return status;
+    }
+    #[cfg(feature = "pg")]
+    if url.starts_with("postgres") {
+        let pool = sqlx::PgPool::connect(url).await.unwrap();
+        let status = sqlx::query_scalar(sql)
+            .bind(workflow_id)
+            .bind(name)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        return status;
+    }
+    panic!("unsupported test backend")
+}
+
 async fn execute_sql(url: &str, sql: &str) {
     #[cfg(feature = "sqlite")]
     if url.starts_with("sqlite:") {
@@ -207,13 +236,7 @@ async fn nested(url: &str) {
         results,
     }));
     let run = workflow.submit("start", vec![1, 2, 3]).await.unwrap();
-    let snap = tokio::time::timeout(Duration::from_secs(12), workflow.wait_run(run.run_id))
-        .await
-        .expect("all three nested invocations must complete and collect")
-        .unwrap();
-    assert_eq!(snap.status, RunStatus::Succeeded);
-
-    let records = tokio::time::timeout(Duration::from_secs(5), async {
+    let records = tokio::time::timeout(Duration::from_secs(12), async {
         let mut records = Vec::new();
         loop {
             let result = receiver.recv().await.unwrap();
@@ -225,7 +248,7 @@ async fn nested(url: &str) {
         }
     })
     .await
-    .unwrap();
+    .expect("all three nested invocations must complete and collect");
     let reports: Vec<_> = records
         .iter()
         .filter(|(task, _)| task.name == "analysis.report")
@@ -683,12 +706,18 @@ async fn retry_and_recovery_join(url: &str) {
     }
     .unwrap();
     let zombie_wf = engine.make(zombie_graph);
-    let run = zombie_wf.submit("start", 1).await.unwrap();
-    let snap = tokio::time::timeout(Duration::from_secs(8), zombie_wf.wait_run(run.run_id))
-        .await
-        .expect("missing required slot must fail collecting JOIN instead of hanging")
-        .unwrap();
-    assert_eq!(snap.status, RunStatus::Failed);
-    let joined = snap.tasks.iter().find(|t| t.name == "joined").unwrap();
-    assert_eq!(joined.status, TaskStatus::Failed);
+    let _run = zombie_wf.submit("start", 1).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(status) = read_task_status(url, &zombie_id, "joined").await
+                && status != TaskStatus::Collecting.as_str()
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("missing required slot must fail collecting JOIN instead of hanging");
+    assert_eq!(status, TaskStatus::Failed.as_str());
 }

@@ -16,19 +16,10 @@
 
 use std::marker::PhantomData;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 
 use super::{Node, NodeError, NodeRole, TypeFingerprint};
-
-/// JOIN 槽位的合并方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MergeMode {
-    /// 单值写入键值。
-    Set,
-    /// 始终以 JSON 数组保存，多次贡献逐项追加。
-    Append,
-}
+pub use crate::task::MergeMode;
 
 /// 单个 JOIN 输入字段的静态规格，由 `#[derive(JoinInput)]` 自动生成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,8 +1,8 @@
-//! 跨工作流共享的唤醒中枢：单轮询器合并查询 + PostgreSQL `LISTEN/NOTIFY` 跨进程唤醒。
+//! 跨工作流共享的唤醒中枢：单轮询器合并查询 + 可选的后端推送唤醒监听（如 PG `LISTEN/NOTIFY`）。
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 
@@ -10,6 +10,9 @@ use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tracing::error;
 
 use crate::task::TaskStore;
+
+type WakeCallback = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type ListenerSpawner = Box<dyn Fn(WakeCallback) -> Option<JoinHandle<()>> + Send + Sync>;
 
 struct HubEntry {
     id: u64,
@@ -23,18 +26,16 @@ struct HubState {
     next_id: u64,
     entries: Vec<HubEntry>,
     poller: Option<JoinHandle<()>>,
-    #[cfg(feature = "pg")]
-    pg_listener: Option<JoinHandle<()>>,
+    listener: Option<JoinHandle<()>>,
 }
 
 /// 跨工作流共享的唤醒中枢：
 /// - 单个共享轮询器通过 `ready_workflows` 一次部分索引查询覆盖全部已注册工作流；
-/// - PostgreSQL 下同时维护单个 `PgListener` 实现亚毫秒级跨进程唤醒；
+/// - 若底层存储支持推送唤醒（如 PostgreSQL `LISTEN/NOTIFY`），同时维护单个共享监听任务；
 /// - 随最后一个 `Workflow` 释放/停机自动清理后台协程，支持 `Engine` 先于 `Workflow` 释放。
 pub(crate) struct WakeHub {
     store: Arc<dyn TaskStore>,
-    #[cfg(feature = "pg")]
-    pg_pool: Option<sqlx::PgPool>,
+    spawn_listener: ListenerSpawner,
     state: Mutex<HubState>,
     config_changed: Arc<Notify>,
 }
@@ -51,17 +52,20 @@ impl Drop for HubRegistration {
 }
 
 impl WakeHub {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: Arc<dyn TaskStore>,
-        #[cfg(feature = "pg")] pg_pool: Option<sqlx::PgPool>,
+        spawn_listener: impl Fn(WakeCallback) -> Option<JoinHandle<()>> + Send + Sync + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            #[cfg(feature = "pg")]
-            pg_pool,
+            spawn_listener: Box::new(spawn_listener),
             state: Mutex::new(HubState::default()),
             config_changed: Arc::new(Notify::new()),
         })
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, HubState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn register(
@@ -70,7 +74,7 @@ impl WakeHub {
         wake: Arc<Notify>,
         poll_interval: Duration,
     ) -> HubRegistration {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         let id = state.next_id;
         state.next_id += 1;
         state.entries.push(HubEntry {
@@ -83,12 +87,15 @@ impl WakeHub {
             let weak = Arc::downgrade(self);
             state.poller = Some(tokio::spawn(shared_poll_loop(weak)));
         }
-        #[cfg(feature = "pg")]
-        if state.pg_listener.is_none()
-            && let Some(pool) = self.pg_pool.clone()
-        {
+        if state.listener.is_none() {
             let weak = Arc::downgrade(self);
-            state.pg_listener = Some(tokio::spawn(pg_listen_loop(pool, weak)));
+            state.listener = (self.spawn_listener)(Arc::new(move |wf_id| {
+                let Some(hub) = weak.upgrade() else {
+                    return false;
+                };
+                hub.notify_workflow(wf_id);
+                true
+            }));
         }
         drop(state);
         self.config_changed.notify_one();
@@ -99,14 +106,13 @@ impl WakeHub {
     }
 
     fn unregister(&self, id: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         state.entries.retain(|e| e.id != id);
         if state.entries.is_empty() {
             if let Some(handle) = state.poller.take() {
                 handle.abort();
             }
-            #[cfg(feature = "pg")]
-            if let Some(handle) = state.pg_listener.take() {
+            if let Some(handle) = state.listener.take() {
                 handle.abort();
             }
         }
@@ -115,7 +121,7 @@ impl WakeHub {
     }
 
     fn snapshot_poll(&self) -> (Vec<String>, Duration) {
-        let state = self.state.lock().unwrap();
+        let state = self.lock_state();
         let mut seen = HashSet::with_capacity(state.entries.len());
         let mut ids = Vec::with_capacity(state.entries.len());
         let mut min_poll = Duration::from_secs(60);
@@ -132,7 +138,7 @@ impl WakeHub {
 
     fn notify_workflow(&self, workflow_id: &str) {
         let wakes: Vec<Arc<Notify>> = {
-            let state = self.state.lock().unwrap();
+            let state = self.lock_state();
             state
                 .entries
                 .iter()
@@ -178,47 +184,6 @@ async fn shared_poll_loop(hub_weak: Weak<WakeHub>) {
             }
             Err(error) => {
                 error!(error = %error, "shared poller query failed");
-            }
-        }
-    }
-}
-
-#[cfg(feature = "pg")]
-async fn pg_listen_loop(pool: sqlx::PgPool, hub_weak: Weak<WakeHub>) {
-    use crate::backend::PG_NOTIFY_CHANNEL;
-    use sqlx::postgres::PgListener;
-    use tracing::warn;
-
-    loop {
-        if hub_weak.upgrade().is_none() {
-            return;
-        }
-        let mut listener = match PgListener::connect_with(&pool).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                warn!(error = %error, "pg listener connect failed; retrying");
-                sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        if let Err(error) = listener.listen(PG_NOTIFY_CHANNEL).await {
-            warn!(error = %error, "pg listen channel failed; retrying");
-            sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        loop {
-            match listener.recv().await {
-                Ok(notification) => {
-                    let Some(hub) = hub_weak.upgrade() else {
-                        return;
-                    };
-                    hub.notify_workflow(notification.payload());
-                }
-                Err(error) => {
-                    warn!(error = %error, "pg listener disconnected; reconnecting");
-                    sleep(Duration::from_secs(1)).await;
-                    break;
-                }
             }
         }
     }

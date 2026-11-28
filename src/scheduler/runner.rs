@@ -1,6 +1,10 @@
 //! 单任务执行生命周期：租约续期防护、节点执行、后继规划、原子结算与回调分发。
 
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use futures::FutureExt;
 use serde_json::Value;
@@ -10,12 +14,15 @@ use tracing::{error, warn};
 use crate::{
     error::StorageError,
     graph::Graph,
-    node::{NodeContext, NodeError, RetryPolicy},
-    task::{SettlementConfig, Successor, TaskRecord, TaskStore},
+    node::{NodeContext, NodeError},
+    task::{MAX_ATTEMPTS, Successor, TaskRecord, TaskStore, store::LEASE_DURATION},
 };
 
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(LEASE_DURATION.as_secs() / 3);
 const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const RELEASE_BACKOFF: Duration = Duration::from_millis(200);
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 /// 业务执行与后继规划的结果。成功时保留上下文，供提交后的 `on_success` 使用。
 pub(super) enum ExecutionOutcome<Ctx> {
@@ -35,6 +42,26 @@ pub(super) enum ExecutionOutcome<Ctx> {
     },
 }
 
+/// 指数退避（1s 起步，上限 60s）+ 75%~100% 轻量抖动防惊群。
+fn retry_delay(task_id: i64, attempt: i32) -> Duration {
+    let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0).min(16);
+    let raw = RETRY_BASE_DELAY
+        .saturating_mul(1u32 << shift)
+        .min(RETRY_MAX_DELAY);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u64);
+    let mut z = (task_id as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (attempt as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ nanos;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let pct = 75 + (z % 26);
+    Duration::from_millis(((raw.as_millis() as u64).saturating_mul(pct) / 100).max(1))
+}
+
 /// 执行和结算期间维持认领，终态提交或退避入队后立即返回回调载荷，释放执行槽。
 #[tracing::instrument(
     name = "settle",
@@ -51,9 +78,6 @@ pub(super) async fn run_task<Ctx, S>(
     store: Arc<S>,
     task: TaskRecord,
     lease_deadline: Instant,
-    lease_duration: Duration,
-    default_retry: RetryPolicy,
-    config: SettlementConfig,
 ) -> Option<(TaskRecord, ExecutionOutcome<Ctx>)>
 where
     Ctx: NodeContext + Sync + 'static,
@@ -64,35 +88,9 @@ where
         return None;
     }
     let work = async {
-        let outcome = execute_and_plan(graph.as_ref(), &task, default_retry).await;
-        match settle(store.as_ref(), graph.as_ref(), &task, &outcome, config).await {
-            Ok(()) => Ok(outcome),
-            Err(StorageError::RunTaskLimitExceeded {
-                workflow_id,
-                run_id,
-                limit,
-            }) => {
-                // 单次运行超过任务上限属于确定性护栏触发，直接以永久失败结算，不再无效重试。
-                let msg = format!(
-                    "run {workflow_id}:{run_id} exceeded max tasks limit ({limit})"
-                );
-                let err = NodeError::permanent(msg.clone());
-                let context = match outcome {
-                    ExecutionOutcome::Success { context, .. } => Some(context),
-                    ExecutionOutcome::Failure { context, .. } => context,
-                    ExecutionOutcome::Retry { .. } => None,
-                };
-                store
-                    .settle_failure(&task, &msg, &[], graph.settlement_rules(), config)
-                    .await?;
-                Ok(ExecutionOutcome::Failure {
-                    context,
-                    error: err,
-                    successors: Vec::new(),
-                })
-            }
-            Err(err) => Err(err),
-        }
+        let outcome = execute_and_plan(graph.as_ref(), &task).await;
+        settle(store.as_ref(), graph.as_ref(), &task, &outcome).await?;
+        Ok::<_, StorageError>(outcome)
     };
     let lifecycle = async {
         let release_reason = match AssertUnwindSafe(work).catch_unwind().await {
@@ -118,7 +116,7 @@ where
     };
     let outcome = tokio::select! {
         biased;
-        _ = maintain_claim(store.as_ref(), &task, lease_deadline, lease_duration) => None,
+        _ = maintain_claim(store.as_ref(), &task, lease_deadline) => None,
         outcome = lifecycle => outcome,
     };
     outcome.map(|outcome| (task, outcome))
@@ -137,15 +135,13 @@ async fn maintain_claim<S: TaskStore + ?Sized>(
     store: &S,
     task: &TaskRecord,
     mut deadline: Instant,
-    lease_duration: Duration,
 ) {
-    let renew_interval = (lease_duration / 3).max(Duration::from_secs(1));
-    let mut renew_at = deadline - lease_duration + renew_interval;
+    let mut renew_at = deadline - LEASE_DURATION + LEASE_RENEW_INTERVAL;
     loop {
         let renewal = async {
             sleep_until(renew_at).await;
             let requested_at = Instant::now();
-            (requested_at, store.renew_claim(task, lease_duration).await)
+            (requested_at, store.renew_claim(task).await)
         };
         tokio::select! {
             biased;
@@ -156,8 +152,8 @@ async fn maintain_claim<S: TaskStore + ?Sized>(
             (requested_at, result) = renewal => {
                 match result {
                     Ok(Some(_)) => {
-                        deadline = requested_at + lease_duration;
-                        renew_at = requested_at + renew_interval;
+                        deadline = requested_at + LEASE_DURATION;
+                        renew_at = requested_at + LEASE_RENEW_INTERVAL;
                     }
                     Ok(None) => {
                         warn!("claim no longer owned; stopping local work");
@@ -174,21 +170,16 @@ async fn maintain_claim<S: TaskStore + ?Sized>(
 }
 
 /// fork 独立上下文并规划结算；预算耗尽的认领只走最终失败流程，不再执行节点。
-async fn execute_and_plan<Ctx>(
-    graph: &Graph<Ctx>,
-    task: &TaskRecord,
-    default_retry: RetryPolicy,
-) -> ExecutionOutcome<Ctx>
+async fn execute_and_plan<Ctx>(graph: &Graph<Ctx>, task: &TaskRecord) -> ExecutionOutcome<Ctx>
 where
     Ctx: NodeContext + Sync,
 {
     let name = task.name.as_str();
-    let max_attempts = task.max_attempts.max(1);
-    if task.attempt > max_attempts {
+    if task.attempt > MAX_ATTEMPTS {
         let error = NodeError::permanent(
             task.error
                 .as_deref()
-                .expect("exhausted claims must carry their final failure reason"),
+                .unwrap_or("task retry budget exhausted"),
         );
         return plan_failure(graph, task, None, error);
     }
@@ -205,9 +196,8 @@ where
             }
             Err(error) => NodeError::permanent(error.to_string()),
         },
-        Err(error) if error.is_retryable() && task.attempt < max_attempts => {
-            let policy = graph.retry_policy_of(name).unwrap_or(default_retry);
-            let delay = policy.delay_for(task.task_id, task.attempt);
+        Err(error) if error.is_retryable() && task.attempt < MAX_ATTEMPTS => {
+            let delay = retry_delay(task.task_id, task.attempt);
             warn!(
                 error = %error,
                 attempt = task.attempt,
@@ -250,7 +240,6 @@ async fn settle<Ctx, S>(
     graph: &Graph<Ctx>,
     task: &TaskRecord,
     outcome: &ExecutionOutcome<Ctx>,
-    config: SettlementConfig,
 ) -> Result<(), StorageError>
 where
     Ctx: NodeContext + Sync + 'static,
@@ -260,11 +249,7 @@ where
     match outcome {
         ExecutionOutcome::Success {
             output, successors, ..
-        } => {
-            store
-                .settle_success(task, output, successors, rules, config)
-                .await
-        }
+        } => store.settle_success(task, output, successors, rules).await,
         ExecutionOutcome::Retry { error, delay } => {
             store.schedule_retry(task, &error.to_string(), *delay).await
         }
@@ -272,7 +257,7 @@ where
             error, successors, ..
         } => {
             store
-                .settle_failure(task, &error.to_string(), successors, rules, config)
+                .settle_failure(task, &error.to_string(), successors, rules)
                 .await
         }
     }
