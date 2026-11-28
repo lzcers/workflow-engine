@@ -5,11 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
-    Graph, Node, NodeError, Trigger,
-    graph::{JoinSlot, MergeMode, SlotSpec, TaskType, direct, success, success_join},
+    Edge, Graph, Node, NodeError, NodeRole,
+    graph::{JoinSlot, MergeMode, SlotSpec, TaskType},
 };
 
 struct Pass;
@@ -25,28 +25,11 @@ struct FixtureJoin(Vec<SlotSpec>);
 impl Node<()> for FixtureJoin {
     type In = Value;
     type Out = Value;
-    const TASK_TYPE: TaskType = TaskType::Join;
 
-    fn join_slots(&self) -> Option<Vec<SlotSpec>> {
-        Some(self.0.clone())
+    fn role(&self) -> NodeRole {
+        NodeRole::Join(self.0.clone())
     }
 
-    async fn execute(&self, _: &mut (), input: Value) -> Result<Value, NodeError> {
-        Ok(input)
-    }
-}
-
-struct Event;
-impl Node<()> for Event {
-    type In = Value;
-    type Out = Value;
-    const TASK_TYPE: TaskType = TaskType::Event;
-    fn trigger(&self) -> Option<Trigger> {
-        Some(Trigger {
-            kind: "test".into(),
-            config: json!({}),
-        })
-    }
     async fn execute(&self, _: &mut (), input: Value) -> Result<Value, NodeError> {
         Ok(input)
     }
@@ -97,15 +80,10 @@ pub fn graph(
                     .get(name)
                     .into_iter()
                     .flatten()
-                    .map(|&key| SlotSpec::new::<Value>(key, MergeMode::Append, true, true))
+                    .map(|&key| SlotSpec::new::<Value>(key, MergeMode::Append, true))
                     .collect();
                 builder
                     .node_in_subgraph_with_key(name, FixtureJoin(specs), name, "", subgraph)
-                    .0
-            }
-            TaskType::Event => {
-                builder
-                    .node_in_subgraph_with_key(name, Event, name, "", subgraph)
                     .0
             }
         };
@@ -113,15 +91,13 @@ pub fn graph(
     for &(source, destination) in edges {
         if join_targets.contains_key(destination) {
             let key = slot_key(source);
-            builder = builder.edge(success_join(
-                source,
-                destination,
-                JoinSlot::<Value, Value>::append(key),
-                direct::<Value>(),
-                |_| true,
-            ));
+            builder = builder.edge(
+                Edge::success::<Value>(source)
+                    .to_slot(destination, JoinSlot::<Value, Value>::append(key))
+                    .direct(),
+            );
         } else {
-            builder = builder.edge(success(source, destination, direct::<Value>(), |_| true));
+            builder = builder.edge(Edge::success::<Value>(source).to::<Value>(destination).direct());
         }
     }
     Arc::new(builder.build().unwrap())

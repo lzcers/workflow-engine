@@ -3,7 +3,6 @@
 use std::{
     collections::VecDeque,
     future::pending,
-    io,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,13 +19,16 @@ use tokio::{
     time::{Instant, advance, sleep, timeout},
 };
 
-use super::{Scheduler, run_task};
+use super::{Scheduler, notify_outcome, run_task};
 use crate::backend::task_fixture::TaskSeed;
 use crate::{
-    Graph, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
+    Edge, Graph, Node, NodeContext, NodeError, RetryPolicy, TaskRecord, TaskStatus,
     backend::sqlite::{SqliteTaskRepo, migrate},
-    edge::{direct, failure_transform},
-    task::{SettlementRules, Successor, TaskStore, store::LEASE_DURATION},
+    error::StorageError,
+    task::{
+        DEFAULT_MAX_ATTEMPTS, SettlementConfig, SettlementRules, Successor, TaskStore,
+        store::DEFAULT_LEASE_DURATION,
+    },
 };
 
 struct Context {
@@ -52,6 +54,26 @@ impl NodeContext for Context {
             pool: self.pool.clone(),
         }
     }
+
+    async fn on_start(&mut self, _task: &TaskRecord) {
+        self.record("start");
+    }
+
+    async fn on_success(&mut self, _task: &TaskRecord, _: &Value) {
+        self.record("success");
+    }
+
+    async fn on_error(&mut self, task: &TaskRecord, error: &NodeError) {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM tasks WHERE workflow_id=? AND task_id=?")
+                .bind(&task.workflow_id)
+                .bind(task.task_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+        assert!(matches!(status.as_str(), "failed" | "superseded"));
+        self.events.send(("error", error.to_string())).unwrap();
+    }
 }
 
 struct PendingNode;
@@ -60,26 +82,9 @@ impl Node<Context> for PendingNode {
     type In = i32;
     type Out = i32;
 
-    async fn on_start(ctx: &mut Context, _: &Value) {
-        ctx.record("start");
-    }
-
     async fn execute(&self, ctx: &mut Context, _: i32) -> Result<i32, NodeError> {
         ctx.record("execute");
         pending().await
-    }
-
-    async fn on_error(ctx: &mut Context, error: &NodeError) {
-        let task = ctx.task.as_ref().unwrap();
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM tasks WHERE workflow_id=? AND task_id=?")
-                .bind(&task.workflow_id)
-                .bind(task.task_id)
-                .fetch_one(&ctx.pool)
-                .await
-                .unwrap();
-        assert!(matches!(status.as_str(), "failed" | "superseded"));
-        ctx.events.send(("error", error.to_string())).unwrap();
     }
 }
 
@@ -92,10 +97,6 @@ impl Node<Context> for SuccessNode {
     async fn execute(&self, ctx: &mut Context, input: i32) -> Result<i32, NodeError> {
         ctx.record("execute");
         Ok(input + 1)
-    }
-
-    async fn on_success(ctx: &mut Context, _: &Value) {
-        ctx.record("success");
     }
 }
 
@@ -116,7 +117,7 @@ async fn set_deadline(
     deadline: chrono::DateTime<chrono::Utc>,
 ) -> TaskRecord {
     sqlx::query("UPDATE tasks SET lease_until = ? WHERE workflow_id = ? AND task_id = ?")
-        .bind(deadline)
+        .bind(deadline.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
         .bind(&task.workflow_id)
         .bind(task.task_id)
         .execute(pool)
@@ -144,32 +145,31 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
         )
         .node("pending", PendingNode)
         .node("recovery", SuccessNode)
-        .error_edge(failure_transform(
-            "pending",
-            "recovery",
-            direct(),
-            |_, _| true,
-            |input: &i32, error| {
-                assert!(error.to_string().contains("lease expired"));
-                *input
-            },
-        ))
+        .edge(
+            Edge::failure::<i32>("pending")
+                .to::<i32>("recovery")
+                .map(|input: &i32, error| {
+                    assert!(error.to_string().contains("lease expired"));
+                    *input
+                })
+                .direct(),
+        )
         .build()
         .unwrap(),
     );
     let repo = SqliteTaskRepo::new(pool.clone());
     let input = TaskSeed::new("timeout", "pending", json!(41));
     repo.seed_task(graph.as_ref(), &input).await.unwrap();
-    for _ in 1..crate::task::MAX_ATTEMPTS {
+    for _ in 1..DEFAULT_MAX_ATTEMPTS {
         let previous = repo
-            .claim_many(graph.workflow_id(), 1)
+            .claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
             .await
             .unwrap()
             .remove(0);
-        repo.release_claim(&previous).await.unwrap();
+        repo.release_claim(&previous, None, None).await.unwrap();
     }
     let claim = repo
-        .claim_many(graph.workflow_id(), 1)
+        .claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
         .await
         .unwrap()
         .remove(0);
@@ -184,15 +184,19 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     let scheduler = Scheduler::new(graph.clone(), store.clone(), Duration::from_millis(2))
         .with_max_concurrency(1);
     let mut in_flight = JoinSet::new();
+    let mut callbacks = JoinSet::new();
     in_flight.spawn(run_task(
         graph,
         store,
         claim.clone(),
         Instant::now() + Duration::from_millis(100),
+        DEFAULT_LEASE_DURATION,
+        RetryPolicy::default(),
+        SettlementConfig::default(),
     ));
     let seen = timeout(Duration::from_secs(5), async {
         tokio::select! {
-            _ = scheduler.run_loop(&mut in_flight) => panic!("scheduler exited"),
+            _ = scheduler.run_loop(&mut in_flight, &mut callbacks) => panic!("scheduler exited"),
             seen = async {
                 let mut seen = Vec::new();
                 loop {
@@ -209,9 +213,8 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     .await
     .expect("the lost claim must release the slot so recovery can execute");
     in_flight.shutdown().await;
+    callbacks.shutdown().await;
 
-    // The last business attempt can enter business while the renewal query is in flight;
-    // the recovery claim must not start business again after the budget is exhausted.
     assert!(
         seen.iter()
             .filter(|event| **event == ("execute", "pending".to_owned()))
@@ -229,7 +232,7 @@ async fn lost_full_slot_recovers_through_failure_edge_without_executing_again() 
     assert_eq!(tasks.len(), 2);
     assert_eq!(tasks[0].task_id, claim.task_id);
     assert_eq!(tasks[0].status, TaskStatus::Superseded);
-    assert_eq!(tasks[0].attempt, crate::task::MAX_ATTEMPTS + 1);
+    assert_eq!(tasks[0].attempt, DEFAULT_MAX_ATTEMPTS + 1);
     assert_eq!(tasks[1].status, TaskStatus::Succeeded);
     assert_eq!(tasks[1].output, Some(json!(42)));
     assert_eq!(tasks[1].parent_task_ids, [claim.task_id]);
@@ -262,7 +265,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
     .await
     .unwrap();
     let claim = repo
-        .claim_many(graph.workflow_id(), 1)
+        .claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
         .await
         .unwrap()
         .remove(0);
@@ -273,17 +276,21 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
         chrono::Utc::now() - chrono::Duration::seconds(1),
     )
     .await;
-    timeout(
+    let outcome = timeout(
         Duration::from_secs(1),
         run_task(
             graph,
             Arc::new(repo.clone()),
             claim.clone(),
             Instant::now() - Duration::from_secs(1),
+            DEFAULT_LEASE_DURATION,
+            RetryPolicy::default(),
+            SettlementConfig::default(),
         ),
     )
     .await
     .expect("an expired snapshot must exit before calling fork or a node hook");
+    assert!(outcome.is_none());
     assert!(receiver.try_recv().is_err());
     let stored = repo.get("expired", claim.task_id).await.unwrap().unwrap();
     assert_eq!(
@@ -292,6 +299,7 @@ async fn already_expired_snapshot_never_enters_business_or_settlement() {
     );
     pool.close().await;
 }
+
 #[derive(Clone, Copy)]
 enum Renewal {
     Healthy,
@@ -323,9 +331,7 @@ impl Store {
 }
 
 impl TaskStore for Store {
-    type Error = io::Error;
-
-    fn enqueue(&self, _: crate::Task) -> BoxFuture<'_, Result<crate::RunHandle, Self::Error>> {
+    fn enqueue(&self, _: crate::Task) -> BoxFuture<'_, Result<crate::RunHandle, StorageError>> {
         Box::pin(async { unreachable!("run_task receives an existing claim") })
     }
 
@@ -333,14 +339,16 @@ impl TaskStore for Store {
         &'a self,
         _: &'a str,
         _: usize,
-    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>> {
+        _: Duration,
+    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
         Box::pin(async { unreachable!("run_task receives an existing claim") })
     }
 
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
-    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error>> {
+        _: Duration,
+    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>> {
         Box::pin(async move {
             assert_eq!(task.attempt, 1, "renewal must not create another attempt");
             self.renewals.fetch_add(1, Ordering::SeqCst);
@@ -355,7 +363,7 @@ impl TaskStore for Store {
                 .unwrap_or(Renewal::Healthy);
             match result {
                 Renewal::Healthy => Ok(Some(chrono::Utc::now() + chrono::Duration::seconds(300))),
-                Renewal::Error => Err(io::Error::other("database unavailable")),
+                Renewal::Error => Err(StorageError::Other("database unavailable".into())),
                 Renewal::Lost => Ok(None),
                 Renewal::Hanging => pending().await,
             }
@@ -368,7 +376,8 @@ impl TaskStore for Store {
         _: &'a Value,
         _: &'a [Successor],
         _: &'a SettlementRules,
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        _: SettlementConfig,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.settlements.fetch_add(1, Ordering::SeqCst);
             if !self.settlement_delay.is_zero() {
@@ -385,7 +394,8 @@ impl TaskStore for Store {
         _: &'a str,
         _: &'a [Successor],
         _: &'a SettlementRules,
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        _: SettlementConfig,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async { panic!("lease loss must not be recorded as a business failure") })
     }
 
@@ -394,15 +404,43 @@ impl TaskStore for Store {
         _: &'a TaskRecord,
         _: &'a str,
         _: Duration,
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async { panic!("lease loss must not be recorded as a retry") })
     }
 
-    fn release_claim<'a>(&'a self, _: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>> {
+    fn release_claim<'a>(
+        &'a self,
+        _: &'a TaskRecord,
+        _: Option<&'a str>,
+        _: Option<Duration>,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             self.releases.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
+    }
+
+    fn ready_workflows<'a>(
+        &'a self,
+        _: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn list_tasks<'a>(
+        &'a self,
+        _: &'a str,
+        _: i64,
+    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn cancel_run<'a>(
+        &'a self,
+        _: &'a str,
+        _: i64,
+    ) -> BoxFuture<'a, Result<usize, StorageError>> {
+        Box::pin(async { Ok(0) })
     }
 }
 
@@ -442,6 +480,13 @@ impl NodeContext for TimedContext {
     async fn fork(&self, _: &TaskRecord) -> Self {
         self.clone()
     }
+
+    async fn on_success(&mut self, _: &TaskRecord, _: &Value) {
+        self.probe.hooks.fetch_add(1, Ordering::SeqCst);
+        if !self.callback.is_zero() {
+            sleep(self.callback).await;
+        }
+    }
 }
 
 impl Node<TimedContext> for TimedNode {
@@ -462,13 +507,6 @@ impl Node<TimedContext> for TimedNode {
         cancellation.completed = true;
         Ok(input)
     }
-
-    async fn on_success(ctx: &mut TimedContext, _: &Value) {
-        ctx.probe.hooks.fetch_add(1, Ordering::SeqCst);
-        if !ctx.callback.is_zero() {
-            sleep(ctx.callback).await;
-        }
-    }
 }
 
 fn claim() -> TaskRecord {
@@ -482,7 +520,9 @@ fn claim() -> TaskRecord {
         name: "node".into(),
         status: TaskStatus::Running,
         lease_until: Some(now + chrono::Duration::seconds(300)),
+        available_at: None,
         attempt: 1,
+        max_attempts: DEFAULT_MAX_ATTEMPTS,
         input: json!(7),
         output: None,
         error: None,
@@ -516,12 +556,21 @@ async fn start_probe(
         .build()
         .unwrap(),
     );
-    let handle = tokio::spawn(run_task(
-        graph,
-        store,
-        claim(),
-        Instant::now() + LEASE_DURATION,
-    ));
+    let handle = tokio::spawn(async move {
+        if let Some((task, outcome)) = run_task(
+            graph.clone(),
+            store,
+            claim(),
+            Instant::now() + DEFAULT_LEASE_DURATION,
+            DEFAULT_LEASE_DURATION,
+            RetryPolicy::default(),
+            SettlementConfig::default(),
+        )
+        .await
+        {
+            notify_outcome(graph.as_ref(), &task, outcome).await;
+        }
+    });
     probe.started.notified().await;
     (handle, probe)
 }

@@ -1,4 +1,4 @@
-//! DSL 图在 SQLite 内部存储和调度器上的扇出、JOIN 与唤醒行为。
+//! DSL 图在 SQLite 内部存储和调度器上的扇出、JOIN 与单次认领唤醒行为。
 
 use std::{sync::Arc, time::Duration};
 
@@ -15,7 +15,7 @@ use crate::{
     dsl,
     graph::{JoinNode, Node, NodeContext, NodeError},
     scheduler::Scheduler,
-    task::{TaskRecord, TaskStatus, TaskStore},
+    task::{TaskRecord, TaskStatus, TaskStore, store::DEFAULT_LEASE_DURATION},
 };
 
 #[derive(Default)]
@@ -29,6 +29,12 @@ impl NodeContext for Context {
         Self {
             task: Some(task.clone()),
             completed: self.completed.clone(),
+        }
+    }
+
+    async fn on_success(&mut self, task: &TaskRecord, output: &Value) {
+        if let Some(completed) = &self.completed {
+            let _ = completed.send((task.clone(), output.clone()));
         }
     }
 }
@@ -47,14 +53,6 @@ impl Node<Context> for AddOne {
         assert_eq!(task.input, json!(input));
         assert_eq!(task.status, TaskStatus::Running);
         Ok(input + 1)
-    }
-
-    async fn on_success(ctx: &mut Context, output: &Value) {
-        if let Some(completed) = &ctx.completed {
-            completed
-                .send((ctx.task.as_ref().unwrap().clone(), output.clone()))
-                .unwrap();
-        }
     }
 }
 
@@ -86,8 +84,6 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         DatabasePool::Postgres(_) => panic!("SQLite URL must select the SQLite backend"),
     };
 
-    // start ─┬─ worker × 2 ─┬─ collect (JOIN) ─ total
-    //        └─ summary ────┘
     let graph = dsl::workflow! {
         workflow_id: "dsl-workflow";
         title: "扇出与汇合";
@@ -218,7 +214,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         assert!(
             task.parent_task_ids
                 .iter()
-                .all(|id| { other_tasks.iter().any(|other| other.task_id == *id) })
+                .all(|id| other_tasks.iter().any(|other| other.task_id == *id))
         );
     }
     let other_total = other_tasks
@@ -227,7 +223,7 @@ async fn dsl_workflow_persists_fanout_join_and_final_output() {
         .unwrap();
     assert_eq!(other_total.output, Some(json!(316)));
     assert!(
-        repo.claim_many(graph.workflow_id(), 1)
+        repo.claim_many(graph.workflow_id(), 1, DEFAULT_LEASE_DURATION)
             .await
             .unwrap()
             .is_empty()
@@ -435,8 +431,6 @@ async fn scopes_isolate_shared_join_and_reports_after_out_of_order_sources() {
                 _ = scheduler.run() => panic!("scheduler must run until cancelled"),
                 _ = async {
                     tokio::join!(starts[0].notified(), starts[1].notified(), starts[2].notified());
-                    // The next source stays running until the preceding report has completed.
-                    // Shared nodes must not wait for or collect another source's future scope.
                     for (index, source) in [2, 0, 1].into_iter().enumerate() {
                         releases[source].notify_one();
                         loop {
@@ -655,7 +649,7 @@ async fn shared_join_selects_its_external_entry_and_isolates_source_failure() {
 }
 
 #[tokio::test]
-async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
+async fn scheduler_wakes_for_new_work_without_redundant_empty_claim() {
     let (released_tx, mut released_rx) = mpsc::unbounded_channel();
     let db = SqlitePoolOptions::new()
         .max_connections(1)
@@ -697,7 +691,6 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     .with_max_concurrency(2)
     .with_wake(wake.clone());
 
-    // 清空建库和入队产生的归还事件。单连接池保证此后仅观察调度器的认领事务。
     let connection = db.acquire().await.unwrap();
     while released_rx.try_recv().is_ok() {}
     drop(connection);
@@ -708,12 +701,17 @@ async fn scheduler_wakes_for_new_work_while_another_node_is_running() {
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         slow_started.notified().await;
-        // 第一次认领 slow；第二次认领为空，此时仍有一个空槽，调度器进入等待。
-        released_rx.recv().await.unwrap();
+        // 认领数量 1 < 可用槽 2 时直接进入等待，不再多发一次多余空认领。
         released_rx.recv().await.unwrap();
     })
     .await
-    .expect("scheduler starts the slow node and finishes its next claim");
+    .expect("scheduler starts the slow node with a single claim");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), released_rx.recv())
+            .await
+            .is_err(),
+        "must not issue a redundant second claim_many when batch < available"
+    );
 
     task.task.name = "fast".into();
     repo.seed_task(graph.as_ref(), &task).await.unwrap();

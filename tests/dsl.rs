@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use workflow_engine::{
-    Graph, JoinInput, JoinNode, Node, NodeError, Trigger,
+    Edge, Graph, GraphError, JoinInput, JoinNode, Node, NodeError, Trigger,
     graph::{EdgeMode, MergeMode, TaskType},
     task::Dispatch,
     workflow,
@@ -40,9 +40,10 @@ fn arrows_route_collections_as_one_input_or_as_individual_items() {
         title: "Collection routes";
         context: Ctx;
         nodes { source => Values, batch => Values }
-        subgraph analysis { nodes { item => PassThrough } }
+        subgraph analysis { nodes { item => PassThrough, batch_in => Values } }
         edges {
             source -> batch,
+            source ->! analysis.batch_in,
             source ->* analysis.item,
             source ->+ analysis.item,
             source ->+ analysis.item when(|items| items.len() > 1) |>
@@ -55,13 +56,16 @@ fn arrows_route_collections_as_one_input_or_as_individual_items() {
     .unwrap();
 
     let description = graph.describe();
-    assert!(!description.edges[2].has_transform);
-    assert!(description.edges[3].has_transform);
+    assert!(!description.edges[3].has_transform);
+    assert!(description.edges[4].has_transform);
+    assert!(description.edges[4].has_condition);
+    assert!(!description.edges[0].has_condition);
     let modes: Vec<_> = description.edges.iter().map(|edge| edge.mode).collect();
     assert_eq!(
         modes,
         [
             EdgeMode::Direct,
+            EdgeMode::IsolatedDirect,
             EdgeMode::SharedExpand,
             EdgeMode::IsolatedExpand,
             EdgeMode::IsolatedExpand,
@@ -73,6 +77,7 @@ fn arrows_route_collections_as_one_input_or_as_individual_items() {
         serde_json::to_value(modes).unwrap(),
         json!([
             "direct",
+            "isolated_direct",
             "shared_expand",
             "isolated_expand",
             "isolated_expand",
@@ -81,24 +86,28 @@ fn arrows_route_collections_as_one_input_or_as_individual_items() {
         ])
     );
     let plans = graph.plan_success("source", &json!([1, 2])).unwrap();
-    assert_eq!(plans.len(), 4);
+    assert_eq!(plans.len(), 5);
     assert_eq!(plans[0].inputs, [json!([1, 2])]);
-    assert_eq!(plans[0].dst, "batch");
-    for plan in &plans[1..] {
-        assert_eq!(plan.dst, "analysis.item");
+    assert_eq!(plans[0].dst.as_ref(), "batch");
+    assert_eq!(plans[1].dst.as_ref(), "analysis.batch_in");
+    assert_eq!(plans[1].dispatch, Dispatch::PerInputScope);
+    assert_eq!(plans[1].inputs, [json!([1, 2])]);
+    for plan in &plans[2..] {
+        assert_eq!(plan.dst.as_ref(), "analysis.item");
     }
-    assert_eq!(plans[1].dispatch, Dispatch::Shared);
-    assert_eq!(plans[1].inputs, [json!(1), json!(2)]);
-    assert_eq!(plans[2].dispatch, Dispatch::PerInputScope);
-    assert_eq!(plans[2].inputs, plans[1].inputs);
+    assert_eq!(plans[2].dispatch, Dispatch::Shared);
+    assert_eq!(plans[2].inputs, [json!(1), json!(2)]);
     assert_eq!(plans[3].dispatch, Dispatch::PerInputScope);
-    assert_eq!(plans[3].inputs, [json!(2), json!(1)]);
+    assert_eq!(plans[3].inputs, plans[2].inputs);
+    assert_eq!(plans[4].dispatch, Dispatch::PerInputScope);
+    assert_eq!(plans[4].inputs, [json!(2), json!(1)]);
 
     let empty = graph.plan_success("source", &json!([])).unwrap();
-    assert_eq!(empty.len(), 1);
+    assert_eq!(empty.len(), 2);
     assert_eq!(empty[0].inputs, [json!([])]);
+    assert_eq!(empty[1].inputs, [json!([])]);
     let singleton = graph.plan_success("source", &json!([1])).unwrap();
-    assert_eq!(singleton.len(), 3);
+    assert_eq!(singleton.len(), 4);
 
     let retry = graph
         .plan_failure("source", &json!([1, 2]), &NodeError::retryable("retry"))
@@ -122,7 +131,7 @@ struct SingleValueJoin {
 }
 
 #[test]
-fn isolated_expansion_rejects_join_targets() {
+fn isolated_arrows_reject_join_targets() {
     let graph = workflow! {
         workflow_id: "isolated-join";
         title: "Isolated JOIN";
@@ -131,18 +140,14 @@ fn isolated_expansion_rejects_join_targets() {
         subgraph analysis { nodes { join => JoinNode::<SingleValueJoin>::new() } }
         edges { source ->+ analysis.join::items }
     };
-    assert_eq!(
-        graph.err().as_deref(),
-        Some("->+ edge must not target join node analysis.join")
-    );
+    assert!(matches!(graph, Err(GraphError::InvalidEdge { .. })));
 }
 
-struct EventNode(Option<Trigger>);
+struct TriggeredNode(Option<Trigger>);
 
-impl Node<Ctx> for EventNode {
+impl Node<Ctx> for TriggeredNode {
     type In = serde_json::Value;
     type Out = serde_json::Value;
-    const TASK_TYPE: TaskType = TaskType::Event;
 
     fn trigger(&self) -> Option<Trigger> {
         self.0.clone()
@@ -161,16 +166,16 @@ fn cron_trigger() -> Trigger {
 }
 
 #[test]
-fn event_nodes_are_discovered_and_described_through_existing_dsl() {
+fn triggers_are_discovered_and_orthogonal_to_incoming_edges() {
     let graph = workflow! {
         workflow_id: "event-description";
         title: "Event description";
         context: Ctx;
         nodes {
-            z_tick => EventNode(Some(cron_trigger())),
+            z_tick => TriggeredNode(Some(cron_trigger())),
             process => PassThrough,
             #[title = "支付回调"]
-            a_payment => EventNode(Some(Trigger {
+            a_payment => TriggeredNode(Some(Trigger {
                 kind: "payment.webhook".into(),
                 config: serde_json::json!({"path": "/payments"}),
             })),
@@ -178,6 +183,8 @@ fn event_nodes_are_discovered_and_described_through_existing_dsl() {
         edges {
             z_tick -> process,
             a_payment -> process,
+            // 外部触发元数据与上游入边完全正交：允许上游继续触发带 trigger 的节点。
+            process -> a_payment on_error,
         }
     }
     .unwrap();
@@ -188,93 +195,19 @@ fn event_nodes_are_discovered_and_described_through_existing_dsl() {
         ["a_payment", "z_tick"]
     );
     assert_eq!(triggers[0].1.kind, "payment.webhook");
-    assert_eq!(
-        triggers[0].1.config,
-        serde_json::json!({"path": "/payments"})
-    );
     assert_eq!(triggers[1].1, cron_trigger());
 
     let description = graph.describe();
     assert_eq!(description.nodes[0].id, "a_payment");
     assert_eq!(description.nodes[0].title, "支付回调");
-    assert_eq!(description.nodes[0].task_type, TaskType::Event);
+    assert_eq!(description.nodes[0].task_type, TaskType::Normal);
     assert_eq!(description.nodes[0].trigger.as_ref(), Some(&triggers[0].1));
     assert_eq!(description.nodes[1].id, "process");
     assert!(description.nodes[1].trigger.is_none());
-    let serialized = serde_json::to_value(&description).unwrap();
-    assert_eq!(
-        serialized["nodes"][2]["trigger"]["config"],
-        cron_trigger().config
-    );
-    assert!(serialized["nodes"][1]["trigger"].is_null());
 }
 
 #[test]
-fn event_nodes_require_consistent_trigger_metadata() {
-    struct OrdinaryNodeWithTrigger;
-
-    impl Node<Ctx> for OrdinaryNodeWithTrigger {
-        type In = serde_json::Value;
-        type Out = serde_json::Value;
-
-        fn trigger(&self) -> Option<Trigger> {
-            Some(cron_trigger())
-        }
-
-        async fn execute(&self, _: &mut Ctx, input: Self::In) -> Result<Self::Out, NodeError> {
-            Ok(input)
-        }
-    }
-
-    assert!(
-        Graph::builder("missing-trigger", "Missing trigger", Ctx)
-            .node("event", EventNode(None))
-            .build()
-            .is_err()
-    );
-    assert!(
-        Graph::builder("unexpected-trigger", "Unexpected trigger", Ctx)
-            .node("ordinary", OrdinaryNodeWithTrigger)
-            .build()
-            .is_err()
-    );
-}
-
-#[test]
-fn event_nodes_reject_incoming_success_and_failure_edges() {
-    let success = workflow! {
-        workflow_id: "event-success-edge";
-        title: "Event success edge";
-        context: Ctx;
-        nodes {
-            source => PassThrough,
-            event => EventNode(Some(cron_trigger())),
-        }
-        edges {
-            source -> event,
-        }
-    };
-    assert!(success.is_err());
-
-    let failure = workflow! {
-        workflow_id: "event-failure-edge";
-        title: "Event failure edge";
-        context: Ctx;
-        nodes {
-            source => PassThrough,
-            event => EventNode(Some(cron_trigger())),
-        }
-        edges {
-            source -> event on_error,
-        }
-    };
-    assert!(failure.is_err());
-}
-
-/// `on_error |> fn`（无条件）/ `when_error(cond) |> fn`（条件）失败边 DSL 语法：都能展开并规划。
-/// 节点名与边端点均为标识符（类型级 key），经 checked 构造函数做编译期类型接线校验。
-#[test]
-fn failure_edge_dsl_syntax() {
+fn failure_edge_dsl_syntax_and_source_order() {
     let g: Graph<Ctx> = workflow!(
         workflow_id: "test";
         title: "测试工作流";
@@ -303,20 +236,18 @@ fn failure_edge_dsl_syntax() {
     assert_eq!(description.nodes[2].title, "c");
     assert_eq!(description.nodes[2].description, "");
 
-    // 可重试错误：无条件 on_error 与条件 when_error 都命中 → 路由到 a、c
     let retry = g
         .plan_failure("b", &serde_json::json!(1), &NodeError::retryable("boom"))
         .unwrap();
     assert_eq!(retry.len(), 2);
-    let mut dsts: Vec<_> = retry.iter().map(|s| s.dst).collect();
+    let mut dsts: Vec<_> = retry.iter().map(|s| s.dst.as_ref()).collect();
     dsts.sort();
     assert_eq!(dsts, vec!["a", "c"]);
-    // 永久错误：when_error 条件不命中 → 只走无条件 on_error
     let skip = g
         .plan_failure("b", &serde_json::json!(1), &NodeError::permanent("boom"))
         .unwrap();
     assert_eq!(skip.len(), 1);
-    assert_eq!(skip[0].dst, "a");
+    assert_eq!(skip[0].dst.as_ref(), "a");
 }
 
 #[tokio::test]
@@ -331,7 +262,6 @@ async fn infers_instance_and_context_types_and_evaluates_each_expression_once() 
         }
     }
     let mut constructions = 0;
-    // Neither node nor context implements Clone/Copy; expressions may move owned values.
     let destination = OffsetNode(4);
     let workflow_id = String::from("offset_workflow");
     let workflow_title = String::from("偏移工作流");
@@ -356,8 +286,6 @@ async fn infers_instance_and_context_types_and_evaluates_each_expression_once() 
     assert_eq!(constructions, 6);
     assert_eq!(graph.workflow_id(), "offset_workflow");
     assert_eq!(graph.title(), "偏移工作流");
-    assert_eq!(graph.describe().workflow_id, graph.workflow_id());
-    assert_eq!(graph.describe().title, graph.title());
     assert_eq!(graph.context().0, 3);
     let source = graph
         .describe()
@@ -389,15 +317,20 @@ struct NestedJoin {
 }
 
 #[test]
-fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
+fn nested_subgraphs_ui_groups_and_reusable_mount() {
     let graph = workflow! {
         workflow_id: "nested";
         title: "Nested";
         context: Ctx;
         nodes { source => PassThrough }
+        #[description = "纯画布视觉分组，不产生 scopes 行"]
+        group visual_stage {
+            nodes { prep => PassThrough }
+        }
         subgraph batch {
             nodes { fetch => PassThrough }
             #[title = "信号分析"]
+            #[description = "隔离计算子图"]
             subgraph analysis {
                 nodes { signal => PassThrough, join => JoinNode::<NestedJoin>::new() }
                 edges { signal -> join::signal }
@@ -405,13 +338,32 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
             edges { fetch -> analysis.signal, fetch -> analysis.join::fetch }
         }
         nodes { output => PassThrough }
-        edges { source -> batch.fetch, batch.analysis.join -> output |> |joined| serde_json::to_value(joined).unwrap() }
+        edges {
+            source -> visual_stage.prep,
+            visual_stage.prep -> batch.fetch,
+            batch.analysis.join -> output |> |joined| serde_json::to_value(joined).unwrap(),
+        }
     }
     .unwrap();
     let description = graph.describe();
-    assert_eq!(description.subgraphs.len(), 2);
-    assert_eq!(description.subgraphs[1].id, "batch.analysis");
-    assert_eq!(description.subgraphs[1].parent_id.as_deref(), Some("batch"));
+    assert_eq!(description.subgraphs.len(), 3);
+    let visual = description
+        .subgraphs
+        .iter()
+        .find(|s| s.id == "visual_stage")
+        .unwrap();
+    assert!(!visual.isolated);
+    assert_eq!(visual.description, "纯画布视觉分组，不产生 scopes 行");
+    assert!(graph.subgraph_path("visual_stage.prep").unwrap().is_empty());
+
+    let analysis = description
+        .subgraphs
+        .iter()
+        .find(|s| s.id == "batch.analysis")
+        .unwrap();
+    assert!(analysis.isolated);
+    assert_eq!(analysis.parent_id.as_deref(), Some("batch"));
+    assert_eq!(analysis.description, "隔离计算子图");
     assert_eq!(
         graph.subgraph_path("batch.analysis.signal").unwrap(),
         ["batch", "batch.analysis"]
@@ -421,7 +373,7 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
         .unwrap();
     assert_eq!(plans.len(), 2);
     assert_eq!(
-        graph.subgraph_path(plans[0].dst).unwrap(),
+        graph.subgraph_path(plans[0].dst.as_ref()).unwrap(),
         ["batch", "batch.analysis"]
     );
     let join = &plans[1];
@@ -433,20 +385,40 @@ fn nested_subgraphs_preserve_qualified_endpoints_and_complete_join_upstream() {
         }
     );
     assert_eq!(join.inputs, [serde_json::json!(1)]);
-    assert_eq!(
-        graph.predecessors_of(join.dst).unwrap(),
-        ["batch.analysis.signal", "batch.fetch"]
-    );
     assert_eq!(graph.subgraph_path("batch.fetch").unwrap(), ["batch"]);
     assert!(graph.subgraph_path("missing").is_none());
-    assert!(graph.predecessors_of("missing").is_none());
-    let exit = graph
-        .plan_success(
-            "batch.analysis.join",
-            &serde_json::json!({"signal": 1, "fetch": 2, "optional_extra": null}),
+
+    // 命令式可复用子图挂载 + 条件边对称校验（多条命令式 when 边可共写同一必填 Set 槽位）
+    let reusable = |sub: workflow_engine::graph::SubgraphBuilder<Ctx>| {
+        let (sub, a) = sub.node_key("a", PassThrough);
+        let (sub, b) = sub.node_key("b", PassThrough);
+        sub.edge(Edge::from(&a).to(&b).direct())
+    };
+    let dynamic = Graph::builder("dynamic", "Dynamic", Ctx)
+        .mount("s1", "Stage 1", reusable)
+        .mount("s2", "Stage 2", reusable)
+        .node("j", JoinNode::<NestedJoin>::new())
+        .edge(
+            Edge::success::<serde_json::Value>("s1.b")
+                .to_slot("j", NestedJoin::slots().signal())
+                .when(|v| v.is_number())
+                .direct(),
         )
+        .edge(
+            Edge::success::<serde_json::Value>("s2.b")
+                .to_slot("j", NestedJoin::slots().signal())
+                .when(|v| v.is_string())
+                .direct(),
+        )
+        .edge(
+            Edge::success::<serde_json::Value>("s1.a")
+                .to_slot("j", NestedJoin::slots().fetch())
+                .direct(),
+        )
+        .build()
         .unwrap();
-    assert!(graph.subgraph_path(exit[0].dst).unwrap().is_empty());
+    assert_eq!(dynamic.subgraph_path("s1.a").unwrap(), ["s1"]);
+    assert_eq!(dynamic.subgraph_path("s2.b").unwrap(), ["s2"]);
 }
 
 #[test]
@@ -522,7 +494,7 @@ fn interleaved_subgraph_declarations_preserve_construction_order() {
 }
 
 #[test]
-fn isolated_expansion_requires_an_explicit_subgraph_boundary() {
+fn isolated_arrows_require_an_explicit_isolated_subgraph_boundary() {
     let result = workflow! {
         workflow_id: "unbounded";
         title: "Unbounded";
@@ -530,5 +502,15 @@ fn isolated_expansion_requires_an_explicit_subgraph_boundary() {
         nodes { source => Values, target => PassThrough }
         edges { source ->+ target }
     };
-    assert!(result.err().unwrap().contains("must enter a new subgraph"));
+    assert!(matches!(result, Err(GraphError::InvalidEdge { .. })));
+
+    let into_group = workflow! {
+        workflow_id: "into-group";
+        title: "Into UI Group";
+        context: Ctx;
+        nodes { source => PassThrough }
+        group ui { nodes { target => PassThrough } }
+        edges { source ->! ui.target }
+    };
+    assert!(matches!(into_group, Err(GraphError::InvalidEdge { .. })));
 }

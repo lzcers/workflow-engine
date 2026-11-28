@@ -1,24 +1,25 @@
-//! 引擎统一定义的任务存储契约与后继输入规则。
-//!
-//! 各数据库后端复用本模块的纯数据转换，并通过各自的 SQL、锁与事务落实 [`TaskStore`] 契约。
+//! 引擎统一定义的任务存储契约、后继分发计划与静态结算规则。
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
 
-use super::{Task, TaskRecord};
+use super::{DEFAULT_MAX_ATTEMPTS, Task, TaskRecord};
 use crate::{RunHandle, error::StorageError, node::MergeMode};
 
-/// 认领和每次续租的存活期限，不限制节点的总执行时长。
-pub(crate) const LEASE_DURATION: Duration = Duration::from_secs(300);
+/// 默认认领与续租的存活期限，可通过 `WorkerOptions::lease_duration` 自定义。
+pub(crate) const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(300);
+
+/// 单次运行默认最大任务数上限（防止失败回边环或失控扇出打爆数据库）；0 表示不限制。
+pub(crate) const DEFAULT_MAX_TASKS_PER_RUN: usize = 10_000;
 
 /// 后继任务在结算事务内的落库与作用域分发方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dispatch {
     /// 在共享作用域内为每条输入创建独立的 `pending` 任务。
     Shared,
-    /// 为 `->+` 的每条输入建立独立子图作用域并创建 `pending` 任务。
+    /// 为 `->!` / `->+` 的每条输入建立独立子图作用域并创建 `pending` 任务。
     PerInputScope,
     /// 在共享作用域内合并至状态为 `collecting` 的 JOIN 任务的指定槽位。
     Join {
@@ -30,67 +31,99 @@ pub enum Dispatch {
 /// 一条边的后继输入及目标信息；由存储层原子路由、创建作用域和任务。
 #[derive(Debug, Clone)]
 pub struct Successor {
-    pub dst: &'static str,
-    /// 从根到目标所属子图的完整子图 ID，根节点为空。
-    pub subgraph_path: Vec<String>,
+    pub dst: Arc<str>,
+    /// 从根到目标所属隔离作用域的完整子图 ID，根节点或纯视觉分组为空。
+    pub subgraph_path: Arc<[Arc<str>]>,
     pub inputs: Vec<Value>,
     pub dispatch: Dispatch,
+    /// 目标节点级最大尝试次数覆盖；None 时继承工作流默认策略。
+    pub max_attempts: Option<i32>,
 }
 
-/// JOIN 的直接前驱、仍可能创建输入的全部上游与聚合槽位名，在图构建后固定。
+/// 跨边界进入子图内 JOIN 的外部直接前驱，用于通过 `trigger_task_id` 精确绑定入口事件。
+#[derive(Debug, Clone)]
+pub(crate) struct JoinExternalEntry {
+    pub name: String,
+    pub entry_depth: usize,
+}
+
+/// JOIN 的作用域深度、必填槽位、聚合槽位、外部入口与全部反向可达上游，在图构建后固定。
 #[derive(Debug, Clone)]
 pub(crate) struct JoinRule {
-    pub predecessors: Vec<JoinPredecessor>,
-    pub upstreams: Vec<String>,
-    /// 需要预置为空数组的 `MergeMode::Append` 槽位键。
+    pub scope_depth: usize,
+    pub required_slots: Vec<String>,
     pub append_keys: Vec<String>,
-}
-
-/// 外部前驱只对应触发当前子图实例的入口任务。深度从最外层子图的 0 开始。
-#[derive(Debug, Clone)]
-pub(crate) struct JoinPredecessor {
-    pub name: String,
-    pub entry_depth: Option<usize>,
-    pub optional: bool,
+    pub external_entries: Vec<JoinExternalEntry>,
+    pub upstreams: Vec<String>,
 }
 
 /// 图构建时预计算的静态结算规则，由存储层在结算事务内消费。
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SettlementRules {
-    pub join_rules: HashMap<String, JoinRule>,
+    pub join_rules: HashMap<Arc<str>, JoinRule>,
+    /// 每个节点结算时可能影响的 JOIN 节点名列表（用于精细锁粒度与无 JOIN 短路）。
+    pub affected_joins: HashMap<Arc<str>, Vec<Arc<str>>>,
 }
 
-#[cfg(feature = "pg")]
 impl SettlementRules {
-    /// 是否包含需要运行级串行锁的跨任务规则。
-    pub(crate) fn needs_run_lock(&self) -> bool {
-        !self.join_rules.is_empty()
+    pub(crate) fn affected_joins_for(&self, node: &str) -> &[Arc<str>] {
+        self.affected_joins
+            .get(node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// 返回结算 `node` 时可能影响的既有作用域深度（升序去重）。
+    pub(crate) fn affected_scope_depths(&self, node: &str) -> Vec<usize> {
+        let mut depths: Vec<usize> = self
+            .affected_joins_for(node)
+            .iter()
+            .filter_map(|join_name| self.join_rules.get(join_name.as_ref()))
+            .map(|rule| rule.scope_depth)
+            .collect();
+        depths.sort_unstable();
+        depths.dedup();
+        depths
+    }
+}
+
+/// 结算事务运行时策略配置。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SettlementConfig {
+    pub default_max_attempts: i32,
+    pub max_tasks_per_run: usize,
+}
+
+impl Default for SettlementConfig {
+    fn default() -> Self {
+        Self {
+            default_max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_tasks_per_run: DEFAULT_MAX_TASKS_PER_RUN,
+        }
     }
 }
 
 /// 后继路由使用源任务的身份，以及结算时数据库中的运行和作用域。
 pub(crate) struct FanoutSource<'a> {
     pub workflow_id: &'a str,
+    pub name: &'a str,
     pub task_id: i64,
     pub run_id: i64,
     pub scope_id: Option<i64>,
 }
 
-/// 按槽位合并模式把整批贡献合入 JOIN 输入对象；新建累加器时预置聚合槽位为空数组。
-pub(crate) fn merge_join_inputs(
+/// 在 `collecting` 阶段向 JOIN 累加器对象写入单值槽（`Set`）或标记聚合槽已收到贡献（`Append`）。
+///
+/// 约定：`collecting` 阶段 `input_json` 仅包含已收到至少一次贡献的槽位键；
+/// `Append` 槽位的实际元素以 O(1) 追加至 `join_contributions` 表，此处只放空数组 `[]` 占位标记，
+/// 避免大扇入时反复整块读写巨型 JSONB/TEXT。
+pub(crate) fn record_join_slot(
     existing: Option<Value>,
-    append_keys: &[String],
     key: &str,
     merge: MergeMode,
     inputs: &[Value],
 ) -> Result<Value, StorageError> {
-    let mut acc = existing.unwrap_or_else(|| {
-        let mut map = serde_json::Map::with_capacity(append_keys.len() + 1);
-        for append_key in append_keys {
-            map.insert(append_key.clone(), Value::Array(Vec::new()));
-        }
-        Value::Object(map)
-    });
+    let mut acc = existing.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     let Value::Object(map) = &mut acc else {
         return Err(StorageError::InvalidFanout {
             detail: "JOIN accumulator must be a JSON object".into(),
@@ -103,107 +136,114 @@ pub(crate) fn merge_join_inputs(
             }
         }
         MergeMode::Append => {
-            let entry = map
-                .entry(key.to_owned())
-                .or_insert_with(|| Value::Array(Vec::new()));
-            let Value::Array(items) = entry else {
-                return Err(StorageError::InvalidFanout {
-                    detail: format!("JOIN append slot `{key}` is not a JSON array"),
-                });
-            };
-            items.extend(inputs.iter().cloned());
+            if !inputs.is_empty() {
+                map.entry(key.to_owned())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+            }
         }
     }
     Ok(acc)
 }
 
-/// 引擎与调度器共用的任务存储，负责入口入队、认领、续租、结算和释放认领。
-///
-/// 同一引擎的工作流共用仓储，按 workflow_id 认领任务，结算时消费预计算的 [`SettlementRules`]。
-/// 调度器把图规划结果（成功后继 / 失败后继）和静态规则统一交给本存储落库，自身不触碰任何业务字段；
-/// 具体存储实现使用统一的 [`TaskRecord`] 快照，并将操作限制在任务所属的工作流内。
-///
-/// 认领资格与结算语义由本契约统一规定，后端负责事务实现；结算必须原子提交任务状态
-/// 与全部后继。成功和失败结算均在写完后继后推进本次运行内的 collecting JOIN，
-/// 即使本次没有后继也要检查。收齐输入的 JOIN 转为 pending，依赖永久失败的 JOIN 转为 failed。
-pub(crate) trait TaskStore: Sync {
-    /// 存储层错误类型：允许不同存储实现定义各自的错误，同时保证引擎层可统一传播
-    /// （`Send + Sync` 供调度器在协程间传播与打日志）。
-    type Error: std::error::Error + Send + Sync + 'static;
+/// 在 JOIN 由 `collecting` 转为 `pending` 时，把 `join_contributions` 中按 `seq` 排好序的条目
+/// 一次性物化到 `input_json`，并为未收到贡献的可选 `Append` 槽位补齐空数组 `[]`。
+pub(crate) fn materialize_join_input(
+    existing: Value,
+    append_keys: &[String],
+    mut contributions: HashMap<String, Vec<Value>>,
+) -> Result<Value, StorageError> {
+    let mut acc = existing;
+    let Value::Object(map) = &mut acc else {
+        return Err(StorageError::InvalidFanout {
+            detail: "JOIN accumulator must be a JSON object".into(),
+        });
+    };
+    for key in append_keys {
+        if let Some(items) = contributions.remove(key) {
+            map.insert(key.clone(), Value::Array(items));
+        } else {
+            map.entry(key.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+        }
+    }
+    Ok(acc)
+}
 
+/// 引擎与调度器共用的内部任务存储契约，统一使用 [`StorageError`]。
+pub(crate) trait TaskStore: Send + Sync {
     /// 提交已准备好入口路径的独立任务，事务提交成功后返回运行身份。
-    fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, Self::Error>>;
+    fn enqueue(&self, task: Task) -> BoxFuture<'_, Result<RunHandle, StorageError>>;
 
-    /// 在指定工作流的全部运行中认领一批待处理任务（执行业务或处理最终失败），最多 `limit` 个；数量不足或无可认领
-    /// 时返回少于 `limit` 甚至空列表，按任务 ID 排序。`limit` 为 0 时直接返回空列表。
-    ///
-    /// 认领无有效租约的 pending 或 running 任务，两者的输入均已确定。
-    ///
-    /// 资格检查与写入认领状态必须原子执行，避免多个 worker 同时认领同一个任务。
-    /// 每次认领递增 attempt 并写入 300 秒租约。
-    /// 返回的 attempt <= MAX_ATTEMPTS 时执行业务；超过上限时只做最终失败结算，不再执行节点。
-    /// 首次认领耗尽任务时必须持久化 error：末次租约过期记录租约失效，无租约则记录预算耗尽。
-    /// 后续认领保留该原因，使最终失败处理在崩溃或结算失败后仍可恢复。
+    /// 在指定工作流的全部运行中认领一批可执行任务，最多 `limit` 个，按 `task_id` 升序。
     fn claim_many<'a>(
         &'a self,
         workflow_id: &'a str,
         limit: usize,
-    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, Self::Error>>;
+        lease_duration: Duration,
+    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>>;
 
-    /// 将仍有效的认领延长至数据库当前时间 + LEASE_DURATION，返回新截止时间。
-    ///
-    /// 原子校验 workflow_id、task_id、attempt、running 状态和尚未过期的租约。
-    /// 失权、已结算或过期返回 None，不能复活过期认领；数据库错误单独返回 Err。
-    /// 续租不递增 attempt，也适用于超过业务尝试预算的最终失败结算认领。
+    /// 延长仍有效的认领至数据库当前时间 + `lease_duration`，返回新截止时间。
     fn renew_claim<'a>(
         &'a self,
         task: &'a TaskRecord,
-    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error>>;
+        lease_duration: Duration,
+    ) -> BoxFuture<'a, Result<Option<chrono::DateTime<chrono::Utc>>, StorageError>>;
 
-    /// 释放任务租约：原子结算事务失败（已回滚）后由调度器调用，让任务在下一轮认领即可
-    /// 重入，不必等待租约过期。仅当前有效认领可以释放，不能释放新执行者的租约。
-    fn release_claim<'a>(&'a self, task: &'a TaskRecord) -> BoxFuture<'a, Result<(), Self::Error>>;
+    /// 释放当前有效认领；可附带错误说明与可选短退避，保留崩溃/结算错误现场。
+    fn release_claim<'a>(
+        &'a self,
+        task: &'a TaskRecord,
+        error: Option<&'a str>,
+        delay: Option<Duration>,
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
 
-    /// 在同一事务内写入产物、标记成功并入队全部成功后继。
-    ///
-    /// 必须校验当前有效认领且 attempt <= MAX_ATTEMPTS；旧执行者和仅用于最终失败的认领不能提交成功。
-    /// 成功后继继承运行身份，作用域按子图边界进入、继承或退出。
-    /// 同一次结算的普通跨入边共享实例，`->+` 按边及元素建立独立实例。
-    /// scope 创建、任务结算、JOIN 输入合并与后继创建在同一事务提交。
-    /// 普通任务逐项创建；JOIN 按 workflow、run、scope 和节点名累积。
-    /// 依赖永久失败会令已有及晚创建的 JOIN 失败，不影响其他实例。
+    /// 在同一事务内写入产物、标记成功、批量入队后继并推进受影响的 collecting JOIN。
     fn settle_success<'a>(
         &'a self,
         task: &'a TaskRecord,
         output: &'a Value,
         successors: &'a [Successor],
         rules: &'a SettlementRules,
-    ) -> BoxFuture<'a, Result<(), Self::Error>>;
+        config: SettlementConfig,
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
 
-    /// 在同一事务内结算失败，并入队失败后继或级联已有依赖任务。
-    ///
-    /// `successors` 存在非空输入时标记 `superseded`；否则标记 `failed`，并将同一工作流、
-    /// 同一 run 中按前驱名称和作用域关系依赖该实例来源的 collecting JOIN 标记失败。
-    /// 必须先校验当前有效认领，旧执行者不能创建后继或级联失败。
-    /// 失败后继同样将源任务 ID 写入 parent_task_ids，每条失败路由输入创建一条直接执行的后继。
-    /// 任一步失败都必须整体回滚，调度器会释放租约并重试。
+    /// 在同一事务内结算失败（`superseded` 或 `failed`）、入队失败后继并推进受影响的 collecting JOIN。
     fn settle_failure<'a>(
         &'a self,
         task: &'a TaskRecord,
         message: &'a str,
         successors: &'a [Successor],
         rules: &'a SettlementRules,
-    ) -> BoxFuture<'a, Result<(), Self::Error>>;
+        config: SettlementConfig,
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
 
-    /// 将可重试失败的任务放回 pending 并设置下次可认领时间（退避延迟），清空租约并保留本次错误。
-    ///
-    /// 必须校验当前有效认领且 `attempt < MAX_ATTEMPTS`；已失权或预算耗尽的认领不能安排退避重试。
+    /// 将可重试失败的任务放回 `pending` 并设置下次可认领时间 `available_at`。
     fn schedule_retry<'a>(
         &'a self,
         task: &'a TaskRecord,
         message: &'a str,
         delay: Duration,
-    ) -> BoxFuture<'a, Result<(), Self::Error>>;
+    ) -> BoxFuture<'a, Result<(), StorageError>>;
+
+    /// 共享轮询器批量探测哪些已注册工作流存在立即可认领的任务（命中 `idx_tasks_claim` 部分索引）。
+    fn ready_workflows<'a>(
+        &'a self,
+        workflow_ids: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>>;
+
+    /// 查询指定运行的全部任务快照（按 `task_id` 升序）。
+    fn list_tasks<'a>(
+        &'a self,
+        workflow_id: &'a str,
+        run_id: i64,
+    ) -> BoxFuture<'a, Result<Vec<TaskRecord>, StorageError>>;
+
+    /// 取消指定运行的所有活跃任务（`pending`/`collecting`/`running`），返回受影响行数。
+    fn cancel_run<'a>(
+        &'a self,
+        workflow_id: &'a str,
+        run_id: i64,
+    ) -> BoxFuture<'a, Result<usize, StorageError>>;
 }
 
 #[cfg(test)]

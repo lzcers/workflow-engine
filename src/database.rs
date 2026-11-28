@@ -1,9 +1,28 @@
-//! 数据库连接、引擎表初始化与任务存储创建；后端选择由连接 URL 决定。
+//! 数据库连接、引擎表初始化、连接池配置与运行控制面查询/取消接口。
 
 use std::time::Duration;
 
 use crate::error::StorageError;
-use crate::{RunHandle, Task};
+use crate::task::TaskStore;
+use crate::{RunHandle, RunSnapshot, RunStatus, Task, TaskRecord};
+
+/// 数据库连接池配置参数；未显式传入时使用引擎默认值（PG 10 / SQLite 4，超时 5 秒）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolOptions {
+    /// 最大连接数（SQLite 内存/临时库固定为 1）。
+    pub max_connections: u32,
+    /// 获取连接超时时间（SQLite 同时作为 `busy_timeout`）。
+    pub acquire_timeout: Duration,
+}
+
+impl PoolOptions {
+    pub const fn new(max_connections: u32, acquire_timeout: Duration) -> Self {
+        Self {
+            max_connections: if max_connections == 0 { 1 } else { max_connections },
+            acquire_timeout,
+        }
+    }
+}
 
 /// 工作流数据库。默认共享连接池，也可以借用宿主事务来提交任务。
 #[derive(Clone)]
@@ -34,6 +53,8 @@ impl From<sqlx::SqlitePool> for Database {
 
 impl Database {
     /// 在宿主已有的 SQLx 事务上提交任务，借用在提交任务后结束。
+    ///
+    /// 使用 SQLite 且同一事务内先读后写时，建议通过 `pool.begin_with("BEGIN IMMEDIATE")` 开启事务。
     pub fn in_transaction<'a, 'c, DB: sqlx::Database>(
         tx: &'a mut sqlx::Transaction<'c, DB>,
     ) -> Database<&'a mut sqlx::Transaction<'c, DB>> {
@@ -45,20 +66,29 @@ impl Database {
         &self.0
     }
 
-    /// 根据 URL 连接 PostgreSQL 或 SQLite，不创建引擎表、不启动 worker。
-    ///
-    /// PostgreSQL 使用最多 10 个连接；SQLite 可写文件使用 WAL 和最多 4 个连接。
-    /// SQLite 内存及临时数据库保留一个不自动回收的连接，避免连接回收后数据库消失。
-    /// 两种后端的连接获取超时均为 5 秒，SQLite 写锁等待也为 5 秒。
-    /// SQLite 文件默认在不存在时创建；显式的 mode 和 immutable URL 参数保持原意。
+    /// 根据 URL 使用默认连接池参数连接 PostgreSQL 或 SQLite，不创建引擎表、不启动 worker。
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
+        Self::connect_internal(url, None).await
+    }
+
+    /// 使用自定义连接池参数连接 PostgreSQL 或 SQLite。
+    pub async fn connect_with(url: &str, options: PoolOptions) -> Result<Self, StorageError> {
+        Self::connect_internal(url, Some(options)).await
+    }
+
+    async fn connect_internal(
+        url: &str,
+        pool_cfg: Option<PoolOptions>,
+    ) -> Result<Self, StorageError> {
+        let timeout = pool_cfg.map_or(Duration::from_secs(5), |c| c.acquire_timeout);
         match url.split_once(':').map(|(scheme, _)| scheme) {
             Some("postgres" | "postgresql") => {
                 #[cfg(feature = "pg")]
                 {
+                    let max_conns = pool_cfg.map_or(10, |c| c.max_connections.max(1));
                     let pool = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(10)
-                        .acquire_timeout(Duration::from_secs(5))
+                        .max_connections(max_conns)
+                        .acquire_timeout(timeout)
                         .connect(url)
                         .await?;
                     Ok(Self::from(pool))
@@ -84,8 +114,6 @@ impl Database {
                     let (database_name, params) = database_and_params
                         .split_once('?')
                         .unwrap_or((database_and_params, ""));
-                    // SQLx 会把原始 :memory: 改为生成的文件名；编码后的特殊文件名
-                    // 和空文件名则由 SQLite 自身解释为只属于连接的临时数据库。
                     let mut transient = database_name == ":memory:"
                         || options.get_filename().as_os_str().is_empty()
                         || matches!(
@@ -95,7 +123,6 @@ impl Database {
                     let mut explicit_mode = false;
                     let mut read_only = false;
                     let mut immutable = false;
-                    // SQLx 已验证 URL；这里只读取连接池策略所需的参数，保留其连接选项。
                     for (key, value) in form_urlencoded::parse(params.as_bytes()) {
                         match key.as_ref() {
                             "mode" => {
@@ -107,9 +134,8 @@ impl Database {
                             _ => {}
                         }
                     }
-                    let mut options = options.busy_timeout(Duration::from_secs(5));
-                    let mut pool_options =
-                        SqlitePoolOptions::new().acquire_timeout(Duration::from_secs(5));
+                    let mut options = options.busy_timeout(timeout);
+                    let mut pool_options = SqlitePoolOptions::new().acquire_timeout(timeout);
                     if transient {
                         pool_options = pool_options
                             .max_connections(1)
@@ -117,7 +143,8 @@ impl Database {
                             .max_lifetime(None)
                             .test_before_acquire(false);
                     } else {
-                        pool_options = pool_options.max_connections(4);
+                        let max_conns = pool_cfg.map_or(4, |c| c.max_connections.max(1));
+                        pool_options = pool_options.max_connections(max_conns);
                         if !read_only && !immutable {
                             options = options.journal_mode(SqliteJournalMode::Wal);
                             if !explicit_mode {
@@ -148,7 +175,7 @@ impl Database {
             }
             #[cfg(feature = "sqlite")]
             DatabasePool::Sqlite(pool) => {
-                let mut tx = pool.begin().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let run = Self::in_transaction(&mut tx).submit(task).await?;
                 tx.commit().await?;
                 Ok(run)
@@ -163,6 +190,65 @@ impl Database {
             DatabasePool::Postgres(pool) => crate::backend::pgsql::migrate(pool).await,
             #[cfg(feature = "sqlite")]
             DatabasePool::Sqlite(pool) => crate::backend::sqlite::migrate(pool).await,
+        }
+    }
+
+    /// 查询指定运行下全部任务快照（按 `task_id` 升序）。
+    pub async fn list_tasks(
+        &self,
+        workflow_id: &str,
+        run_id: i64,
+    ) -> Result<Vec<TaskRecord>, StorageError> {
+        match &self.0 {
+            #[cfg(feature = "pg")]
+            DatabasePool::Postgres(pool) => {
+                crate::backend::pgsql::PgTaskRepo::new(pool.clone())
+                    .list_tasks(workflow_id, run_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            DatabasePool::Sqlite(pool) => {
+                crate::backend::sqlite::SqliteTaskRepo::new(pool.clone())
+                    .list_tasks(workflow_id, run_id)
+                    .await
+            }
+        }
+    }
+
+    /// 获取指定运行的汇总状态与任务快照；不存在该运行时返回 `Ok(None)`。
+    pub async fn get_run(
+        &self,
+        workflow_id: &str,
+        run_id: i64,
+    ) -> Result<Option<RunSnapshot>, StorageError> {
+        let tasks = self.list_tasks(workflow_id, run_id).await?;
+        if tasks.is_empty() {
+            return Ok(None);
+        }
+        let status = RunStatus::from_tasks(&tasks);
+        Ok(Some(RunSnapshot {
+            workflow_id: workflow_id.to_owned(),
+            run_id,
+            status,
+            tasks,
+        }))
+    }
+
+    /// 取消指定运行的所有活跃任务（`pending`/`collecting`/`running`），返回被取消的任务数。
+    pub async fn cancel_run(&self, workflow_id: &str, run_id: i64) -> Result<usize, StorageError> {
+        match &self.0 {
+            #[cfg(feature = "pg")]
+            DatabasePool::Postgres(pool) => {
+                crate::backend::pgsql::PgTaskRepo::new(pool.clone())
+                    .cancel_run(workflow_id, run_id)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            DatabasePool::Sqlite(pool) => {
+                crate::backend::sqlite::SqliteTaskRepo::new(pool.clone())
+                    .cancel_run(workflow_id, run_id)
+                    .await
+            }
         }
     }
 

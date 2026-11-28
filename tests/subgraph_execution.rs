@@ -1,18 +1,29 @@
-//! 真实存储上的嵌套进入、退出和 JOIN 隔离；同一图验证 SQLite 与 PostgreSQL。
+//! 真实存储上的嵌套进入、退出、XOR-Merge、JOIN 隔离与恢复；同一图验证 SQLite 与 PostgreSQL。
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::sync::{Semaphore, mpsc};
-use workflow_engine::task::ScopeRecord;
 use workflow_engine::{
-    Engine, Graph, JoinInput, JoinNode, Node, NodeContext, NodeError, TaskRecord, TaskStatus,
-    workflow,
+    Edge, Engine, Graph, JoinInput, JoinNode, Node, NodeContext, NodeError, RunStatus, TaskRecord,
+    TaskStatus, workflow,
 };
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ScopeRow {
+    #[allow(dead_code)]
+    workflow_id: String,
+    scope_id: i64,
+    run_id: i64,
+    subgraph_id: String,
+    parent_scope_id: Option<i64>,
+    trigger_task_id: i64,
+}
 
 struct Context {
     task: Option<TaskRecord>,
     results: mpsc::UnboundedSender<(TaskRecord, Value)>,
 }
+
 impl NodeContext for Context {
     async fn fork(&self, task: &TaskRecord) -> Self {
         Self {
@@ -20,7 +31,12 @@ impl NodeContext for Context {
             results: self.results.clone(),
         }
     }
+
+    async fn on_success(&mut self, task: &TaskRecord, output: &Value) {
+        let _ = self.results.send((task.clone(), output.clone()));
+    }
 }
+
 struct Pass<T>(PhantomData<T>);
 fn pass<T>() -> Pass<T> {
     Pass(PhantomData)
@@ -31,12 +47,8 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Node<Context> for 
     async fn execute(&self, _: &mut Context, input: T) -> Result<T, NodeError> {
         Ok(input)
     }
-    async fn on_success(ctx: &mut Context, output: &Value) {
-        let _ = ctx
-            .results
-            .send((ctx.task.as_ref().unwrap().clone(), output.clone()));
-    }
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize, JoinInput)]
 struct IndicatorsJoin {
     left: i32,
@@ -86,7 +98,8 @@ fn nested_graph(context: Context) -> Graph<Context> {
     }
     .unwrap()
 }
-async fn read_scopes(url: &str, workflow_id: &str) -> Vec<ScopeRecord> {
+
+async fn read_scopes(url: &str, workflow_id: &str) -> Vec<ScopeRow> {
     let sql = "SELECT workflow_id,scope_id,run_id,subgraph_id,parent_scope_id,trigger_task_id FROM scopes WHERE workflow_id=$1 ORDER BY scope_id";
     #[cfg(feature = "sqlite")]
     if url.starts_with("sqlite:") {
@@ -112,6 +125,7 @@ async fn read_scopes(url: &str, workflow_id: &str) -> Vec<ScopeRecord> {
     }
     panic!("unsupported test backend")
 }
+
 async fn execute_sql(url: &str, sql: &str) {
     #[cfg(feature = "sqlite")]
     if url.starts_with("sqlite:") {
@@ -129,12 +143,13 @@ async fn execute_sql(url: &str, sql: &str) {
     }
     panic!("unsupported test backend")
 }
+
 async fn recover_nested(url: &str) {
     let workflow_id = format!("scope-recovery-{}", uuid::Uuid::new_v4());
     let engine = Engine::new(url).await.unwrap();
     let fixture = format!(
         "INSERT INTO tasks(workflow_id,name,status,input_json,attempt,lease_until)
-         VALUES('{workflow_id}','outer.inner.start','running','8',1,'2000-01-01T00:00:00Z');
+         VALUES('{workflow_id}','outer.inner.start','running','8',1,'2000-01-01T00:00:00.000Z');
          INSERT INTO scopes(workflow_id,run_id,subgraph_id,trigger_task_id)
          SELECT workflow_id,task_id,'outer',task_id FROM tasks WHERE workflow_id='{workflow_id}';
          INSERT INTO scopes(workflow_id,run_id,subgraph_id,parent_scope_id,trigger_task_id)
@@ -192,7 +207,13 @@ async fn nested(url: &str) {
         results,
     }));
     let run = workflow.submit("start", vec![1, 2, 3]).await.unwrap();
-    let records = tokio::time::timeout(Duration::from_secs(12), async {
+    let snap = tokio::time::timeout(Duration::from_secs(12), workflow.wait_run(run.run_id))
+        .await
+        .expect("all three nested invocations must complete and collect")
+        .unwrap();
+    assert_eq!(snap.status, RunStatus::Succeeded);
+
+    let records = tokio::time::timeout(Duration::from_secs(5), async {
         let mut records = Vec::new();
         loop {
             let result = receiver.recv().await.unwrap();
@@ -204,7 +225,7 @@ async fn nested(url: &str) {
         }
     })
     .await
-    .expect("all three nested invocations must complete and collect");
+    .unwrap();
     let reports: Vec<_> = records
         .iter()
         .filter(|(task, _)| task.name == "analysis.report")
@@ -241,7 +262,6 @@ async fn nested(url: &str) {
             assert!(ids.contains(&scope.parent_scope_id.unwrap()));
         }
     }
-    // Manual entry directly into a nested node creates both ancestor instances.
     let direct = workflow
         .submit("analysis.indicators.left", 7)
         .await
@@ -257,6 +277,7 @@ async fn nested(url: &str) {
         Some(direct_scopes[0].scope_id)
     );
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize, JoinInput)]
 struct SignalJoin {
     daily: i32,
@@ -439,11 +460,10 @@ struct SharedValuesJoin {
     value: Vec<i32>,
 }
 
-// Both graphs use the same JOIN name but wait for different predecessors.
 async fn shared_store_uses_each_graphs_join_rules(url: &str) {
     let engine = Engine::new(url).await.unwrap();
     let (results, mut receiver) = mpsc::unbounded_channel();
-    let make = |id: &str, entry: &'static str| {
+    let make = |id: &str, entry: &str| {
         let context = Context {
             task: None,
             results: results.clone(),
@@ -452,19 +472,16 @@ async fn shared_store_uses_each_graphs_join_rules(url: &str) {
             .node(entry, pass::<Vec<i32>>())
             .node("joined", JoinNode::<SharedValuesJoin>::new())
             .node("finish", pass::<SharedValuesJoin>())
-            .edge(workflow_engine::graph::success_join(
-                entry,
-                "joined",
-                SharedValuesJoin::slots().value(),
-                workflow_engine::graph::shared_expand::<i32>(),
-                |_| true,
-            ))
-            .edge(workflow_engine::graph::success(
-                "joined",
-                "finish",
-                workflow_engine::graph::direct::<SharedValuesJoin>(),
-                |_| true,
-            ))
+            .edge(
+                Edge::success::<Vec<i32>>(entry)
+                    .to_slot("joined", SharedValuesJoin::slots().value())
+                    .expand(),
+            )
+            .edge(
+                Edge::success::<SharedValuesJoin>("joined")
+                    .to::<SharedValuesJoin>("finish")
+                    .direct(),
+            )
             .build()
             .unwrap();
         engine.make(graph)
@@ -508,18 +525,33 @@ async fn sqlite_nested_scopes_and_entry_correlation() {
     shared_store_uses_each_graphs_join_rules(&url).await;
     let _ = std::fs::remove_file(path);
 }
+
 #[cfg(feature = "pg")]
 #[tokio::test]
 async fn postgres_nested_scopes_and_entry_correlation() {
-    let Ok(url) = std::env::var("WORKFLOW_ENGINE_TEST_DATABASE_URL") else {
+    let Ok(base_url) = std::env::var("WORKFLOW_ENGINE_TEST_DATABASE_URL") else {
         return;
     };
+    let schema = format!("subgraph_exec_{}", uuid::Uuid::new_v4().simple());
+    let admin = sqlx::PgPool::connect(&base_url).await.unwrap();
+    sqlx::query(&format!(r#"CREATE SCHEMA "{schema}""#))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let url = format!("{base_url}{sep}options=-c%20search_path%3D{schema}");
+
     nested(&url).await;
     entry_and_isolated_expansion(&url).await;
     recover_nested(&url).await;
     waits_for_later_upstream_tasks(&url).await;
     retry_and_recovery_join(&url).await;
     shared_store_uses_each_graphs_join_rules(&url).await;
+
+    let _ = sqlx::query(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE"#))
+        .execute(&admin)
+        .await;
+    admin.close().await;
 }
 
 struct FailOnNegative;
@@ -541,6 +573,8 @@ struct FallbackAndOptionalJoin {
     base: i32,
     fallback_branch: String,
     optional_branch: Option<i32>,
+    /// 必填槽位通过 XOR 条件分支汇聚（槽位驱动就绪的核心正交能力）。
+    xor_result: String,
 }
 
 async fn retry_and_recovery_join(url: &str) {
@@ -548,12 +582,14 @@ async fn retry_and_recovery_join(url: &str) {
     let (results, mut receiver) = mpsc::unbounded_channel();
     let graph = workflow! {
         workflow_id: format!("fallback-optional-{}", uuid::Uuid::new_v4());
-        title: "Fallback on_error and optional branch into typed JOIN";
+        title: "Fallback on_error, optional slot, and XOR-merge into typed JOIN";
         context: Context { task: None, results };
         nodes {
             start => pass::<i32>(),
             flaky => FailOnNegative,
             maybe => pass::<i32>(),
+            pos_branch => pass::<i32>(),
+            neg_branch => pass::<i32>(),
             joined => JoinNode::<FallbackAndOptionalJoin>::new(),
             finish => pass::<FallbackAndOptionalJoin>(),
         }
@@ -562,15 +598,21 @@ async fn retry_and_recovery_join(url: &str) {
             start -> flaky,
             flaky -> joined::fallback_branch |> |v| format!("ok:{v}"),
             flaky -> joined::fallback_branch on_error |> |_, err| format!("degraded:{err}"),
+            // Option<i32> 槽位天然可选，边上无需重复声明 optional。
             start -> maybe when(|v| *v > 0),
-            maybe -> joined::optional_branch optional,
+            maybe -> joined::optional_branch,
+            // XOR-Merge：两条互斥条件分支汇入同一个必填槽 xor_result: String。
+            start -> pos_branch when(|v| *v >= 0),
+            start -> neg_branch when(|v| *v < 0),
+            pos_branch -> joined::xor_result when(|v| *v >= 0) |> |v| format!("pos:{v}"),
+            neg_branch -> joined::xor_result when(|v| *v < 0) |> |v| format!("neg:{v}"),
             joined -> finish,
         }
     }
     .unwrap();
     let workflow = engine.make(graph);
 
-    // 1) Negative input: flaky fails -> on_error fallback merges into JOIN; maybe skipped via optional.
+    // 1) Negative input: flaky fails -> on_error fallback; maybe skipped -> None; neg_branch fills xor_result.
     workflow.submit("start", -1).await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
@@ -581,17 +623,18 @@ async fn retry_and_recovery_join(url: &str) {
         }
     })
     .await
-    .expect("degraded fallback + skipped optional branch must converge");
+    .expect("degraded fallback + skipped optional + XOR-merge must converge");
     assert_eq!(
         first,
         FallbackAndOptionalJoin {
             base: -1,
             fallback_branch: "degraded:negative input".into(),
             optional_branch: None,
+            xor_result: "neg:-1".into(),
         }
     );
 
-    // 2) Positive input: flaky succeeds and optional maybe branch runs and joins.
+    // 2) Positive input: flaky succeeds, optional maybe runs, pos_branch fills xor_result.
     workflow.submit("start", 2).await.unwrap();
     let second = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
@@ -602,17 +645,18 @@ async fn retry_and_recovery_join(url: &str) {
         }
     })
     .await
-    .expect("successful branch + active optional branch must converge");
+    .expect("successful branch + active optional + XOR-merge must converge");
     assert_eq!(
         second,
         FallbackAndOptionalJoin {
             base: 2,
             fallback_branch: "ok:20".into(),
             optional_branch: Some(2),
+            xor_result: "pos:2".into(),
         }
     );
 
-    // 3) Required predecessor skipped via when(false) settles collecting JOIN as Failed (no zombie).
+    // 3) Required slot skipped via when(false) settles collecting JOIN as Failed (no zombie).
     let zombie_id = format!("zombie-cleanup-{}", uuid::Uuid::new_v4());
     let (z_tx, _z_rx) = mpsc::unbounded_channel();
     #[derive(Debug, Clone, Serialize, Deserialize, JoinInput)]
@@ -622,7 +666,7 @@ async fn retry_and_recovery_join(url: &str) {
     }
     let zombie_graph = workflow! {
         workflow_id: zombie_id.clone();
-        title: "Missing required predecessor settles JOIN as failed";
+        title: "Missing required slot settles JOIN as failed";
         context: Context { task: None, results: z_tx };
         nodes {
             start => pass::<i32>(),
@@ -639,44 +683,12 @@ async fn retry_and_recovery_join(url: &str) {
     }
     .unwrap();
     let zombie_wf = engine.make(zombie_graph);
-    zombie_wf.submit("start", 1).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(8), async {
-        loop {
-            let sql = format!(
-                "SELECT status FROM tasks WHERE workflow_id = '{zombie_id}' AND name = 'joined'"
-            );
-            let status: Option<String> = {
-                #[cfg(feature = "sqlite")]
-                if url.starts_with("sqlite:") {
-                    let pool = sqlx::SqlitePool::connect(url).await.unwrap();
-                    let s = sqlx::query_scalar(&sql).fetch_optional(&pool).await.unwrap();
-                    pool.close().await;
-                    s
-                } else {
-                    #[cfg(feature = "pg")]
-                    {
-                        let pool = sqlx::PgPool::connect(url).await.unwrap();
-                        let s = sqlx::query_scalar(&sql).fetch_optional(&pool).await.unwrap();
-                        pool.close().await;
-                        s
-                    }
-                    #[cfg(not(feature = "pg"))]
-                    unreachable!()
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
-                    let pool = sqlx::PgPool::connect(url).await.unwrap();
-                    let s = sqlx::query_scalar(&sql).fetch_optional(&pool).await.unwrap();
-                    pool.close().await;
-                    s
-                }
-            };
-            if status.as_deref() == Some(TaskStatus::Failed.as_str()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("missing required predecessor must fail collecting JOIN instead of hanging");
+    let run = zombie_wf.submit("start", 1).await.unwrap();
+    let snap = tokio::time::timeout(Duration::from_secs(8), zombie_wf.wait_run(run.run_id))
+        .await
+        .expect("missing required slot must fail collecting JOIN instead of hanging")
+        .unwrap();
+    assert_eq!(snap.status, RunStatus::Failed);
+    let joined = snap.tasks.iter().find(|t| t.name == "joined").unwrap();
+    assert_eq!(joined.status, TaskStatus::Failed);
 }

@@ -1,20 +1,22 @@
-//! 节点抽象：强类型输入/输出 + 类型擦除。
+//! 节点抽象：强类型输入/输出、角色声明、重试策略与上下文生命周期钩子。
 //!
 //! [`Node`] 是业务节点实现的接口，`In`/`Out` 支持序列化以便落库（对应 DB `task.input`/`task.output`）。
 //! 节点**不携带名字**，节点名由 [`crate::graph::Graph`] 在注册实例时外部绑定。
-//!
-//! 节点错误统一为 [`NodeError`]：区分「可重试」与「永久失败」，供工作流的失败边选择后继。
-//!
-//! 子模块划分：
-//! - [`join`]：显式 JOIN 汇聚节点（[`JoinNode`]），引擎通用能力，把多前驱输入合并透传。
+//! 跨节点的观测钩子（`on_start` / `on_success` / `on_error`）统一收敛在 [`NodeContext`] 上。
 
-use std::{any::TypeId, future::Future, marker::PhantomData};
+use std::{
+    any::TypeId,
+    future::Future,
+    marker::PhantomData,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use super::task::TaskRecord;
+use super::task::{DEFAULT_MAX_ATTEMPTS, TaskRecord};
 
 mod join;
 
@@ -30,82 +32,168 @@ pub struct Trigger {
     pub config: Value,
 }
 
-/// `Node` 的上下文类型参数：`Ctx` 业务侧实例化为 `NodeContext`。
-/// 错误统一为 [`NodeError`]。
+/// 任务级/工作流级重试策略：指数退避 + 抖动（jitter）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// 最大业务执行次数（含首次认领，至少为 1；默认 3）。
+    pub max_attempts: i32,
+    /// 首次重试基础延迟（默认 1 秒）。
+    pub base_delay: Duration,
+    /// 单次退避延迟上限（默认 60 秒）。
+    pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub const fn new(max_attempts: i32) -> Self {
+        let clamped = if max_attempts < 1 { 1 } else { max_attempts };
+        Self {
+            max_attempts: clamped,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+
+    /// 禁用自动重试（仅执行 1 次）。
+    pub const fn no_retry() -> Self {
+        Self::new(1)
+    }
+
+    /// 规范化最大尝试次数（至少 1）。
+    pub const fn effective_max_attempts(self) -> i32 {
+        if self.max_attempts < 1 {
+            1
+        } else {
+            self.max_attempts
+        }
+    }
+
+    /// 计算第 `attempt` 次失败后的指数退避时长，附带 75%~100% 抖动防惊群。
+    pub fn delay_for(self, task_id: i64, attempt: i32) -> Duration {
+        let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0).min(16);
+        let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let raw = self.base_delay.saturating_mul(factor).min(self.max_delay);
+        if raw.is_zero() {
+            return Duration::ZERO;
+        }
+        // splitmix64 混合 task_id、attempt 与当前纳秒，提供轻量无依赖抖动（[75%, 100%]）。
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as u64);
+        let mut z = (task_id as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (attempt as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+            ^ nanos;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let pct = 75 + (z % 26); // 75..=100
+        let ms = raw.as_millis() as u64;
+        if ms == 0 {
+            raw
+        } else {
+            Duration::from_millis((ms.saturating_mul(pct) / 100).max(1))
+        }
+    }
+}
+
+/// 节点在图中的执行角色（以单一 ADT 消除非法组合状态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeRole {
+    /// 普通节点：任一入边到达即独立执行。
+    Normal,
+    /// JOIN 汇聚节点：按槽位收集同作用域贡献，等待上游终结且必填槽位满足后执行。
+    Join(Vec<SlotSpec>),
+}
+
+impl NodeRole {
+    pub fn task_type(&self) -> TaskType {
+        match self {
+            Self::Normal => TaskType::Normal,
+            Self::Join(_) => TaskType::Join,
+        }
+    }
+}
+
+/// 节点声明的执行任务类型，供图描述输出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    /// 普通节点：无需等齐前驱，fan-in 任一前驱成功即触发。
+    Normal,
+    /// JOIN 汇聚门：按槽位和作用域收集来源并等待上游终结。
+    Join,
+}
+
+/// 业务节点接口：所有方法均以 `&self` 保持对称。
 pub trait Node<Ctx>: Send + Sync {
     /// 任务输入类型，对应 DB `task.input`。
     type In: Serialize + DeserializeOwned + 'static;
     /// 任务输出类型，对应 DB `task.output`。
     type Out: Serialize + DeserializeOwned + 'static;
-    /// 该节点产出的任务类型；子图边界由图结构声明。
-    const TASK_TYPE: TaskType = TaskType::Normal;
 
-    /// 外部触发器的注册信息。Event 节点必须返回 Some，其他节点必须返回 None。
-    ///
-    /// 此方法仅描述固定的节点配置，必须无副作用，不注册监听或依赖单次任务上下文。
-    /// 宿主通过 Workflow::triggers 获取声明，注册后调用 Workflow::submit 投递事件。
+    /// 节点执行角色；默认普通节点，JOIN 节点返回 `NodeRole::Join(Self::In::slot_specs())`。
+    fn role(&self) -> NodeRole {
+        NodeRole::Normal
+    }
+
+    /// 外部触发器的静态注册声明（无副作用，与入边正交）。
     fn trigger(&self) -> Option<Trigger> {
         None
     }
 
-    /// JOIN 节点的强类型输入槽位规格。`TaskType::Join` 节点必须返回 `Some(Self::In::slot_specs())`，
-    /// 其他节点必须返回 `None`。
-    fn join_slots(&self) -> Option<Vec<SlotSpec>> {
+    /// 节点级重试策略覆盖；None 时继承工作流默认策略。
+    fn retry_policy(&self) -> Option<RetryPolicy> {
         None
     }
 
     /// 异步执行：消费输入，产出序列化输出。失败返回 [`NodeError`]。
-    ///
-    /// 返回 `impl Future + Send` 以便擦除后可在 tokio 任务中跨线程移动。
-    /// 引擎只维护执行租约，不设置业务超时；需要限制运行时长时由节点自行控制。
     fn execute(
         &self,
         ctx: &mut Ctx,
         input: Self::In,
     ) -> impl Future<Output = Result<Self::Out, NodeError>> + Send;
-
-    /// 任务开始回调（当前任务已注入 `ctx`），先于节点执行。
-    fn on_start(_ctx: &mut Ctx, _input: &Value) -> impl Future<Output = ()> + Send {
-        async {}
-    }
-
-    /// 执行成功且落库后回调。`out` 为该节点序列化输出（`Value`）。
-    fn on_success(_ctx: &mut Ctx, _out: &Value) -> impl Future<Output = ()> + Send {
-        async {}
-    }
-
-    /// 失败结算提交后回调。`err` 为节点错误或尝试预算耗尽原因。
-    /// 回调不阻塞后继认领，也不保证必达；进程退出或 Workflow 释放时可能被取消。
-    /// 回调期间不再续租，引擎不限制回调时长。
-    fn on_error(_ctx: &mut Ctx, _err: &NodeError) -> impl Future<Output = ()> + Send {
-        async {}
-    }
 }
 
-/// 节点注册时返回的类型化标识，携带名字与由实例推导的节点、上下文类型。
-/// 供 `workflow!` 宏和类型检查版建边函数在编译期校验边两端的输入输出类型。
+/// 节点注册时返回的类型化标识，携带动态/静态名称与推导的节点、上下文类型。
+/// 供 `workflow!` 宏和类型化建边接口在编译期校验边两端的输入输出类型。
 pub struct NodeKey<Ctx, N> {
-    name: &'static str,
+    name: Arc<str>,
     marker: PhantomData<fn(Ctx) -> N>,
 }
 
-impl<Ctx, N> Copy for NodeKey<Ctx, N> {}
 impl<Ctx, N> Clone for NodeKey<Ctx, N> {
     fn clone(&self) -> Self {
-        *self
+        Self {
+            name: self.name.clone(),
+            marker: PhantomData,
+        }
     }
 }
 
 impl<Ctx, N> NodeKey<Ctx, N> {
-    pub(crate) fn new(name: &'static str) -> Self {
+    pub(crate) fn new(name: Arc<str>) -> Self {
         Self {
             name,
             marker: PhantomData,
         }
     }
 
-    pub fn name(self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn arc_name(&self) -> Arc<str> {
+        self.name.clone()
     }
 }
 
@@ -114,14 +202,13 @@ where
     N: Node<Ctx>,
     N::In: JoinInput,
 {
-    /// 返回目标 JOIN 节点的强类型字段槽位表，供 `workflow!` 宏和类型化建边函数按字段接线。
-    pub fn slots(self) -> <N::In as JoinInput>::Slots {
+    /// 返回目标 JOIN 节点的强类型字段槽位表，供 `workflow!` 宏和类型化建边按字段接线。
+    pub fn slots(&self) -> <N::In as JoinInput>::Slots {
         <N::In as JoinInput>::slots()
     }
 }
 
 /// 节点/边端口的编译期类型指纹：`TypeId` 做等值比对，`type_name` 用于错误信息与图描述。
-/// 用于 `Graph::build` 期间静态校验命令式边的端口类型接线，把错线从运行时提前到建图期。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TypeFingerprint {
     id: TypeId,
@@ -155,14 +242,12 @@ impl TypeFingerprint {
 
 /// 擦除后的节点接口：对 `Value` 执行，隐藏具体 `In`/`Out`。
 pub(crate) trait AnyNode<Ctx>: Send + Sync {
-    fn task_type(&self) -> TaskType;
+    fn role(&self) -> NodeRole;
     fn trigger(&self) -> Option<Trigger>;
-    fn join_slots(&self) -> Option<Vec<SlotSpec>>;
+    fn retry_policy(&self) -> Option<RetryPolicy>;
     fn in_type(&self) -> TypeFingerprint;
     fn out_type(&self) -> TypeFingerprint;
-    fn on_start<'a>(&'a self, ctx: &'a mut Ctx, input: &'a Value) -> BoxFuture<'a, ()>;
-    fn on_success<'a>(&'a self, ctx: &'a mut Ctx, output: &'a Value) -> BoxFuture<'a, ()>;
-    fn on_error<'a>(&'a self, ctx: &'a mut Ctx, error: &'a NodeError) -> BoxFuture<'a, ()>;
+    fn validate_input(&self, input: &Value) -> Result<(), serde_json::Error>;
 
     /// `name` 为节点名，仅用于错误信息。
     fn execute<'a>(
@@ -173,15 +258,35 @@ pub(crate) trait AnyNode<Ctx>: Send + Sync {
     ) -> BoxFuture<'a, Result<Value, NodeError>>;
 }
 
-/// 调度器对节点上下文的最小契约：调度器只依赖此接口驱动节点，不感知具体上下文类型。
-/// 每次执行都接收统一的 [`TaskRecord`]，由业务上下文按需读取任务信息。
+/// 调度器对任务上下文的契约：承载每任务上下文派发与统一生命周期观测钩子。
+///
+/// 钩子在 `NodeContext` 上实现一次即覆盖整张图的所有节点，避免在每个 `Node` 实现中重复样板。
 pub trait NodeContext: Send {
-    /// 从共享基座按任务复制一份上下文（共享字段借用同一 `Arc`，仅瞬态字段随任务注入）。
-    ///
-    /// 异步：每个被认领的任务在执行前都会走一次，因此这是业务侧准备或刷新任务所需上下文的
-    /// 天然位置（例如重新读取配置、冻结快照）。失败由实现自行降级（沿用上一份可用上下文）：
-    /// 任务已经认领，返回错误只会白烧一次尝试预算。
+    /// 从共享基座按任务派发独立上下文（共享字段借用同一 `Arc`，瞬态字段随任务注入）。
     fn fork(&self, task: &TaskRecord) -> impl Future<Output = Self> + Send;
+
+    /// 任务开始执行前回调。
+    fn on_start(&mut self, _task: &TaskRecord) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// 成功结算落库后回调（不占用执行槽，不阻塞后继认领）。
+    fn on_success(
+        &mut self,
+        _task: &TaskRecord,
+        _output: &Value,
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// 最终失败（`failed`/`superseded`）结算落库后回调（不占用执行槽）。
+    fn on_error(
+        &mut self,
+        _task: &TaskRecord,
+        _error: &NodeError,
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 impl<Ctx, N> AnyNode<Ctx> for N
@@ -189,29 +294,28 @@ where
     Ctx: Send,
     N: Node<Ctx> + 'static,
 {
-    fn task_type(&self) -> TaskType {
-        N::TASK_TYPE
+    fn role(&self) -> NodeRole {
+        N::role(self)
     }
+
     fn trigger(&self) -> Option<Trigger> {
         N::trigger(self)
     }
-    fn join_slots(&self) -> Option<Vec<SlotSpec>> {
-        N::join_slots(self)
+
+    fn retry_policy(&self) -> Option<RetryPolicy> {
+        N::retry_policy(self)
     }
+
     fn in_type(&self) -> TypeFingerprint {
         TypeFingerprint::of::<N::In>()
     }
+
     fn out_type(&self) -> TypeFingerprint {
         TypeFingerprint::of::<N::Out>()
     }
-    fn on_start<'a>(&'a self, ctx: &'a mut Ctx, input: &'a Value) -> BoxFuture<'a, ()> {
-        Box::pin(N::on_start(ctx, input))
-    }
-    fn on_success<'a>(&'a self, ctx: &'a mut Ctx, output: &'a Value) -> BoxFuture<'a, ()> {
-        Box::pin(N::on_success(ctx, output))
-    }
-    fn on_error<'a>(&'a self, ctx: &'a mut Ctx, error: &'a NodeError) -> BoxFuture<'a, ()> {
-        Box::pin(N::on_error(ctx, error))
+
+    fn validate_input(&self, input: &Value) -> Result<(), serde_json::Error> {
+        <N::In as Deserialize>::deserialize(input).map(|_| ())
     }
 
     fn execute<'a>(
@@ -231,12 +335,6 @@ where
 }
 
 /// 图节点统一的错误类型：区分「可重试」与「永久失败」。
-///
-/// - [`NodeError::Retryable`]：瞬时错误（如 LLM 调用超时、网络抖动）。在 `attempt < MAX_ATTEMPTS` 时由调度器按指数退避重新入队重试；耗尽重试预算后进入失败边规划与失败结算。
-/// - [`NodeError::Permanent`]：确定性错误（如序列化失败、意外输出），不自动重试，直接进入失败边规划与失败结算。
-///
-/// `From<String>` 默认映射为 [`NodeError::Retryable`]，使经 `?` 传播的 exec 层错误
-/// （多为瞬时调用）无需显式标注；确定性错误请在构造处用 [`NodeError::permanent`] 显式声明。
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum NodeError {
     /// 可重试的瞬时错误。
@@ -248,38 +346,22 @@ pub enum NodeError {
 }
 
 impl NodeError {
-    /// 构造一个可重试错误。
     pub fn retryable(msg: impl Into<String>) -> Self {
         NodeError::Retryable(msg.into())
     }
-    /// 构造一个永久失败错误。
+
     pub fn permanent(msg: impl Into<String>) -> Self {
         NodeError::Permanent(msg.into())
     }
-    /// 是否可重试。
+
     pub fn is_retryable(&self) -> bool {
         matches!(self, NodeError::Retryable(_))
     }
 }
 
-/// 默认把 `String` 错误视为可重试（`?` 传播的 exec 层错误以瞬时为主）。
+/// 默认把 `String` 错误视为可重试（`?` 传播的外部调用错误以瞬时为主）。
 impl From<String> for NodeError {
     fn from(s: String) -> Self {
         NodeError::Retryable(s)
     }
-}
-
-/// 节点声明的任务类型：Event 为外部事件入口，JOIN 等待关联来源。
-/// Event 入队后的认领与执行沿用普通任务规则；事件监听和注册由宿主负责。
-///
-/// 由节点经 [`Node::TASK_TYPE`] 声明。调度和图描述都从图定义读取类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskType {
-    /// 普通节点：无需等齐前驱，fan-in 任一前驱成功即触发。
-    Normal,
-    /// 外部事件入口：声明触发配置，不允许成功边或失败边指向此节点。
-    Event,
-    /// JOIN 汇聚门：按前驱名称和作用域等待来源成功及上游生产结束。
-    Join,
 }

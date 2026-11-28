@@ -14,10 +14,10 @@ mod keyword {
     syn::custom_keyword!(nodes);
     syn::custom_keyword!(edges);
     syn::custom_keyword!(subgraph);
+    syn::custom_keyword!(group);
     syn::custom_keyword!(on_error);
     syn::custom_keyword!(when);
     syn::custom_keyword!(when_error);
-    syn::custom_keyword!(optional);
 }
 
 pub struct Workflow {
@@ -29,14 +29,15 @@ pub struct Workflow {
 
 #[derive(Default)]
 pub struct Region {
+    /// 保留源码声明顺序（节点、子图/分组、边块交错均可保持原序）。
     pub items: Vec<RegionItem>,
-    pub edges: Vec<Edge>,
 }
 
 /// A declaration in source order.
 pub enum RegionItem {
     Node(Node),
     Subgraph(Subgraph),
+    Edges(Vec<Edge>),
 }
 
 pub struct Node {
@@ -48,6 +49,7 @@ pub struct Node {
 pub struct Subgraph {
     pub name: Ident,
     pub attributes: Vec<Attribute>,
+    pub isolated: bool,
     pub region: Region,
 }
 
@@ -71,12 +73,12 @@ pub struct Edge {
     pub target: NodePath,
     pub slot: Option<Ident>,
     pub route: Route,
-    pub optional: bool,
     pub transform: Option<Expr>,
 }
 
 pub enum Arrow {
     Direct,
+    IsolatedDirect,
     SharedExpand,
     IsolatedExpand,
 }
@@ -131,29 +133,43 @@ impl Parse for Region {
                         body.parse::<Token![,]>()?;
                     }
                 }
-            } else if input.peek(keyword::subgraph) || input.peek(Token![#]) {
+            } else if input.peek(keyword::subgraph)
+                || input.peek(keyword::group)
+                || input.peek(Token![#])
+            {
                 let attributes = input.call(Attribute::parse_outer)?;
-                input.parse::<keyword::subgraph>()?;
+                let isolated = if input.peek(keyword::subgraph) {
+                    input.parse::<keyword::subgraph>()?;
+                    true
+                } else if input.peek(keyword::group) {
+                    input.parse::<keyword::group>()?;
+                    false
+                } else {
+                    return Err(input.error("expected `subgraph` or `group` after attributes"));
+                };
                 let name = input.parse()?;
                 let body;
                 braced!(body in input);
                 region.items.push(RegionItem::Subgraph(Subgraph {
                     name,
                     attributes,
+                    isolated,
                     region: body.parse()?,
                 }));
             } else if input.peek(keyword::edges) {
                 input.parse::<keyword::edges>()?;
                 let body;
                 braced!(body in input);
+                let mut edges = Vec::new();
                 while !body.is_empty() {
-                    region.edges.push(body.parse()?);
+                    edges.push(body.parse()?);
                     if !body.is_empty() {
                         body.parse::<Token![,]>()?;
                     }
                 }
+                region.items.push(RegionItem::Edges(edges));
             } else {
-                return Err(input.error("expected nodes, subgraph, or edges"));
+                return Err(input.error("expected nodes, subgraph, group, or edges"));
             }
         }
         Ok(region)
@@ -194,7 +210,10 @@ impl Parse for Edge {
     fn parse(input: ParseStream) -> Result<Self> {
         let source = input.parse()?;
         input.parse::<Token![->]>()?;
-        let arrow = if input.peek(Token![*]) {
+        let arrow = if input.peek(Token![!]) {
+            input.parse::<Token![!]>()?;
+            Arrow::IsolatedDirect
+        } else if input.peek(Token![*]) {
             input.parse::<Token![*]>()?;
             Arrow::SharedExpand
         } else if input.peek(Token![+]) {
@@ -211,28 +230,11 @@ impl Parse for Edge {
             None
         };
 
-        let mut optional = false;
-        if input.peek(keyword::optional) {
-            input.parse::<keyword::optional>()?;
-            optional = true;
-        }
         let route = if input.peek(keyword::on_error) {
-            let kw = input.parse::<keyword::on_error>()?;
-            if optional {
-                return Err(syn::Error::new_spanned(
-                    kw,
-                    "optional is only valid on success edges",
-                ));
-            }
+            input.parse::<keyword::on_error>()?;
             Route::Failure(None)
         } else if input.peek(keyword::when_error) {
-            let kw = input.parse::<keyword::when_error>()?;
-            if optional {
-                return Err(syn::Error::new_spanned(
-                    kw,
-                    "optional is only valid on success edges",
-                ));
-            }
+            input.parse::<keyword::when_error>()?;
             Route::Failure(Some(condition(input)?))
         } else if input.peek(keyword::when) {
             input.parse::<keyword::when>()?;
@@ -240,32 +242,12 @@ impl Parse for Edge {
         } else {
             Route::Success(None)
         };
-        if input.peek(keyword::optional) {
-            let kw = input.parse::<keyword::optional>()?;
-            if matches!(route, Route::Failure(_)) {
-                return Err(syn::Error::new_spanned(
-                    kw,
-                    "optional is only valid on success edges",
-                ));
-            }
-            if optional {
-                return Err(syn::Error::new_spanned(kw, "duplicate optional modifier"));
-            }
-            optional = true;
-        }
-        if optional && slot.is_none() {
-            return Err(syn::Error::new_spanned(
-                &target,
-                "optional edges must target a JOIN slot (node::field)",
-            ));
-        }
         Ok(Self {
             source,
             arrow,
             target,
             slot,
             route,
-            optional,
             transform: transform(input)?,
         })
     }

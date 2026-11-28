@@ -1,4 +1,6 @@
 //! Test seeds may model a task that already belongs to an existing run.
+use std::sync::Arc;
+
 use crate::{
     Task,
     graph::MergeMode,
@@ -25,28 +27,30 @@ impl TaskSeed {
     }
 }
 
-pub(crate) fn plan(dst: &'static str, inputs: Vec<Value>) -> Successor {
+pub(crate) fn plan(dst: &str, inputs: Vec<Value>) -> Successor {
     Successor {
-        dst,
-        subgraph_path: Vec::new(),
+        dst: Arc::from(dst),
+        subgraph_path: Arc::from([]),
         inputs,
         dispatch: Dispatch::Shared,
+        max_attempts: None,
     }
 }
 
-pub(crate) fn scoped_plan(
-    dst: &'static str,
-    subgraph_path: &[&str],
-    inputs: Vec<Value>,
-) -> Successor {
+pub(crate) fn scoped_plan(dst: &str, subgraph_path: &[&str], inputs: Vec<Value>) -> Successor {
     Successor {
-        subgraph_path: subgraph_path.iter().map(|&id| id.to_owned()).collect(),
+        subgraph_path: Arc::from(
+            subgraph_path
+                .iter()
+                .map(|&id| Arc::<str>::from(id))
+                .collect::<Vec<_>>(),
+        ),
         ..plan(dst, inputs)
     }
 }
 
 pub(crate) fn join_plan(
-    dst: &'static str,
+    dst: &str,
     key: &'static str,
     merge: MergeMode,
     inputs: Vec<Value>,

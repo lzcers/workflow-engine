@@ -1,12 +1,12 @@
-//! 通过公开 API 验证工作流创建恢复、提交执行与并发额度。
+//! 通过公开 API 验证工作流创建恢复、提交预检、并发额度与运行控制面（get/cancel/wait）。
 
 use std::{sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use workflow_engine::{
-    Engine, EngineError, Graph, TaskRecord, TaskStatus, Trigger,
-    graph::{Node, NodeContext, NodeError, TaskType},
+    Engine, EngineError, Graph, Node, NodeContext, NodeError, RunStatus, TaskRecord, TaskStatus,
+    Trigger, WorkerOptions, graph::TaskType,
 };
 
 #[derive(Default)]
@@ -20,6 +20,12 @@ impl NodeContext for Context {
         Self {
             task: Some(task.clone()),
             completed: self.completed.clone(),
+        }
+    }
+
+    async fn on_success(&mut self, task: &TaskRecord, output: &Value) {
+        if let Some(completed) = &self.completed {
+            let _ = completed.send((task.clone(), output.clone()));
         }
     }
 }
@@ -39,14 +45,6 @@ impl Node<Context> for AddOne {
         assert_eq!(task.status, TaskStatus::Running);
         Ok(input + 1)
     }
-
-    async fn on_success(ctx: &mut Context, output: &Value) {
-        if let Some(completed) = &ctx.completed {
-            completed
-                .send((ctx.task.as_ref().unwrap().clone(), output.clone()))
-                .unwrap();
-        }
-    }
 }
 
 #[tokio::test]
@@ -56,7 +54,6 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
     impl Node<Context> for ScheduledInput {
         type In = i32;
         type Out = i32;
-        const TASK_TYPE: TaskType = TaskType::Event;
 
         fn trigger(&self) -> Option<Trigger> {
             Some(Trigger {
@@ -67,10 +64,6 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
 
         async fn execute(&self, _: &mut Context, input: i32) -> Result<i32, NodeError> {
             Ok(input + 10)
-        }
-
-        async fn on_success(ctx: &mut Context, output: &Value) {
-            <AddOne as Node<Context>>::on_success(ctx, output).await;
         }
     }
 
@@ -97,13 +90,26 @@ async fn event_discovery_and_external_submissions_preserve_type_and_independent_
     assert_eq!(trigger.kind, "cron");
     assert_eq!(trigger.config["expression"], "0 9 * * *");
 
-    // The external registration uses the discovered entry for each delivered event.
+    // 入口输入类型不匹配时在 submit 期立即失败，不落库空跑。
+    assert!(matches!(
+        workflow.submit(entry, "not-an-int").await,
+        Err(EngineError::Input(_))
+    ));
+
     let first = workflow.submit(entry, 10).await.unwrap();
     let second = workflow.submit(entry, 20).await.unwrap();
     let manual = workflow.submit("process", 30).await.unwrap();
     assert_ne!(first.run_id, second.run_id);
-    assert_ne!(manual.run_id, first.run_id);
-    assert_ne!(manual.run_id, second.run_id);
+    assert_ne!(first.run_id, manual.run_id);
+    assert_ne!(second.run_id, manual.run_id);
+
+    // 直接通过 wait_run 等待运行完成并检查快照。
+    let snap = tokio::time::timeout(Duration::from_secs(5), workflow.wait_run(first.run_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snap.status, RunStatus::Succeeded);
+    assert_eq!(snap.tasks.len(), 2);
 
     let mut observed = tokio::time::timeout(Duration::from_secs(5), async {
         let mut observed = Vec::new();
@@ -144,7 +150,7 @@ async fn make_recovers_persisted_tasks_without_submit() {
                             attempt, lease_until)
          VALUES ('recovery', 1, 1, 'start', 'pending', '10', 0, NULL),
                 ('recovery', 2, 2, 'start', 'running', '20', 1,
-                 '2000-01-01T00:00:00Z')",
+                 '2000-01-01T00:00:00.000Z')",
     )
     .execute(&pool)
     .await
@@ -198,6 +204,10 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
         async fn fork(&self, task: &TaskRecord) -> Self {
             Self(self.0.fork(task).await)
         }
+
+        async fn on_success(&mut self, task: &TaskRecord, output: &Value) {
+            self.0.on_success(task, output).await;
+        }
     }
 
     impl Node<OtherContext> for AddOne {
@@ -206,10 +216,6 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
 
         async fn execute(&self, ctx: &mut OtherContext, input: i32) -> Result<i32, NodeError> {
             <Self as Node<Context>>::execute(self, &mut ctx.0, input).await
-        }
-
-        async fn on_success(ctx: &mut OtherContext, output: &Value) {
-            <Self as Node<Context>>::on_success(&mut ctx.0, output).await;
         }
     }
 
@@ -318,7 +324,7 @@ async fn workflows_with_different_contexts_execute_on_submit_independently() {
 }
 
 #[tokio::test]
-async fn workflow_shares_slots_across_concurrent_submissions() {
+async fn workflow_shares_slots_and_supports_cancel_and_run_task_limit() {
     struct Block {
         started: mpsc::UnboundedSender<i32>,
         release: Arc<Semaphore>,
@@ -332,14 +338,6 @@ async fn workflow_shares_slots_across_concurrent_submissions() {
             self.started.send(input).unwrap();
             self.release.acquire().await.unwrap().forget();
             Ok(input)
-        }
-
-        async fn on_success(ctx: &mut Context, output: &Value) {
-            ctx.completed
-                .as_ref()
-                .unwrap()
-                .send((ctx.task.as_ref().unwrap().clone(), output.clone()))
-                .unwrap();
         }
     }
 
@@ -413,17 +411,53 @@ async fn workflow_shares_slots_across_concurrent_submissions() {
     submitted_runs.dedup();
     assert_eq!(submitted_runs.len(), 12);
 
-    let next_run = workflow.submit("start", 99).await.unwrap();
-    let input = tokio::time::timeout(Duration::from_secs(5), starts.recv())
-        .await
-        .expect("the scheduler executes another submission after becoming idle")
-        .unwrap();
-    assert_eq!(input, 99);
+    // 取消运行：阻塞任务被标记为 Cancelled，wait_run 立即返回 Cancelled。
+    let to_cancel = workflow.submit("start", 77).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), starts.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        77
+    );
+    assert_eq!(workflow.cancel_run(to_cancel.run_id).await.unwrap(), 1);
+    let cancelled = workflow.wait_run(to_cancel.run_id).await.unwrap();
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
     release.add_permits(1);
-    let (task, output) = tokio::time::timeout(Duration::from_secs(5), completions.recv())
+
+    // 失败环护栏：a <-> b on_error 在达到 max_tasks_per_run 后自动终止为 Failed。
+    struct AlwaysFail;
+    impl Node<Context> for AlwaysFail {
+        type In = i32;
+        type Out = i32;
+        async fn execute(&self, _: &mut Context, _: i32) -> Result<i32, NodeError> {
+            Err(NodeError::permanent("loop boom"))
+        }
+    }
+    let loop_graph = workflow_engine::workflow! {
+        workflow_id: "loop-guard";
+        title: "Failure loop guard";
+        context: Context::default();
+        nodes { a => AlwaysFail, b => AlwaysFail }
+        edges {
+            a -> b on_error,
+            b -> a on_error,
+        }
+    }
+    .unwrap();
+    let loop_wf = engine.make_with(
+        loop_graph,
+        WorkerOptions {
+            max_tasks_per_run: 4,
+            ..WorkerOptions::default()
+        },
+    );
+    let loop_run = loop_wf.submit("a", 1).await.unwrap();
+    let snap = tokio::time::timeout(Duration::from_secs(5), loop_wf.wait_run(loop_run.run_id))
         .await
-        .expect("the later run settles without an explicit start")
+        .unwrap()
         .unwrap();
-    assert_eq!(task.run_id, next_run.run_id);
-    assert_eq!(output, json!(99));
+    assert_eq!(snap.status, RunStatus::Failed);
+    assert_eq!(snap.tasks.len(), 4);
+    assert!(snap.tasks.last().unwrap().error.as_deref().unwrap().contains("exceeded max tasks limit"));
 }

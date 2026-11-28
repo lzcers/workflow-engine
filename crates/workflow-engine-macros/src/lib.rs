@@ -5,7 +5,7 @@ mod parse;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Tokens};
-use quote::{ToTokens, format_ident, quote};
+use quote::{format_ident, quote};
 use std::collections::HashMap;
 use syn::{
     Attribute, DeriveInput, Expr, Ident, Meta, Path, Result, Token,
@@ -53,11 +53,7 @@ fn qualify(parent: &str, name: &str) -> String {
     }
 }
 
-fn metadata(
-    attributes: &[Attribute],
-    default_title: &str,
-    allow_description: bool,
-) -> Result<(Expr, Expr)> {
+fn metadata(attributes: &[Attribute], default_title: &str) -> Result<(Expr, Expr)> {
     let mut title = None;
     let mut description = None;
     for attribute in attributes {
@@ -69,7 +65,7 @@ fn metadata(
         };
         let field = if value.path.is_ident("title") {
             &mut title
-        } else if allow_description && value.path.is_ident("description") {
+        } else if value.path.is_ident("description") {
             &mut description
         } else {
             return Err(syn::Error::new_spanned(
@@ -105,8 +101,7 @@ fn register(
                 if keys.insert(name.clone(), key.clone()).is_some() {
                     return Err(syn::Error::new_spanned(&node.name, "duplicate node name"));
                 }
-                let (title, description) =
-                    metadata(&node.attributes, &node.name.to_string(), true)?;
+                let (title, description) = metadata(&node.attributes, &node.name.to_string())?;
                 let instance = &node.instance;
                 let owner = if parent.is_empty() {
                     quote! { None }
@@ -122,17 +117,22 @@ fn register(
             }
             RegionItem::Subgraph(subgraph) => {
                 let name = qualify(parent, &subgraph.name.to_string());
-                let (title, _) = metadata(&subgraph.attributes, &subgraph.name.to_string(), false)?;
+                let (title, description) =
+                    metadata(&subgraph.attributes, &subgraph.name.to_string())?;
                 let owner = if parent.is_empty() {
                     quote! { None }
                 } else {
                     quote! { Some(#parent) }
                 };
+                let isolated = subgraph.isolated;
                 statements.extend(quote! {
-                    let __workflow_builder = __workflow_builder.subgraph(#name, #title, #owner);
+                    let __workflow_builder = __workflow_builder.subgraph_with(
+                        #name, #title, #description, #owner, #isolated
+                    );
                 });
                 register(&subgraph.region, &name, keys, statements)?;
             }
+            RegionItem::Edges(_) => {}
         }
     }
     Ok(())
@@ -156,6 +156,7 @@ fn resolve(path: &NodePath, parent: &str, keys: &HashMap<String, Ident>) -> Resu
     ))
 }
 
+/// 按源码声明顺序展开所有边（对称使用流式 `Edge` API）。
 fn wire(
     region: &Region,
     parent: &str,
@@ -164,108 +165,45 @@ fn wire(
     statements: &mut Tokens,
 ) -> Result<()> {
     for item in &region.items {
-        if let RegionItem::Subgraph(subgraph) = item {
-            wire(
-                &subgraph.region,
-                &qualify(parent, &subgraph.name.to_string()),
-                engine,
-                keys,
-                statements,
-            )?;
+        match item {
+            RegionItem::Node(_) => {}
+            RegionItem::Subgraph(subgraph) => {
+                wire(
+                    &subgraph.region,
+                    &qualify(parent, &subgraph.name.to_string()),
+                    engine,
+                    keys,
+                    statements,
+                )?;
+            }
+            RegionItem::Edges(edges) => {
+                for edge in edges {
+                    let source = resolve(&edge.source, parent, keys)?;
+                    let target = resolve(&edge.target, parent, keys)?;
+                    let arrow = match edge.arrow {
+                        Arrow::Direct => quote! { #engine::dsl::direct() },
+                        Arrow::IsolatedDirect => quote! { #engine::dsl::isolated_direct() },
+                        Arrow::SharedExpand => quote! { #engine::dsl::shared_expand() },
+                        Arrow::IsolatedExpand => quote! { #engine::dsl::isolated_expand() },
+                    };
+                    let (start, cond) = match &edge.route {
+                        Route::Success(c) => (quote! { #engine::dsl::Edge::from(&#source) }, c),
+                        Route::Failure(c) => (quote! { #engine::dsl::Edge::on_error(&#source) }, c),
+                    };
+                    let dst = match &edge.slot {
+                        Some(slot) => quote! { .to_slot(&#target, #target.slots().#slot()) },
+                        None => quote! { .to(&#target) },
+                    };
+                    let when_step = cond.as_ref().map(|c| quote! { .when(#c) });
+                    let map_step = edge.transform.as_ref().map(|t| quote! { .map(#t) });
+                    statements.extend(quote! {
+                        let __workflow_builder = __workflow_builder.edge(
+                            #start #dst #when_step #map_step .via(#arrow)
+                        );
+                    });
+                }
+            }
         }
-    }
-    for edge in &region.edges {
-        let source = resolve(&edge.source, parent, keys)?;
-        let target = resolve(&edge.target, parent, keys)?;
-        let arrow = match edge.arrow {
-            Arrow::Direct => quote! { #engine::dsl::direct() },
-            Arrow::SharedExpand => quote! { #engine::dsl::shared_expand() },
-            Arrow::IsolatedExpand => quote! { #engine::dsl::isolated_expand() },
-        };
-        let transform = &edge.transform;
-        let statement = match (&edge.route, &edge.slot) {
-            (Route::Success(condition), None) => {
-                let constructor = if edge.transform.is_some() {
-                    quote! { success_transform_checked }
-                } else {
-                    quote! { success_checked }
-                };
-                let cond_expr = condition
-                    .as_ref()
-                    .map_or_else(|| quote! { |_| true }, ToTokens::to_token_stream);
-                let has_cond = condition.is_some();
-                quote! {
-                    let __workflow_builder = __workflow_builder.edge(
-                        #engine::dsl::#constructor(#source, #target, #arrow, #cond_expr, #transform)
-                            .with_condition(#has_cond)
-                    );
-                }
-            }
-            (Route::Success(condition), Some(slot)) => {
-                let constructor = if edge.transform.is_some() {
-                    quote! { success_join_transform_checked }
-                } else {
-                    quote! { success_join_checked }
-                };
-                let cond_expr = condition
-                    .as_ref()
-                    .map_or_else(|| quote! { |_| true }, ToTokens::to_token_stream);
-                let has_cond = condition.is_some();
-                let optional = edge.optional;
-                quote! {
-                    let __workflow_builder = __workflow_builder.edge(
-                        #engine::dsl::#constructor(
-                            #source,
-                            #target,
-                            #target.slots().#slot(),
-                            #arrow,
-                            #cond_expr,
-                            #transform
-                        )
-                        .with_condition(#has_cond)
-                        .with_optional(#optional)
-                    );
-                }
-            }
-            (Route::Failure(condition), None) => {
-                let constructor = if edge.transform.is_some() {
-                    quote! { failure_transform_checked }
-                } else {
-                    quote! { failure_checked }
-                };
-                let cond_expr = condition
-                    .as_ref()
-                    .map_or_else(|| quote! { |_, _| true }, ToTokens::to_token_stream);
-                quote! {
-                    let __workflow_builder = __workflow_builder.error_edge(
-                        #engine::dsl::#constructor(#source, #target, #arrow, #cond_expr, #transform)
-                    );
-                }
-            }
-            (Route::Failure(condition), Some(slot)) => {
-                let constructor = if edge.transform.is_some() {
-                    quote! { failure_join_transform_checked }
-                } else {
-                    quote! { failure_join_checked }
-                };
-                let cond_expr = condition
-                    .as_ref()
-                    .map_or_else(|| quote! { |_, _| true }, ToTokens::to_token_stream);
-                quote! {
-                    let __workflow_builder = __workflow_builder.error_edge(
-                        #engine::dsl::#constructor(
-                            #source,
-                            #target,
-                            #target.slots().#slot(),
-                            #arrow,
-                            #cond_expr,
-                            #transform
-                        )
-                    );
-                }
-            }
-        };
-        statements.extend(statement);
     }
     Ok(())
 }

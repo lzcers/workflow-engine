@@ -3,13 +3,36 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Attribute, DeriveInput, Fields, GenericArgument, PathArguments, Result, Type,
+    Attribute, DeriveInput, Fields, GenericArgument, Path, PathArguments, Result, Type,
     parse_quote,
 };
 
 struct FieldAttr {
     collect: bool,
     optional: bool,
+}
+
+fn parse_crate_path(attrs: &[Attribute]) -> Result<Path> {
+    let mut crate_path: Option<Path> = None;
+    for attr in attrs {
+        if !attr.path().is_ident("join") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("crate") {
+                if crate_path.is_some() {
+                    return Err(meta.error("duplicate `crate` attribute"));
+                }
+                let value = meta.value()?;
+                let path: Path = value.parse()?;
+                crate_path = Some(path);
+                Ok(())
+            } else {
+                Err(meta.error("expected `crate = path` on struct"))
+            }
+        })?;
+    }
+    Ok(crate_path.unwrap_or_else(|| parse_quote!(::workflow_engine)))
 }
 
 fn parse_join_attr(attrs: &[Attribute]) -> Result<FieldAttr> {
@@ -79,6 +102,7 @@ pub fn expand_join_input(input: DeriveInput) -> Result<TokenStream> {
         ));
     };
 
+    let engine = parse_crate_path(&input.attrs)?;
     let ident = &input.ident;
     let vis = &input.vis;
     let generics = &input.generics;
@@ -95,70 +119,45 @@ pub fn expand_join_input(input: DeriveInput) -> Result<TokenStream> {
         let field_name = field_ident.to_string();
         let attr = parse_join_attr(&field.attrs)?;
 
-        let (item_ty, slot_ctor, merge_expr, required, allows_optional): (
-            &Type,
-            TokenStream,
-            TokenStream,
-            bool,
-            bool,
-        ) = if attr.collect {
-            let Some(inner) = unwrap_generic(&field.ty, "Vec") else {
-                return Err(syn::Error::new_spanned(
-                    &field.ty,
-                    "#[join(collect)] field must have type Vec<T>",
-                ));
-            };
-            let required = !attr.optional;
-            let ctor = if required {
-                quote!(append)
+        let (item_ty, slot_ctor, merge_expr, required): (&Type, TokenStream, TokenStream, bool) =
+            if attr.collect {
+                let Some(inner) = unwrap_generic(&field.ty, "Vec") else {
+                    return Err(syn::Error::new_spanned(
+                        &field.ty,
+                        "#[join(collect)] field must have type Vec<T>",
+                    ));
+                };
+                (
+                    inner,
+                    quote!(append),
+                    quote!(#engine::graph::MergeMode::Append),
+                    !attr.optional,
+                )
+            } else if let Some(inner) = unwrap_generic(&field.ty, "Option") {
+                (inner, quote!(set), quote!(#engine::graph::MergeMode::Set), false)
             } else {
-                quote!(optional_append)
-            };
-            (
-                inner,
-                ctor,
-                quote!(::workflow_engine::graph::MergeMode::Append),
-                required,
-                true,
-            )
-        } else if let Some(inner) = unwrap_generic(&field.ty, "Option") {
-            (
-                inner,
-                quote!(optional_set),
-                quote!(::workflow_engine::graph::MergeMode::Set),
-                false,
-                true,
-            )
-        } else {
-            if attr.optional {
-                return Err(syn::Error::new_spanned(
+                // `#[join(optional)]` 允许用于类型别名（如 `type MaybeX = Option<X>`）或带 `#[serde(default)]` 的字段。
+                (
                     &field.ty,
-                    "#[join(optional)] requires Option<T> or #[join(collect)] Vec<T>",
-                ));
-            }
-            (
-                &field.ty,
-                quote!(set),
-                quote!(::workflow_engine::graph::MergeMode::Set),
-                true,
-                false,
-            )
-        };
+                    quote!(set),
+                    quote!(#engine::graph::MergeMode::Set),
+                    !attr.optional,
+                )
+            };
 
         methods.push(quote! {
             #[allow(dead_code, non_snake_case)]
             #vis const fn #field_ident(
                 &self,
-            ) -> ::workflow_engine::graph::JoinSlot<#ident #ty_generics, #item_ty> {
-                ::workflow_engine::graph::JoinSlot::#slot_ctor(#field_name)
+            ) -> #engine::graph::JoinSlot<#ident #ty_generics, #item_ty> {
+                #engine::graph::JoinSlot::#slot_ctor(#field_name)
             }
         });
         specs.push(quote! {
-            ::workflow_engine::graph::SlotSpec::new::<#item_ty>(
+            #engine::graph::SlotSpec::new::<#item_ty>(
                 #field_name,
                 #merge_expr,
                 #required,
-                #allows_optional,
             )
         });
     }
@@ -191,14 +190,14 @@ pub fn expand_join_input(input: DeriveInput) -> Result<TokenStream> {
             #(#methods)*
         }
 
-        impl #impl_generics ::workflow_engine::graph::JoinInput for #ident #ty_generics #join_where {
+        impl #impl_generics #engine::graph::JoinInput for #ident #ty_generics #join_where {
             type Slots = #slots_ident #ty_generics;
 
             fn slots() -> Self::Slots {
                 #slots_ident(::core::marker::PhantomData)
             }
 
-            fn slot_specs() -> ::std::vec::Vec<::workflow_engine::graph::SlotSpec> {
+            fn slot_specs() -> ::std::vec::Vec<#engine::graph::SlotSpec> {
                 ::std::vec![#(#specs),*]
             }
         }
